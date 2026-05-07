@@ -82,7 +82,17 @@ async def test_archive_includes_prompt_and_rollout_content():
     batcher.window_start = 42
     batcher.randomness = "0xdeadbeef"
     batcher.window_opened_at = 100.0
+    from reliquary.validator.batcher import RejectedSubmission
     batcher.reject_counts = {"out_of_zone": 3, "logprob_mismatch": 1}
+    batcher.rejected_submissions = [
+        RejectedSubmission(
+            hotkey="hk_evict", prompt_idx=4, reason="out_of_zone",
+        ),
+        RejectedSubmission(
+            hotkey="hk_grail_cheater", prompt_idx=5, reason="grail_fail",
+            # sketch_diff_max intentionally None — set by _reject() in prod.
+        ),
+    ]
 
     batch = [
         _valid_submission(prompt_idx=7, k=4, hotkey="hk1", eos_first=True),
@@ -159,3 +169,24 @@ async def test_archive_includes_prompt_and_rollout_content():
 
     # reject_summary persisted from batcher.
     assert archive["reject_summary"] == {"out_of_zone": 3, "logprob_mismatch": 1}
+
+    # rejected[] persisted from batcher.rejected_submissions — metadata only.
+    assert "rejected" in archive
+    assert archive["rejected"] == [
+        {
+            "hotkey": "hk_evict",
+            "prompt_idx": 4,
+            "reason": "out_of_zone",
+            "sketch_diff_max": None,
+            "lp_dev_max": None,
+            "dist_q10_min": None,
+        },
+        {
+            "hotkey": "hk_grail_cheater",
+            "prompt_idx": 5,
+            "reason": "grail_fail",
+            "sketch_diff_max": None,  # anti-tuning: never surfaced
+            "lp_dev_max": None,
+            "dist_q10_min": None,
+        },
+    ]

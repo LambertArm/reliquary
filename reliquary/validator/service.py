@@ -462,6 +462,18 @@ class ValidationService:
                 "dist_q10_min": s.dist_q10_min,
             })
 
+        rejected_payload = [
+            {
+                "hotkey": r.hotkey,
+                "prompt_idx": r.prompt_idx,
+                "reason": r.reason,
+                "sketch_diff_max": r.sketch_diff_max,
+                "lp_dev_max": r.lp_dev_max,
+                "dist_q10_min": r.dist_q10_min,
+            }
+            for r in getattr(batcher, "rejected_submissions", [])
+        ]
+
         archive = {
             "window_start": batcher.window_start,
             "validator_hotkey": self.wallet.hotkey.ss58_address,  # provenance
@@ -470,6 +482,7 @@ class ValidationService:
             "batch": batch_entries,
             "runners_up": runners_up,
             "reject_summary": dict(getattr(batcher, "reject_counts", {})),
+            "rejected": rejected_payload,
         }
         await storage.upload_window_dataset(batcher.window_start, archive)
 
