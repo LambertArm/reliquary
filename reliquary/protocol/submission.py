@@ -187,9 +187,16 @@ class CommitModel(BaseModel):
                 f"completion_length({v.completion_length}) must equal "
                 f"len(tokens)={len(tokens)}"
             )
-        if len(v.token_logprobs) != len(tokens):
+        # Two layouts are accepted, matching ``verify_logprobs_claim`` in
+        # ``validator/verifier.py``:
+        #   * full-sequence: len == len(tokens), prompt entries ignored
+        #   * completion-only: len == completion_length, indexed from 0
+        # Forcing one layout here would silently reject every miner that
+        # ships completion-only — including the miner code in this very repo.
+        if len(v.token_logprobs) not in (len(tokens), v.completion_length):
             raise ValueError(
-                f"token_logprobs length {len(v.token_logprobs)} "
-                f"must equal tokens length {len(tokens)}"
+                f"token_logprobs length {len(v.token_logprobs)} must equal "
+                f"either tokens length {len(tokens)} (full-sequence) "
+                f"or completion_length {v.completion_length} (completion-only)"
             )
         return v
