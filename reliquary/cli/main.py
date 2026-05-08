@@ -257,7 +257,15 @@ def validate(
                 hf_repo_id=hf_repo_id,
                 resume_from=resume_from or None,
             )
-            await service.run(subtensor)
+            # Run training + scoring as two independent concurrent loops so
+            # set_weights fires on its own 360-block cadence (~72 min) instead
+            # of being gated by the trainer's window timeouts.
+            from reliquary.validator.weight_only import WeightOnlyValidator
+            weights_worker = WeightOnlyValidator(wallet=wallet, netuid=netuid)
+            await asyncio.gather(
+                service.run(subtensor),
+                weights_worker.run(subtensor),
+            )
         else:
             from reliquary.validator.weight_only import WeightOnlyValidator
 

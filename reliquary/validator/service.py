@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections import defaultdict
 from typing import Any
 
 from reliquary.constants import (
@@ -23,10 +22,8 @@ from reliquary.constants import (
     POLL_INTERVAL_SECONDS,
     PPO_CLIP_EPSILON,
     SUBNET_START_BLOCK,
-    UID_BURN,
     VALIDATOR_HTTP_PORT,
     WANDB_TRAINING_VERSION,
-    WEIGHT_SUBMISSION_INTERVAL,
     WINDOW_LENGTH,
     WINDOW_TIMEOUT_SECONDS,
 )
@@ -34,15 +31,13 @@ from reliquary.environment.base import Environment
 from reliquary.infrastructure import chain, storage
 from reliquary.protocol.submission import RolloutSubmission, WindowState
 from reliquary.validator import telemetry
-from reliquary.validator.batcher import GrpoWindowBatcher, ValidSubmission
+from reliquary.validator.batcher import GrpoWindowBatcher
 from reliquary.validator.checkpoint import CheckpointStore
 from reliquary.validator.cooldown import CooldownMap
 from reliquary.validator.server import ValidatorServer
 from reliquary.validator.training import train_step
 
 logger = logging.getLogger(__name__)
-
-ROLLING_WINDOWS = WEIGHT_SUBMISSION_INTERVAL // WINDOW_LENGTH
 
 
 def is_bootstrap_window(window_start: int, subnet_start: int) -> bool:
@@ -163,10 +158,6 @@ class ValidationService:
 
         self._last_processed_window: int = -1
         self._windows_in_interval: int = 0
-        # Last on-chain block at which we successfully submitted weights.
-        # The next submit fires when current_block - this >= WEIGHT_SUBMISSION_INTERVAL.
-        # Bootstrapped to the current block at startup so we don't submit on boot.
-        self._last_weight_block: int = 0
         self._cooldown_map = CooldownMap(
             cooldown_windows=BATCH_PROMPT_COOLDOWN_WINDOWS
         )
@@ -177,7 +168,6 @@ class ValidationService:
         # startup from R2 + HF (no local JSON state file).
         self._window_n: int = 0
         self._checkpoint_n: int = 0
-        self._miner_scores_ema: defaultdict[str, float] = defaultdict(float)
         self._publish_every = CHECKPOINT_PUBLISH_INTERVAL_WINDOWS
         self._checkpoint_store = CheckpointStore(
             validator_hotkey=wallet.hotkey.ss58_address,
@@ -191,34 +181,6 @@ class ValidationService:
 
         self._resume_from = resume_from
         self._load_model_fn = load_model_fn or _default_load_model
-
-    def _update_ema(self, batch: list) -> None:
-        """EMA update on the per-hotkey miner score dict.
-
-        Applied to every hotkey we've ever seen — absent miners this window
-        contribute 0 → their EMA decays by factor (1 - α). Active miners
-        blend in their fresh contribution.
-
-        The sum across all hotkeys converges to the smoothed fill rate of
-        the batch — burn is derived as the complement.
-        """
-        from reliquary.constants import EMA_ALPHA
-        alpha = EMA_ALPHA
-
-        window_contribs: dict[str, int] = defaultdict(int)
-        for sub in batch:
-            window_contribs[sub.hotkey] += 1
-
-        all_hotkeys = set(self._miner_scores_ema) | set(window_contribs)
-        for hk in all_hotkeys:
-            fraction = window_contribs.get(hk, 0) / B_BATCH
-            old = self._miner_scores_ema[hk]
-            self._miner_scores_ema[hk] = alpha * fraction + (1 - alpha) * old
-
-        # Prune near-zero entries to bound the dict size.
-        self._miner_scores_ema = defaultdict(float, {
-            hk: v for hk, v in self._miner_scores_ema.items() if v > 1e-6
-        })
 
     def _set_state(self, s: WindowState) -> None:
         self._current_window_state = s
@@ -334,7 +296,9 @@ class ValidationService:
 
         self._set_state(WindowState.TRAINING)
         batch = self._active_batcher.seal_batch()
-        self._update_ema(batch)  # miners earn slots regardless of training
+        # Note: miners earn slots regardless of training. Their contribution
+        # is reflected in the next ``_submit_weights`` call, which replays
+        # the EMA from R2 archives written by ``_archive_window`` below.
 
         # Only train on a full batch. A partial seal (timeout) means miner
         # population + cadence didn't produce enough groups to train on;
@@ -462,6 +426,18 @@ class ValidationService:
                 "dist_q10_min": s.dist_q10_min,
             })
 
+        rejected_entries = [
+            {
+                "hotkey": r.hotkey,
+                "prompt_idx": r.prompt_idx,
+                "reason": r.reason,
+                "sketch_diff_max": r.sketch_diff_max,
+                "lp_dev_max": r.lp_dev_max,
+                "dist_q10_min": r.dist_q10_min,
+            }
+            for r in getattr(batcher, "rejected_submissions", [])
+        ]
+
         archive = {
             "window_start": batcher.window_start,
             "validator_hotkey": self.wallet.hotkey.ss58_address,  # provenance
@@ -470,6 +446,7 @@ class ValidationService:
             "batch": batch_entries,
             "runners_up": runners_up,
             "reject_summary": dict(getattr(batcher, "reject_counts", {})),
+            "rejected": rejected_entries,
         }
         await storage.upload_window_dataset(batcher.window_start, archive)
 
@@ -479,15 +456,6 @@ class ValidationService:
         await self._apply_resume_from()                  # ← resume before bootstrap
         await self._bootstrap_state_from_external()
         await self._rebuild_cooldown_from_history()
-        # Anchor the weight-submission cadence at the current chain block so
-        # a restart doesn't trigger a submit on the first iteration.
-        try:
-            self._last_weight_block = await chain.get_current_block(subtensor)
-        except Exception:
-            logger.exception(
-                "Could not read current block at boot; _last_weight_block stays 0 "
-                "(will submit on the first iteration)"
-            )
         logger.info(
             "Validator started (v2.1): env=%s, netuid=%d, http=%s:%d",
             self.env.name, self.netuid, self.server.host, self.server.port,
@@ -514,20 +482,9 @@ class ValidationService:
 
                     await self._train_and_publish()
 
-                    # Weight cadence: every WEIGHT_SUBMISSION_INTERVAL on-chain
-                    # blocks. We cannot key off window count because v2.1 windows
-                    # are event-driven — a full window can take 20+ min = 100+
-                    # blocks, so "every 72 windows" would fire every ~24 h instead
-                    # of the protocol-intended ~72 min.
-                    current_block = await chain.get_current_block(subtensor)
-                    if current_block - self._last_weight_block >= WEIGHT_SUBMISSION_INTERVAL:
-                        submitted = await self._submit_weights(subtensor)
-                        if submitted:
-                            self._last_weight_block = current_block
-                        else:
-                            logger.warning(
-                                "set_weights did not succeed — EMA unchanged for next retry"
-                            )
+                    # set_weights is owned by a concurrent WeightOnlyValidator
+                    # task running off the same R2 archives; no need to do it
+                    # here. The trainer is purely about training + uploads.
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -591,9 +548,12 @@ class ValidationService:
             )
 
     async def _bootstrap_state_from_external(self) -> None:
-        """Derive window_n, checkpoint_n, and miner_scores_ema from R2 + HF.
+        """Derive window_n and checkpoint_n from R2 + HF.
 
-        Called once at startup before the main loop. Zero local state required.
+        Called once at startup before the main loop. Miner scoring (EMA) is
+        no longer bootstrapped here — ``_submit_weights`` recomputes it from
+        R2 archives at every submit, which keeps the trainer in lock-step
+        with weight-only validators replaying the same archives.
         """
         # 1. window_n from R2 archive keys
         try:
@@ -617,38 +577,6 @@ class ValidationService:
             logger.info("Bootstrapped checkpoint_n=%d from HF", self._checkpoint_n)
         except Exception:
             logger.exception("Failed to bootstrap checkpoint_n from HF; starting at 0")
-
-        # 3. miner_scores_ema by replaying last K archives
-        try:
-            archives = await storage.list_recent_datasets(
-                current_window=self._window_n + 1,
-                n=ROLLING_WINDOWS * 3,  # enough for EMA half-life to converge
-            )
-            self._miner_scores_ema = self._replay_ema(archives)
-            logger.info(
-                "Bootstrapped EMA from %d archives, %d hotkeys tracked",
-                len(archives), len(self._miner_scores_ema),
-            )
-        except Exception:
-            logger.exception("Failed to bootstrap EMA from R2; starting empty")
-
-    def _replay_ema(self, archives: list[dict]) -> "defaultdict[str, float]":
-        """Deterministically derive EMA state from a list of archives."""
-        from reliquary.constants import EMA_ALPHA
-        ema: defaultdict[str, float] = defaultdict(float)
-        alpha = EMA_ALPHA
-        # Sort ascending by window_start to replay in order
-        for record in sorted(archives, key=lambda r: int(r["window_start"])):
-            window_contribs: dict[str, int] = defaultdict(int)
-            for entry in record.get("batch", []):
-                window_contribs[entry["hotkey"]] += 1
-            all_hotkeys = set(ema) | set(window_contribs)
-            for hk in all_hotkeys:
-                fraction = window_contribs.get(hk, 0) / B_BATCH
-                old = ema[hk]
-                ema[hk] = alpha * fraction + (1 - alpha) * old
-            ema = defaultdict(float, {hk: v for hk, v in ema.items() if v > 1e-6})
-        return ema
 
     async def _rebuild_cooldown_from_history(self) -> None:
         """At startup, reconstruct CooldownMap from the last
@@ -694,37 +622,4 @@ class ValidationService:
             )
         return chain.compute_window_randomness(block_hash)
 
-    async def _submit_weights(self, subtensor) -> bool:
-        """Submit weights from the current EMA snapshot. EMA is NOT cleared
-        on success — it persists across submits so that any submit within
-        an epoch carries the full rolling view of miner contributions.
-        """
-        miner_weights = dict(self._miner_scores_ema)
-        total = sum(miner_weights.values())
-        burn_weight = max(0.0, 1.0 - total)
-
-        logger.info(
-            "Submitting weights: %d miners (ema_total=%.4f), burn=%.4f",
-            len(miner_weights), total, burn_weight,
-        )
-        for hk, w in sorted(miner_weights.items(), key=lambda x: -x[1])[:10]:
-            logger.info("  %s: %.6f", hk[:8], w)
-
-        meta = await chain.get_metagraph(subtensor, self.netuid)
-        hotkey_to_uid = dict(zip(meta.hotkeys, meta.uids))
-        uids: list[int] = []
-        weight_vals: list[float] = []
-        for hk, w in miner_weights.items():
-            if hk in hotkey_to_uid and w > 0:
-                uids.append(int(hotkey_to_uid[hk]))
-                weight_vals.append(w)
-        if burn_weight > 0:
-            uids.append(UID_BURN)
-            weight_vals.append(burn_weight)
-        if not uids:
-            logger.info("No non-zero weights to submit; nothing to do.")
-            return True
-        return await chain.set_weights(
-            subtensor, self.wallet, self.netuid, uids, weight_vals,
-        )
 

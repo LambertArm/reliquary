@@ -18,6 +18,7 @@ from reliquary.constants import (
     BATCH_PROMPT_COOLDOWN_WINDOWS,
     B_BATCH,
     M_ROLLOUTS,
+    REJECTED_LIST_CAP_PER_HOTKEY,
 )
 from reliquary.environment.base import Environment
 from reliquary.protocol.submission import (
@@ -73,6 +74,28 @@ class ValidSubmission:
 
     def __post_init__(self):
         self.merkle_root = self.merkle_root_bytes
+
+
+@dataclass
+class RejectedSubmission:
+    """A submission that did NOT pass verification.
+
+    Persisted to the R2 archive (subject to per-hotkey cap) so rejected
+    miners can self-diagnose. Diagnostics are best-effort: only fields
+    computed before the rejection point are populated.
+
+    Anti-tuning: ``sketch_diff_max`` is intentionally LEFT NONE for
+    ``GRAIL_FAIL`` rejections. Surfacing the exact diff would let a cheater
+    calibrate against ``PROOF_SKETCH_TOLERANCE_BASE``. Other reject reasons
+    are not threshold-tunable, so their diagnostics are surfaced verbatim.
+    """
+
+    hotkey: str
+    prompt_idx: int
+    reason: str  # RejectReason.value
+    sketch_diff_max: int | None = None
+    lp_dev_max: float | None = None
+    dist_q10_min: float | None = None
 
 
 class GrpoWindowBatcher:
@@ -144,6 +167,12 @@ class GrpoWindowBatcher:
         # rejecting the most submissions in any given round.
         self.reject_counts: dict[str, int] = {}
 
+        # Per-hotkey-capped metadata for rejected submissions. Persisted in
+        # the R2 archive next to ``reject_counts`` so a rejected miner can
+        # see *which* of their submissions failed and why, instead of just
+        # an aggregate count. Cap protects against single-attacker flooding.
+        self.rejected_submissions: list[RejectedSubmission] = []
+
         # v2.1: seal_event fires the moment the B-th distinct non-cooldown
         # valid submission lands. Service awaits this to close the window.
         # Stored as threading.Event for sync-safe set(); the asyncio.Event
@@ -175,18 +204,20 @@ class GrpoWindowBatcher:
     def _accept_locked(
         self, request: BatchSubmissionRequest
     ) -> BatchSubmissionResponse:
+        hk = request.miner_hotkey
+        pi = request.prompt_idx
         if request.window_start != self.window_start:
-            return self._reject(RejectReason.WINDOW_MISMATCH)
+            return self._reject(RejectReason.WINDOW_MISMATCH, hotkey=hk, prompt_idx=pi)
         # v2.1: checkpoint hash gate. Empty string = gate disabled
         # (pre-first-publish or test convenience).
         if self.current_checkpoint_hash and request.checkpoint_hash != self.current_checkpoint_hash:
-            return self._reject(RejectReason.WRONG_CHECKPOINT)
+            return self._reject(RejectReason.WRONG_CHECKPOINT, hotkey=hk, prompt_idx=pi)
         if request.prompt_idx >= len(self.env):
-            return self._reject(RejectReason.BAD_PROMPT_IDX)
+            return self._reject(RejectReason.BAD_PROMPT_IDX, hotkey=hk, prompt_idx=pi)
         # v2.2: ``signed_round`` was removed from the protocol entirely.
         # Cooldown and prompt-claim short-circuits below handle ordering.
         if self._cooldown.is_in_cooldown(request.prompt_idx, self.window_start):
-            return self._reject(RejectReason.PROMPT_IN_COOLDOWN)
+            return self._reject(RejectReason.PROMPT_IN_COOLDOWN, hotkey=hk, prompt_idx=pi)
         # FIFO short-circuit by TCP arrival: the first submission to pass the
         # full validation pipeline for a given ``prompt_idx`` claims the
         # slot. Every subsequent submission for the same prompt is rejected
@@ -194,7 +225,7 @@ class GrpoWindowBatcher:
         # what protects the validator from being DoS'd by a flood of
         # duplicate-prompt submissions and keeps each prompt single-winner.
         if request.prompt_idx in self._claimed_prompts:
-            return self._reject(RejectReason.SUPERSEDED)
+            return self._reject(RejectReason.SUPERSEDED, hotkey=hk, prompt_idx=pi)
 
         problem = self.env.get_problem(request.prompt_idx)
         completion_texts = []
@@ -202,11 +233,11 @@ class GrpoWindowBatcher:
             text = self._completion_text(rollout)
             completion_texts.append(text)
             if not verify_reward_claim(self.env, problem, text, rollout.reward):
-                return self._reject(RejectReason.REWARD_MISMATCH)
+                return self._reject(RejectReason.REWARD_MISMATCH, hotkey=hk, prompt_idx=pi)
 
         sigma = rewards_std([r.reward for r in request.rollouts])
         if not is_in_zone(sigma, bootstrap=self.bootstrap):
-            return self._reject(RejectReason.OUT_OF_ZONE)
+            return self._reject(RejectReason.OUT_OF_ZONE, hotkey=hk, prompt_idx=pi)
 
         # Per-submission worst-case filter telemetry (across all rollouts).
         sketch_diff_max = 0
@@ -241,11 +272,11 @@ class GrpoWindowBatcher:
             try:
                 CommitModel.model_validate(rollout.commit)
             except ValidationError:
-                return self._reject(RejectReason.BAD_SCHEMA)
+                return self._reject(RejectReason.BAD_SCHEMA, hotkey=hk, prompt_idx=pi)
 
             # Token check: vocab bounds + max length (cheap, protects forward pass)
             if not verify_tokens(rollout.commit["tokens"], self.model.config):
-                return self._reject(RejectReason.BAD_TOKENS)
+                return self._reject(RejectReason.BAD_TOKENS, hotkey=hk, prompt_idx=pi)
 
             if canonical_prompt_tokens is not None:
                 rollout_meta = rollout.commit.get("rollout", {}) or {}
@@ -254,9 +285,9 @@ class GrpoWindowBatcher:
                     :miner_prompt_len
                 ]
                 if miner_prompt_tokens != canonical_prompt_tokens:
-                    return self._reject(RejectReason.PROMPT_MISMATCH)
+                    return self._reject(RejectReason.PROMPT_MISMATCH, hotkey=hk, prompt_idx=pi)
             if not self._verify_signature(rollout.commit, request.miner_hotkey):
-                return self._reject(RejectReason.BAD_SIGNATURE)
+                return self._reject(RejectReason.BAD_SIGNATURE, hotkey=hk, prompt_idx=pi)
             proof = self._verify_commitment(
                 rollout.commit, self.model, self.randomness
             )
@@ -269,7 +300,11 @@ class GrpoWindowBatcher:
                     request.miner_hotkey, request.prompt_idx,
                     proof.sketch_diff_max, proof.passed, proof.checked,
                 )
-                return self._reject(RejectReason.GRAIL_FAIL)
+                return self._reject(
+                    RejectReason.GRAIL_FAIL,
+                    hotkey=hk, prompt_idx=pi,
+                    sketch_diff_max=proof.sketch_diff_max,
+                )
 
             # Termination check: rollout must end with EOS at p(EOS) >= threshold.
             # Reuses cached logits from the GRAIL forward — zero extra compute.
@@ -280,7 +315,11 @@ class GrpoWindowBatcher:
                 ):
                     truncated_count += 1
                     if truncated_count > MAX_TRUNCATED_PER_SUBMISSION:
-                        return self._reject(RejectReason.BAD_TERMINATION)
+                        return self._reject(
+                            RejectReason.BAD_TERMINATION,
+                            hotkey=hk, prompt_idx=pi,
+                            sketch_diff_max=sketch_diff_max,
+                        )
                     # Skip the per-rollout behavioural checks below (logprobs,
                     # distribution) for this truncated rollout — they assume a
                     # completed sequence. The reward is still counted in the
@@ -313,7 +352,12 @@ class GrpoWindowBatcher:
                     "reject reason=logprob_mismatch hotkey=%s median_dev=%.4f",
                     request.miner_hotkey, lp_dev,
                 )
-                return self._reject(RejectReason.LOGPROB_MISMATCH)
+                return self._reject(
+                    RejectReason.LOGPROB_MISMATCH,
+                    hotkey=hk, prompt_idx=pi,
+                    sketch_diff_max=sketch_diff_max,
+                    lp_dev_max=lp_dev_max,
+                )
 
             from reliquary.constants import T_PROTO
             dist_ok, dist_metrics = evaluate_token_distribution(
@@ -332,7 +376,13 @@ class GrpoWindowBatcher:
                     "reject reason=distribution_suspicious hotkey=%s %s",
                     request.miner_hotkey, dist_metrics,
                 )
-                return self._reject(RejectReason.DISTRIBUTION_SUSPICIOUS)
+                return self._reject(
+                    RejectReason.DISTRIBUTION_SUSPICIOUS,
+                    hotkey=hk, prompt_idx=pi,
+                    sketch_diff_max=sketch_diff_max,
+                    lp_dev_max=lp_dev_max,
+                    dist_q10_min=dist_q10_min,
+                )
 
         # All checks passed — claim this prompt. Future submissions for the
         # same ``prompt_idx`` are short-circuited at the top of
@@ -369,8 +419,38 @@ class GrpoWindowBatcher:
             accepted=True, reason=RejectReason.ACCEPTED
         )
 
-    def _reject(self, reason: RejectReason) -> BatchSubmissionResponse:
+    def _reject(
+        self,
+        reason: RejectReason,
+        *,
+        hotkey: str | None = None,
+        prompt_idx: int | None = None,
+        sketch_diff_max: int | None = None,
+        lp_dev_max: float | None = None,
+        dist_q10_min: float | None = None,
+    ) -> BatchSubmissionResponse:
         self.reject_counts[reason.value] = self.reject_counts.get(reason.value, 0) + 1
+
+        if hotkey is not None and prompt_idx is not None:
+            already = sum(
+                1 for r in self.rejected_submissions if r.hotkey == hotkey
+            )
+            if already < REJECTED_LIST_CAP_PER_HOTKEY:
+                # Anti-tuning: never surface the GRAIL sketch diff to miners.
+                # All other reasons get the diagnostics computed up to the
+                # rejection point.
+                if reason is RejectReason.GRAIL_FAIL:
+                    sketch_diff_max = None
+                self.rejected_submissions.append(
+                    RejectedSubmission(
+                        hotkey=hotkey,
+                        prompt_idx=prompt_idx,
+                        reason=reason.value,
+                        sketch_diff_max=sketch_diff_max,
+                        lp_dev_max=lp_dev_max,
+                        dist_q10_min=dist_q10_min,
+                    )
+                )
         return BatchSubmissionResponse(accepted=False, reason=reason)
 
     # ----------------------------- accessors -----------------------------

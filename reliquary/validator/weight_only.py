@@ -57,36 +57,48 @@ class WeightOnlyValidator:
                     await asyncio.sleep(POLL_INTERVAL_SECONDS)
                     continue
 
-                # Read + replay + submit
-                windows = await storage.list_all_window_keys()
-                if not windows:
-                    logger.info("No archives yet; nothing to submit")
-                    await asyncio.sleep(POLL_INTERVAL_SECONDS)
-                    continue
-
-                archives = await storage.list_recent_datasets(
-                    current_window=max(windows) + 1,
-                    n=ROLLING_WINDOWS * 3,
-                )
-                ema = self._replay_ema(archives)
-                miner_weights = dict(ema)
-                total = sum(miner_weights.values())
-                burn_weight = max(0.0, 1.0 - total)
-
-                submitted = await self._submit_weights(
-                    subtensor, miner_weights, burn_weight,
-                )
-                if submitted:
+                if await self.submit_once(subtensor):
                     self._last_submit_block = current_block
-                    logger.info(
-                        "Submitted weights: %d miners (total=%.4f), burn=%.4f",
-                        len(miner_weights), total, burn_weight,
-                    )
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception("weight-only loop iteration failed")
                 await asyncio.sleep(POLL_INTERVAL_SECONDS)
+
+    async def submit_once(self, subtensor) -> bool:
+        """Run one set_weights cycle: read R2 archives → replay EMA → submit
+        on-chain. Returns True iff the chain accepted the extrinsic.
+
+        The single canonical entry point for scoring + on-chain submission,
+        used by both the weight-only ``run`` loop and the trainer service
+        (``ValidationService._submit_weights``). Centralising it here is
+        what makes a trainer and a weight-only validator running on the
+        same subnet converge to identical weights — they execute the exact
+        same code on the exact same R2 input.
+        """
+        windows = await storage.list_all_window_keys()
+        if not windows:
+            logger.info("No archives yet; nothing to submit")
+            return False
+
+        archives = await storage.list_recent_datasets(
+            current_window=max(windows) + 1,
+            n=ROLLING_WINDOWS * 3,
+        )
+        ema = self._replay_ema(archives)
+        miner_weights = dict(ema)
+        total = sum(miner_weights.values())
+        burn_weight = max(0.0, 1.0 - total)
+
+        submitted = await self._submit_weights(
+            subtensor, miner_weights, burn_weight,
+        )
+        if submitted:
+            logger.info(
+                "Submitted weights: %d miners (total=%.4f), burn=%.4f",
+                len(miner_weights), total, burn_weight,
+            )
+        return submitted
 
     @staticmethod
     def _replay_ema(archives: list[dict]) -> dict[str, float]:

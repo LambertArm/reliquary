@@ -87,6 +87,12 @@ UPLOAD_BUFFER = NETWORK_UPLOAD_LATENCY
 # Network-wide protocol cap on completion length.
 MAX_NEW_TOKENS_PROTOCOL_CAP = 8192
 
+# Soft cap on per-hotkey entries persisted to ``archive["rejected"]`` per
+# window. Beyond this, ``reject_counts`` still increments but no metadata is
+# appended — protects the R2 payload size against a flood of garbage
+# submissions from a single attacker.
+REJECTED_LIST_CAP_PER_HOTKEY = 5
+
 # ────────────────  GRPO BATCHING  ────────────────
 
 # Default HTTP port the validator listens on for miner submissions.
@@ -199,7 +205,7 @@ SUBNET_START_BLOCK = 0
 # Safety-net timeout: a window auto-seals after this many seconds even
 # if fewer than B valid submissions have landed. The unused slots burn.
 # Set generously — this is a backstop, not the cadence.
-WINDOW_TIMEOUT_SECONDS = 3600
+WINDOW_TIMEOUT_SECONDS = 7200
 
 # Local JSON path for validator state (window_n counter + checkpoint_n).
 # Resolved relative to the CWD if not absolute.

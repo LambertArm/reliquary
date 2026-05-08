@@ -705,3 +705,97 @@ def test_termination_skipped_when_grail_returns_empty_logits():
 # wiring with the reject case above and the empty-logits skip case; the
 # happy path is exercised by the existing pipeline tests through the
 # empty-logits branch. A real end-to-end happy path lives in tests/integration.
+
+
+def test_rejected_submissions_list_initialised_empty():
+    from reliquary.validator.batcher import GrpoWindowBatcher, RejectedSubmission
+    b = _make_batcher()  # existing helper in this file
+    assert hasattr(b, "rejected_submissions")
+    assert b.rejected_submissions == []
+    # Confirm the dataclass exists and has the documented fields.
+    fields = {f.name for f in RejectedSubmission.__dataclass_fields__.values()}
+    assert {
+        "hotkey", "prompt_idx", "reason",
+        "sketch_diff_max", "lp_dev_max", "dist_q10_min",
+    }.issubset(fields)
+
+
+def _empty_logits():
+    import torch
+    return torch.empty(0)
+
+
+def _build_request(*, hotkey: str = "hk", prompt_idx: int = 42, window_start: int = 500):
+    """Thin wrapper around ``_request`` for the rejection-archive tests."""
+    return _request(prompt_idx=prompt_idx, window_start=window_start, hotkey=hotkey)
+
+
+def test_rejected_grail_fail_omits_sketch_diff_max(monkeypatch):
+    """GRAIL_FAIL must NOT expose sketch_diff_max — anti-tuning."""
+    from reliquary.validator.verifier import ProofResult
+    from reliquary.protocol.submission import RejectReason
+
+    b = _make_batcher()  # existing helper
+
+    # Stub verify_commitment to return a failing proof with a known diff.
+    def fake_verify(commit, model, randomness):
+        return ProofResult(
+            all_passed=False,
+            passed=2,
+            checked=4,
+            sketch_diff_max=4242,  # MUST NOT leak into archive
+            logits=_empty_logits(),
+        )
+    b._verify_commitment = fake_verify
+    b._verify_signature = lambda commit, hk: True
+
+    req = _build_request(hotkey="hk_grail", prompt_idx=3)  # existing helper
+    resp = b.accept_submission(req)
+    assert resp.reason == RejectReason.GRAIL_FAIL
+
+    assert len(b.rejected_submissions) == 1
+    rec = b.rejected_submissions[0]
+    assert rec.hotkey == "hk_grail"
+    assert rec.prompt_idx == 3
+    assert rec.reason == "grail_fail"
+    # Anti-tuning invariant: NO diagnostic field may surface on GRAIL_FAIL.
+    # Identity fields (hotkey, prompt_idx, reason) are explicitly excluded;
+    # everything else must be scrubbed to None.
+    identity_fields = {"hotkey", "prompt_idx", "reason"}
+    for field_name in rec.__dataclass_fields__:
+        if field_name in identity_fields:
+            continue
+        assert getattr(rec, field_name) is None, (
+            f"GRAIL_FAIL leaked tuning signal via field {field_name!r} "
+            f"(value={getattr(rec, field_name)!r}); add scrubbing in _reject."
+        )
+
+
+def test_rejected_submissions_capped_per_hotkey(monkeypatch):
+    """6th rejection from same hotkey must NOT grow the list (cap = 5)."""
+    from reliquary.protocol.submission import RejectReason
+    from reliquary.constants import REJECTED_LIST_CAP_PER_HOTKEY
+
+    assert REJECTED_LIST_CAP_PER_HOTKEY == 5  # plan invariant
+
+    b = _make_batcher()
+    # Trigger BAD_PROMPT_IDX repeatedly — cheapest reject path that needs no
+    # heavy stubbing (just send prompt_idx >= len(env)).
+    spam_hotkey = "hk_spam"
+    for i in range(REJECTED_LIST_CAP_PER_HOTKEY + 3):
+        req = _build_request(
+            hotkey=spam_hotkey,
+            prompt_idx=10_000 + i,  # past env size to force BAD_PROMPT_IDX
+        )
+        resp = b.accept_submission(req)
+        assert resp.reason == RejectReason.BAD_PROMPT_IDX
+
+    # List capped, but counter keeps climbing.
+    assert len(b.rejected_submissions) == REJECTED_LIST_CAP_PER_HOTKEY
+    assert b.reject_counts["bad_prompt_idx"] == REJECTED_LIST_CAP_PER_HOTKEY + 3
+
+    # Different hotkey gets its own quota.
+    other_req = _build_request(hotkey="hk_other", prompt_idx=99_999)
+    b.accept_submission(other_req)
+    assert len(b.rejected_submissions) == REJECTED_LIST_CAP_PER_HOTKEY + 1
+    assert b.rejected_submissions[-1].hotkey == "hk_other"
