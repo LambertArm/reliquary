@@ -127,18 +127,21 @@ def test_prune_keeps_dict_bounded():
 
 @pytest.mark.asyncio
 async def test_submit_does_not_clear_ema():
-    """_submit_weights must NOT reset _miner_scores_ema."""
+    """_submit_weights must NOT touch _miner_scores_ema (now legacy unused)."""
     from unittest.mock import AsyncMock
     svc = _make_service()
     svc._miner_scores_ema["alice"] = 0.2
     svc._miner_scores_ema["bob"] = 0.3
 
-    # Mock chain methods so submit runs without real network
+    # Mock chain + storage so submit runs without network. _submit_weights
+    # now derives weights from R2 archives instead of in-memory EMA.
     import reliquary.validator.service as svc_mod
     svc_mod.chain.get_metagraph = AsyncMock(return_value=MagicMock(
         hotkeys=["alice", "bob"], uids=[1, 2],
     ))
     svc_mod.chain.set_weights = AsyncMock(return_value=True)
+    svc_mod.storage.list_all_window_keys = AsyncMock(return_value=[0])
+    svc_mod.storage.list_recent_datasets = AsyncMock(return_value=[])
 
     await svc._submit_weights(MagicMock())
 

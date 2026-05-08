@@ -334,7 +334,9 @@ class ValidationService:
 
         self._set_state(WindowState.TRAINING)
         batch = self._active_batcher.seal_batch()
-        self._update_ema(batch)  # miners earn slots regardless of training
+        # Note: miners earn slots regardless of training. Their contribution
+        # is reflected in the next ``_submit_weights`` call, which replays
+        # the EMA from R2 archives written by ``_archive_window`` below.
 
         # Only train on a full batch. A partial seal (timeout) means miner
         # population + cadence didn't produce enough groups to train on;
@@ -708,11 +710,23 @@ class ValidationService:
         return chain.compute_window_randomness(block_hash)
 
     async def _submit_weights(self, subtensor) -> bool:
-        """Submit weights from the current EMA snapshot. EMA is NOT cleared
-        on success — it persists across submits so that any submit within
-        an epoch carries the full rolling view of miner contributions.
+        """Submit weights derived from R2 archives.
+
+        Reads the same archives that any weight-only validator would replay
+        (``WeightOnlyValidator``) so a trainer and a weight-only validator
+        running side-by-side converge to identical weights for the same
+        on-chain state. The trainer's in-memory EMA is no longer authoritative;
+        R2 is the single source of truth for scoring.
         """
-        miner_weights = dict(self._miner_scores_ema)
+        windows = await storage.list_all_window_keys()
+        if not windows:
+            logger.info("No archives yet; nothing to submit")
+            return False
+        archives = await storage.list_recent_datasets(
+            current_window=max(windows) + 1,
+            n=ROLLING_WINDOWS * 3,
+        )
+        miner_weights = dict(self._replay_ema(archives))
         total = sum(miner_weights.values())
         burn_weight = max(0.0, 1.0 - total)
 
