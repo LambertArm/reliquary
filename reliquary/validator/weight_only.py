@@ -18,7 +18,6 @@ from reliquary.constants import (
     EPOCH_SUBMIT_LEAD_BLOCKS,
     POLL_INTERVAL_SECONDS,
     UID_BURN,
-    WINDOW_LENGTH,
 )
 from reliquary.infrastructure import chain, storage
 
