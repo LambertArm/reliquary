@@ -15,16 +15,17 @@ from typing import Any
 from reliquary.constants import (
     B_BATCH,
     EMA_ALPHA,
+    EPOCH_SUBMIT_LEAD_BLOCKS,
     POLL_INTERVAL_SECONDS,
     UID_BURN,
-    WEIGHT_SUBMISSION_INTERVAL,
     WINDOW_LENGTH,
 )
 from reliquary.infrastructure import chain, storage
 
-# ROLLING_WINDOWS mirrors the definition in service.py — kept local to avoid
-# circular imports. Both must stay in sync with WEIGHT_SUBMISSION_INTERVAL.
-ROLLING_WINDOWS = WEIGHT_SUBMISSION_INTERVAL // WINDOW_LENGTH
+# EMA history depth — number of past windows replayed to compute miner
+# scores. Independent of the on-chain tempo: 72 windows ≈ ~6 hours on a
+# typical cadence, enough to smooth out per-window noise.
+ROLLING_WINDOWS_HISTORY = 72
 
 logger = logging.getLogger(__name__)
 
@@ -32,10 +33,17 @@ logger = logging.getLogger(__name__)
 class WeightOnlyValidator:
     """Lightweight validator that only sets weights.
 
-    Every ``WEIGHT_SUBMISSION_INTERVAL`` blocks:
+    Each subnet epoch (anchored on subtensor.blocks_until_next_epoch):
       1. Read last K archives from R2
       2. Replay EMA update
       3. Submit weights on-chain via chain.set_weights
+
+    All validators of a netuid hit the same epoch boundary, so they submit
+    inside a shared ~EPOCH_SUBMIT_LEAD_BLOCKS-block window and converge to
+    identical weights from the deterministic EMA replay.
+
+    A freshly-booted validator submits immediately on its first poll, then
+    joins the synced cadence from the next epoch onward.
 
     No local state: every submit recomputes from scratch.
     """
@@ -43,7 +51,7 @@ class WeightOnlyValidator:
     def __init__(self, wallet, netuid: int) -> None:
         self.wallet = wallet
         self.netuid = netuid
-        self._last_submit_block: int = 0
+        self._last_submit_epoch: int | None = None
 
     async def run(self, subtensor) -> None:
         logger.info(
@@ -52,19 +60,34 @@ class WeightOnlyValidator:
         )
         while True:
             try:
+                blocks_until = await chain.blocks_until_next_epoch(
+                    subtensor, self.netuid,
+                )
+                if blocks_until is None:
+                    logger.warning("blocks_until_next_epoch returned None — retrying")
+                    await asyncio.sleep(POLL_INTERVAL_SECONDS)
+                    continue
                 current_block = await chain.get_current_block(subtensor)
-                if current_block - self._last_submit_block < WEIGHT_SUBMISSION_INTERVAL:
+                # Stable per-epoch identifier: the absolute block number of the
+                # next epoch boundary stays constant for every poll inside the
+                # current epoch (current_block + blocks_until is invariant).
+                current_epoch_id = current_block + blocks_until
+
+                if self._last_submit_epoch == current_epoch_id:
+                    await asyncio.sleep(POLL_INTERVAL_SECONDS)
+                    continue
+
+                bootstrap = self._last_submit_epoch is None
+                in_lead_window = blocks_until <= EPOCH_SUBMIT_LEAD_BLOCKS
+                if not bootstrap and not in_lead_window:
                     await asyncio.sleep(POLL_INTERVAL_SECONDS)
                     continue
 
                 if await self.submit_once(subtensor):
-                    self._last_submit_block = current_block
+                    self._last_submit_epoch = current_epoch_id
             except asyncio.CancelledError:
                 raise
             except asyncio.TimeoutError:
-                # Substrate WebSocket wedged — chain.* calls now surface
-                # this as TimeoutError instead of hanging forever. Drop
-                # the dead connection and rebuild before the next poll.
                 logger.warning(
                     "substrate call timed out — recreating subtensor connection",
                 )
@@ -96,7 +119,7 @@ class WeightOnlyValidator:
 
         archives = await storage.list_recent_datasets(
             current_window=max(windows) + 1,
-            n=ROLLING_WINDOWS * 3,
+            n=ROLLING_WINDOWS_HISTORY * 3,
         )
         ema = self._replay_ema(archives)
         miner_weights = dict(ema)
