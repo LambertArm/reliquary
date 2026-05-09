@@ -271,8 +271,10 @@ WANDB_TRAINING_VERSION = "v1"
 # Minimum probability the model must have assigned to EOS at the position
 # that produced it. Below this threshold, the rollout is presumed to be
 # artificially truncated (a miner truncating mid-reasoning to lock in a
-# favourable partial output). Calibrated by upstream grail at 0% honest FP.
-MIN_EOS_PROBABILITY = 0.02
+# favourable partial output). Upstream grail uses 0.02; we lowered to 0.01
+# after Qwen3-4B + T_PROTO=0.9 prod logs showed honest EOS clustering just
+# below 0.02. Mid-reasoning forgery still fails (p_stop typically < 0.001).
+MIN_EOS_PROBABILITY = 0.01
 
 # LogprobValidator: max allowed median importance-sampling deviation
 # across K=CHALLENGE_K positions. dev_i = exp(|model_lp - miner_lp|) - 1.
