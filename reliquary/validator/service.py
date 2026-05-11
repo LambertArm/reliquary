@@ -333,12 +333,44 @@ class ValidationService:
         GRAIL sketch verification re-derives challenge indices from this
         seed; miner and validator must agree. The miner derives it from
         the same block hash + drand round, so the values match bit-for-bit.
+
+        Retries on transient substrate failures (finney returning HTTP 503
+        or WebSocket handshake errors) before bubbling. Without retries,
+        any blip costs us the full window — the new two-phase open keeps
+        the failure clean (no zombie accepts) but still leaves the window
+        empty. A small in-loop retry recovers transparently from the
+        sub-second blips that dominate the failure mode in practice.
         """
         if self._active_batcher is None:
             return
-        self._active_batcher.randomness = await self._derive_randomness(
-            subtensor, self._window_n,
-        )
+        # 3 attempts total: original + 2 retries. Backoff is 0.5s then 1.0s,
+        # so worst-case added latency is 1.5s — well inside the 60s window
+        # budget. Sustained outages still bubble after attempt 3.
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            try:
+                self._active_batcher.randomness = await self._derive_randomness(
+                    subtensor, self._window_n,
+                )
+                if attempt > 0:
+                    logger.info(
+                        "Window %d: randomness derived on attempt %d",
+                        self._window_n, attempt + 1,
+                    )
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                last_exc = exc
+                if attempt < 2:
+                    logger.warning(
+                        "Window %d: _derive_randomness attempt %d failed (%s: %s); retrying",
+                        self._window_n, attempt + 1,
+                        type(exc).__name__, str(exc)[:120],
+                    )
+                    await asyncio.sleep(0.5 * (attempt + 1))
+        assert last_exc is not None
+        raise last_exc
 
     async def _train_and_publish(self) -> None:
         """TRAINING + PUBLISHING + READY phases."""
