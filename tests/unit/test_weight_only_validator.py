@@ -96,52 +96,144 @@ async def test_submit_weights_maps_hotkeys_to_uids():
     assert UID_BURN in captured["uids"]
 
 
-@pytest.mark.asyncio
-async def test_run_loop_submits_after_interval():
-    """run() submits weights when enough blocks have passed."""
+async def _run_one_iteration(wov, subtensor):
+    """Helper: run wov.run() until it completes one poll, then cancel."""
     import asyncio
-    from reliquary.validator.weight_only import WeightOnlyValidator
-    from reliquary.constants import WEIGHT_SUBMISSION_INTERVAL
+    task = asyncio.create_task(wov.run(subtensor))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
 
-    wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
-    wov._last_submit_block = 0
 
-    call_count = 0
-
+def _patch_chain_and_storage(blocks_until: int, current_block: int = 1_000_000):
+    """Patch the four module-level chain/storage entry points
+    weight_only.run() touches. Returns (patches, captured_calls)."""
+    from unittest.mock import AsyncMock
     import reliquary.validator.weight_only as wov_mod
-    original_get_block = wov_mod.chain.get_current_block
-    original_list_all = wov_mod.storage.list_all_window_keys
-    original_list_recent = wov_mod.storage.list_recent_datasets
-    original_submit = wov._submit_weights
 
-    wov_mod.chain.get_current_block = AsyncMock(return_value=WEIGHT_SUBMISSION_INTERVAL + 1)
+    captured = {"submit_calls": 0}
+    originals = {
+        "blocks_until_next_epoch": wov_mod.chain.blocks_until_next_epoch,
+        "get_current_block": wov_mod.chain.get_current_block,
+        "list_all_window_keys": wov_mod.storage.list_all_window_keys,
+        "list_recent_datasets": wov_mod.storage.list_recent_datasets,
+    }
+    wov_mod.chain.blocks_until_next_epoch = AsyncMock(return_value=blocks_until)
+    wov_mod.chain.get_current_block = AsyncMock(return_value=current_block)
     wov_mod.storage.list_all_window_keys = AsyncMock(return_value=[1, 2, 3])
     wov_mod.storage.list_recent_datasets = AsyncMock(return_value=[
         _archive(1, ["alice"]),
         _archive(2, ["alice"]),
         _archive(3, ["bob"]),
     ])
+    return originals, captured
 
+
+def _restore(originals):
+    import reliquary.validator.weight_only as wov_mod
+    wov_mod.chain.blocks_until_next_epoch = originals["blocks_until_next_epoch"]
+    wov_mod.chain.get_current_block = originals["get_current_block"]
+    wov_mod.storage.list_all_window_keys = originals["list_all_window_keys"]
+    wov_mod.storage.list_recent_datasets = originals["list_recent_datasets"]
+
+
+async def _wire_submit_counter(wov, captured):
     async def _fake_submit(subtensor, miner_weights, burn_weight):
-        nonlocal call_count
-        call_count += 1
+        captured["submit_calls"] += 1
         return True
-
     wov._submit_weights = _fake_submit
 
-    try:
-        # Run one iteration then cancel
-        task = asyncio.create_task(wov.run(MagicMock()))
-        await asyncio.sleep(0.05)
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-    finally:
-        wov_mod.chain.get_current_block = original_get_block
-        wov_mod.storage.list_all_window_keys = original_list_all
-        wov_mod.storage.list_recent_datasets = original_list_recent
-        wov._submit_weights = original_submit
 
-    assert call_count >= 1
+@pytest.mark.asyncio
+async def test_bootstrap_submits_immediately_regardless_of_lead_window():
+    """A freshly-booted validator submits on its first poll even if we're
+    far from the epoch boundary."""
+    from reliquary.validator.weight_only import WeightOnlyValidator
+    wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
+    assert wov._last_submit_epoch is None
+    # Far from boundary (200 blocks remain → outside any reasonable lead).
+    originals, captured = _patch_chain_and_storage(blocks_until=200)
+    await _wire_submit_counter(wov, captured)
+    try:
+        await _run_one_iteration(wov, MagicMock())
+    finally:
+        _restore(originals)
+    assert captured["submit_calls"] == 1
+    assert wov._last_submit_epoch == 1_000_200
+
+
+@pytest.mark.asyncio
+async def test_in_lead_window_submits():
+    """Inside [tempo - EPOCH_SUBMIT_LEAD_BLOCKS, tempo - 1] → submit."""
+    from reliquary.validator.weight_only import WeightOnlyValidator
+    from reliquary.constants import EPOCH_SUBMIT_LEAD_BLOCKS
+    wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
+    wov._last_submit_epoch = 999_000  # earlier epoch — not the current one
+    originals, captured = _patch_chain_and_storage(
+        blocks_until=EPOCH_SUBMIT_LEAD_BLOCKS,
+    )
+    await _wire_submit_counter(wov, captured)
+    try:
+        await _run_one_iteration(wov, MagicMock())
+    finally:
+        _restore(originals)
+    assert captured["submit_calls"] == 1
+
+
+@pytest.mark.asyncio
+async def test_outside_lead_window_skips():
+    """Far from boundary AND already submitted before → no submit."""
+    from reliquary.validator.weight_only import WeightOnlyValidator
+    from reliquary.constants import EPOCH_SUBMIT_LEAD_BLOCKS
+    wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
+    wov._last_submit_epoch = 999_000  # earlier epoch
+    originals, captured = _patch_chain_and_storage(
+        blocks_until=EPOCH_SUBMIT_LEAD_BLOCKS + 50,  # well outside
+    )
+    await _wire_submit_counter(wov, captured)
+    try:
+        await _run_one_iteration(wov, MagicMock())
+    finally:
+        _restore(originals)
+    assert captured["submit_calls"] == 0
+
+
+@pytest.mark.asyncio
+async def test_repeat_poll_in_same_epoch_skips():
+    """Once submitted in epoch E, a second poll in E does not re-submit."""
+    from reliquary.validator.weight_only import WeightOnlyValidator
+    wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
+    wov._last_submit_epoch = 1_000_005  # = current_block + blocks_until
+    originals, captured = _patch_chain_and_storage(
+        blocks_until=5, current_block=1_000_000,
+    )
+    await _wire_submit_counter(wov, captured)
+    try:
+        await _run_one_iteration(wov, MagicMock())
+    finally:
+        _restore(originals)
+    assert captured["submit_calls"] == 0
+
+
+@pytest.mark.asyncio
+async def test_next_epoch_submits_again():
+    """After crossing the boundary, _last_submit_epoch != current_epoch_id
+    and we're inside the lead window → submit fires again."""
+    from reliquary.validator.weight_only import WeightOnlyValidator
+    from reliquary.constants import EPOCH_SUBMIT_LEAD_BLOCKS
+    wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
+    wov._last_submit_epoch = 1_000_000  # the prior epoch end
+    originals, captured = _patch_chain_and_storage(
+        blocks_until=EPOCH_SUBMIT_LEAD_BLOCKS,
+        current_block=1_000_001,  # one block past the prior boundary
+    )
+    await _wire_submit_counter(wov, captured)
+    try:
+        await _run_one_iteration(wov, MagicMock())
+    finally:
+        _restore(originals)
+    assert captured["submit_calls"] == 1
+    assert wov._last_submit_epoch == 1_000_001 + EPOCH_SUBMIT_LEAD_BLOCKS

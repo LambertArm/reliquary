@@ -476,8 +476,8 @@ class MiningEngine:
         r_vec = self._verifier.generate_r_vec(randomness)
         commitments = self._verifier.create_commitments_batch(hidden_states, r_vec)
 
-        # Token log-probs from HF (bit-identical with validator)
-        log_probs = torch.log_softmax(logits[0], dim=-1)
+        # fp32 log_softmax to match the validator and reduce tail-token drift.
+        log_probs = torch.log_softmax(logits[0].float(), dim=-1)
         token_logprobs: list[float] = []
         for i in range(prompt_length, len(all_tokens)):
             token_logprobs.append(log_probs[i - 1, all_tokens[i]].item())

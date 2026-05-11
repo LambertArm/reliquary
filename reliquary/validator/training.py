@@ -37,6 +37,35 @@ _ref_model: Optional[Any] = None
 _model_id: Optional[int] = None
 
 
+def _build_optimizer(params) -> torch.optim.Optimizer:
+    """Prefer bitsandbytes PagedAdamW8bit on CUDA — quantised optimiser
+    state (~4× smaller than fp32 / ~2× smaller than bf16) plus unified
+    memory paging that spills to host RAM under pressure. Falls back to
+    plain AdamW when CUDA or bitsandbytes is unavailable (CPU tests, dev
+    boxes without a GPU).
+    """
+    if torch.cuda.is_available():
+        try:
+            import bitsandbytes as bnb  # type: ignore[import-not-found]
+            logger.info("Using bitsandbytes PagedAdamW8bit")
+            return bnb.optim.PagedAdamW8bit(
+                params,
+                lr=LEARNING_RATE,
+                betas=(0.9, 0.999),
+                eps=1e-8,
+                weight_decay=0.01,
+            )
+        except ImportError:
+            logger.warning("bitsandbytes not available — falling back to torch.optim.AdamW")
+    return torch.optim.AdamW(
+        params,
+        lr=LEARNING_RATE,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+        weight_decay=0.01,
+    )
+
+
 def _lazy_init(model) -> bool:
     """Create optimizer, scheduler, and reference model snapshot on first
     call for a given model object. No-op on subsequent calls with the same
@@ -58,13 +87,7 @@ def _lazy_init(model) -> bool:
         logger.warning("_lazy_init: model.parameters() is empty; skipping init")
         return False
 
-    _optimizer = torch.optim.AdamW(
-        params,
-        lr=LEARNING_RATE,
-        betas=(0.9, 0.999),
-        eps=1e-8,
-        weight_decay=0.01,
-    )
+    _optimizer = _build_optimizer(params)
 
     def _lr_lambda(step: int) -> float:
         if step < LR_WARMUP_WINDOWS:
@@ -150,11 +173,13 @@ def _rollout_loss(
 
     tokens = torch.tensor([tokens_list], device=device)  # [1, T]
 
-    # Current model forward pass (with grad)
+    # Current model forward pass (with grad). use_cache=False is required
+    # for gradient_checkpointing to actually take effect — Qwen defaults
+    # use_cache=True which silently disables checkpointing under HF.
     dtype_ctx = torch.autocast(device_type=device.type, dtype=torch.bfloat16) \
         if device.type in ("cuda", "cpu") else torch.autocast(device_type="cpu", enabled=False)
     with dtype_ctx:
-        logits = model(tokens).logits[0]  # [T, vocab]
+        logits = model(tokens, use_cache=False).logits[0]  # [T, vocab]
 
     # log π_new(token_{t+1} | context_<=t) — cast to fp32 for stability
     log_probs_all = F.log_softmax(logits[:-1].float(), dim=-1)
@@ -168,7 +193,7 @@ def _rollout_loss(
     # Reference model forward pass (no grad)
     with torch.no_grad():
         with dtype_ctx:
-            ref_logits = ref_model(tokens).logits[0]
+            ref_logits = ref_model(tokens, use_cache=False).logits[0]
         ref_log_probs_all = F.log_softmax(ref_logits[:-1].float(), dim=-1)
         ref_logprobs = ref_log_probs_all.gather(1, next_tokens.unsqueeze(1)).squeeze(1)
     ref_logprobs_c = ref_logprobs[prompt_length - 1:]
