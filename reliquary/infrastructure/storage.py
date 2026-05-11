@@ -1,4 +1,20 @@
-"""R2/S3 object storage for window rollout files."""
+"""R2/S3 object storage for window rollout files.
+
+Connection lifecycle: every call to ``get_s3_client()`` creates a FRESH
+``aiobotocore`` session + client. We do not cache the session at module
+scope. aiobotocore's session owns an internal HTTP connection pool;
+when the upstream (Cloudflare R2) intermittently slows or rejects
+connections, broken sockets accumulate in the pool and every subsequent
+``create_client`` call inherits that bad state. The validator runs
+24/7 and uploads ~10-15 files/hr, so a single bad spell can silently
+poison the cache for the entire lifetime of the process.
+
+By creating a fresh session per call we pay a small allocation cost
+(~ms) on each upload in exchange for **guaranteed clean transport
+state**. Tested against the same R2 endpoint under load — the previous
+shared-session pattern timed out for hours while a fresh-session client
+(in another process) succeeded in under a second on the same call.
+"""
 
 import asyncio
 import gzip
@@ -16,15 +32,6 @@ from botocore.config import Config
 
 logger = logging.getLogger(__name__)
 
-_SESSION = None
-
-
-def _get_session():
-    global _SESSION
-    if _SESSION is None:
-        _SESSION = get_session()
-    return _SESSION
-
 
 def get_s3_client(
     account_id: str | None = None,
@@ -32,7 +39,24 @@ def get_s3_client(
     secret_access_key: str | None = None,
     bucket_name: str | None = None,
 ):
-    """Create S3 client context for R2."""
+    """Create a fresh S3 client context for R2.
+
+    See module docstring for why we do NOT cache the session.
+
+    Timeouts:
+    - connect_timeout=15s — generous for transient R2 latency spikes
+      (Cloudflare's edge → R2 origin can take 5-10s under load). The
+      previous 3s was below typical 99p connect latency, leading to
+      false-positive timeouts. 15s still bounds total tail latency:
+      with 3 retries × (15s connect + 30s read) the upper bound is
+      135s before propagating an exception.
+    - read_timeout=30s — unchanged. Sufficient for the ~200-500KB
+      gzipped window archives we PUT.
+    - retries.max_attempts=3 — bumped from 2 to give one more shot at
+      transient failures.
+    - retries.mode=standard — default-ish, exponential backoff between
+      attempts.
+    """
     account_id = account_id or os.getenv("R2_ACCOUNT_ID", "")
     access_key_id = access_key_id or os.getenv("R2_ACCESS_KEY_ID", "")
     secret_access_key = secret_access_key or os.getenv("R2_SECRET_ACCESS_KEY", "")
@@ -40,11 +64,12 @@ def get_s3_client(
     region = os.getenv("R2_REGION", "us-east-1")
 
     config = Config(
-        connect_timeout=3,
+        connect_timeout=15,
         read_timeout=30,
-        retries={"max_attempts": 2},
+        retries={"max_attempts": 3, "mode": "standard"},
     )
-    return _get_session().create_client(
+    # Fresh session per call — see module docstring.
+    return get_session().create_client(
         "s3",
         endpoint_url=endpoint,
         region_name=region,
