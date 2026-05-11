@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from typing import Any
 
 from reliquary.constants import (
@@ -38,6 +39,44 @@ from reliquary.validator.server import ValidatorServer
 from reliquary.validator.training import train_step
 
 logger = logging.getLogger(__name__)
+
+
+def _try_empty_cuda_cache() -> None:
+    """Best-effort `torch.cuda.empty_cache()` after a forward pass.
+
+    Releases CUDA cached memory that's no longer referenced — typically
+    activations from a forward pass that have gone out of scope. Active
+    tensors (e.g. the model's weights) stay allocated, so this is safe
+    to call after every accept_submission / train_step.
+
+    Why we need this in the validator:
+
+    The GRAIL verifier runs ``model.forward(...)`` on every accepted
+    submission. PyTorch's CUDA caching allocator holds onto activation
+    buffers between calls in a pool to avoid the cost of ``cudaMalloc``
+    on every call. Under sustained traffic this is normally fine — the
+    pool reuses freed slots. But when ``train_step`` is configured to
+    OOM-fast (as in this validator) it leaves the pool partially
+    allocated. Successive train_step calls fragment the pool over time
+    and eventually verify_commitment's ``cublasCreate`` can't find a
+    contiguous chunk → ``CUBLAS_STATUS_ALLOC_FAILED``.
+
+    Calling ``empty_cache()`` after each forward pass / train_step
+    returns the freed slots to the OS, preventing fragmentation
+    accumulation. Cost: a few ms of cudaFree calls. Negligible against
+    the ~5-25s GRAIL verification time.
+
+    Imports lazily so non-CUDA test environments (CPU-only CI) don't
+    try to import torch at module load.
+    """
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        # Never let a cache-cleanup failure escape — it's a best-effort
+        # optimization, not load-bearing logic.
+        logger.debug("torch.cuda.empty_cache failed (non-fatal)", exc_info=True)
 
 
 def is_bootstrap_window(window_start: int, subnet_start: int) -> bool:
@@ -306,7 +345,20 @@ class ValidationService:
         # and a different effective LR than full-batch steps, so we skip.
         # The miners who did submit are still credited via _update_ema.
         trained = len(batch) >= B_BATCH
-        if trained:
+        # Env-controlled skip: ``RELIQUARY_DISABLE_TRAIN=1`` bypasses the
+        # train_step call entirely. Useful when the validator is configured
+        # in inference-only mode (e.g. a frozen policy phase) or when the
+        # train_step has a known OOM/leak pattern that's poisoning the
+        # GPU pool across windows. With this flag set we proceed straight
+        # to archive + skip-publish, exactly like a partial-seal path.
+        skip_train = os.environ.get("RELIQUARY_DISABLE_TRAIN", "").lower() in {"1", "true", "yes", "on"}
+        if trained and skip_train:
+            logger.info(
+                "Window %d: RELIQUARY_DISABLE_TRAIN set — skipping train_step + publish",
+                self._window_n,
+            )
+            trained = False
+        elif trained:
             try:
                 self.model = train_step(
                     self.model, batch, window_index=self._window_n,
@@ -320,6 +372,13 @@ class ValidationService:
                     "skipping publish", self._window_n,
                 )
                 trained = False
+            finally:
+                # Reclaim any GPU memory the failed/successful train_step
+                # held in its activation cache. This is critical when
+                # train_step OOMs intermittently — without explicit cleanup
+                # the partial allocations fragment the CUDA pool over
+                # successive windows and eventually starve verify_commitment.
+                _try_empty_cuda_cache()
         else:
             logger.info(
                 "Window %d sealed with %d/%d submissions — skipping train_step + publish",

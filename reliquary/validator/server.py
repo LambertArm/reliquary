@@ -130,6 +130,9 @@ class ValidatorServer:
         return app
 
     async def _submit_worker(self) -> None:
+        # Lazy import — keeps the module loadable in CPU-only test envs.
+        from reliquary.validator.service import _try_empty_cuda_cache
+
         while True:
             try:
                 request, batcher = await self._submit_queue.get()
@@ -151,10 +154,26 @@ class ValidatorServer:
                         request.prompt_idx, request.miner_hotkey[:12],
                         response.reason.value, rewards,
                     )
-            except Exception:
+            except Exception as e:
                 logger.exception(
                     "submission worker failed on prompt %d", request.prompt_idx
                 )
+                # OOM-recovery: when CUDA allocator can't get a handle
+                # (CUBLAS_STATUS_ALLOC_FAILED, out-of-memory etc.) we MUST
+                # release the cached pool before the next submission lands,
+                # otherwise every subsequent forward pass fails too. The
+                # generic .empty_cache() call covers all the cuBLAS / cuDNN
+                # / activation-pool fragmentation scenarios we've observed.
+                msg = str(e).lower()
+                if any(s in msg for s in ("out of memory", "cublas", "cuda")):
+                    await asyncio.to_thread(_try_empty_cuda_cache)
+            finally:
+                # Always reclaim activation memory after a forward pass so
+                # back-to-back GRAIL verifies don't accumulate fragmentation.
+                # The helper is a no-op on CPU-only hosts. Cost: ~ms; benefit:
+                # prevents the multi-hour drift that took down the validator
+                # on 2026-05-11.
+                await asyncio.to_thread(_try_empty_cuda_cache)
 
     async def start(self) -> None:
         if self._task is not None:
