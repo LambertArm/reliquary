@@ -78,13 +78,25 @@ Once a `prompt_idx` enters the training batch it is ineligible for the next `BAT
 
 The cooldown map is rebuilt from R2 archives at validator startup — up to 72 recent windows are downloaded and replayed — so the curriculum state survives restarts without needing a local state file for cooldowns specifically.
 
-### FIFO by TCP arrival — speed matters, not cherry-picking
+### v2.3: Drand-round chronological ordering + multi-miner-per-prompt + emission split
 
-Submissions are ranked by `arrived_at` — the validator-side timestamp captured under the batcher lock the moment a submission clears the full validation pipeline. The first submission to claim a given `prompt_idx` for the current window wins that slot; every subsequent submission for the same prompt is rejected `SUPERSEDED` before any heavy work (reward + GRAIL forward pass) runs. Across distinct prompts, batch members are ordered by `arrived_at` with a deterministic hotkey/prompt/merkle-root tiebreak for the (rare) case of identical timestamps.
+> **Major design shift (May 2026).** v2.2's TCP-arrival FIFO and single-winner-per-prompt rules were replaced by drand-round chronological ordering with multi-miner-per-prompt and emission split. Full spec: [docs/superpowers/specs/2026-05-15-drand-ordering-and-prompt-split-design.md](superpowers/specs/2026-05-15-drand-ordering-and-prompt-split-design.md). Implementation in [PR #28](https://github.com/reliquadotai/reliquary/pull/28).
 
-Cherry-picking "easy" prompts requires extra inference compute → takes longer → arrives later → another miner has already claimed the slot. The flat payment per batch slot means there is no reward multiplier for a higher-reward prompt either. The optimal strategy is to submit as fast as possible on whatever prompt passes the zone filter.
+**Three coupled changes:**
 
-Why arrival time and not a miner-claimed value? In the v2.1 design, FIFO ranked submissions by a miner-supplied `signed_round` (a drand round) bounded by a `STALE_ROUND_LAG_MAX` lag. Because the value was claimed by the miner, a sophisticated miner could always pin `signed_round` at the floor of the accepted range and win FIFO regardless of true arrival order. v2.2 removes the field entirely and orders by validator-set `arrived_at` instead. Miners cannot manipulate it.
+1. **Per-window randomness is drand-only.** `block_hash` is dropped from the seed; randomness is `H(drand_randomness || drand_round)`. Window OPEN no longer waits on `chain.get_block_hash` — substrate flakiness can't stall window scheduling. The randomness is exposed on `/state.randomness` so miners use it directly instead of recomputing locally (avoids the entire class of `WRONG_RANDOMNESS` rejects from local-derivation bugs).
+
+2. **Submissions carry a `drand_round` field.** Each `BatchSubmissionRequest` includes the drand quicknet round currently in progress at the wall-clock instant of POST. The validator gates with **zero tolerance** — too old → `STALE_ROUND`, too new → `FUTURE_ROUND`. Selection at seal time orders submissions by `drand_round` (chronological 3 s buckets), ties broken by `H(hotkey ‖ prompt_idx ‖ merkle_root)`. **Co-location with the validator no longer wins the race** — geography and millisecond TCP advantages are irrelevant; being in the same drand round as the rest of the network is what matters.
+
+3. **Multi-miner-per-prompt with emission split.** `SUPERSEDED` is deprecated. Up to `MAX_SUBMISSIONS_PER_PROMPT = 10` distinct hotkeys may submit on the same `prompt_idx`. At seal time each filled slot pays `pool / B_BATCH`, and within a slot the `K_p` miners who submitted for that prompt split equally. **Same-prompt sybil is strictly neutral** (N sybils on one prompt total `pool/B` — same as a single hotkey, minus N − 1 registration burns). Distinct-prompt sybil is additive but bounded by registration cost.
+
+### Why this design (briefly)
+
+v2.2 concentrated emission on whoever won the FIFO race for each prompt. Geography decided who that was — a miner in the validator's datacenter beat any non-co-located miner regardless of inference quality. v2.1's original `signed_round` ordering tried to fix this but was grindable: miners could pin the round at the floor of the accepted range and game ordering. v2.3 chains the round to drand (unforgeable per-window) and replaces the per-prompt single-winner rule with multi-winner emission-split — so an honest GRAIL-validated rollout earns something even if you arrived second. The full reasoning (grinding attack analysis, sybil-neutrality proof, DoS bounds) is in the design spec.
+
+### Historical (v2.2): FIFO by TCP arrival — deprecated
+
+Pre-v2.3 the validator ranked submissions by `arrived_at` (validator-side timestamp at accept). The first submission to claim a given `prompt_idx` for the current window won that slot; subsequent submissions on the same prompt were rejected `SUPERSEDED` before any heavy work ran. v2.3 retains `arrived_at` in `ValidSubmission` for forensics but no longer drives selection.
 
 ### EMA scoring — one payment per training step, not per submission
 
