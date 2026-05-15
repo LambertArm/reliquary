@@ -129,8 +129,10 @@ class GrpoWindowBatcher:
         wall_clock_fn: Callable[[], float] | None = None,
         drand_round_check_enabled: bool = True,
         drand_chain_info: dict | None = None,
+        drand_round_backward_tolerance: int | None = None,
     ) -> None:
         import time
+        from reliquary.constants import DRAND_ROUND_BACKWARD_TOLERANCE
 
         self.window_start = window_start
         self.env = env
@@ -142,7 +144,17 @@ class GrpoWindowBatcher:
         # at submit-receipt time. Distinct from ``_time_fn`` (monotonic)
         # which is used for response_time bookkeeping.
         self._wall_clock = wall_clock_fn or time.time
-        self._drand_round_check_enabled = drand_round_check_enabled
+        self.drand_round_check_enabled = drand_round_check_enabled
+        # How many drand rounds backward of the validator's current round
+        # the batcher accepts. Defaults to ``DRAND_ROUND_BACKWARD_TOLERANCE``
+        # from constants (1 round = 3 s grace) so prod stays consistent;
+        # tests that want to pin zero-tolerance v2.3 behaviour can pass
+        # ``drand_round_backward_tolerance=0`` explicitly.
+        self.drand_round_backward_tolerance = (
+            drand_round_backward_tolerance
+            if drand_round_backward_tolerance is not None
+            else DRAND_ROUND_BACKWARD_TOLERANCE
+        )
         # Lazy: fetched on first use if not injected (tests inject a fixed
         # {"genesis_time", "period"} dict to avoid live HTTP calls).
         self._drand_chain_info = drand_chain_info
@@ -247,6 +259,18 @@ class GrpoWindowBatcher:
         """
         return self._seal_flag.is_set()
 
+    def prompt_submission_count(self, prompt_idx: int) -> int:
+        """Number of GRAIL-validated submissions already in the per-prompt
+        bucket for ``prompt_idx``. Used by the HTTP /submit handler to
+        short-circuit ``PROMPT_FULL`` rejects without queueing.
+
+        Read of a dict-of-list len is GIL-atomic and lock-free in CPython,
+        same property ``valid_count`` relies on. Best-effort: a racing
+        accept inside the worker between this read and the queue.put is
+        harmless — the worker re-checks the cap inside ``_accept_locked``.
+        """
+        return len(self._submissions_per_prompt.get(prompt_idx, ()))
+
     # ----------------------------- ingestion -----------------------------
 
     def accept_submission(
@@ -256,18 +280,31 @@ class GrpoWindowBatcher:
         with self._lock:
             return self._accept_locked(request)
 
-    def _validate_drand_round(self, drand_round: int) -> RejectReason | None:
-        """Return the appropriate reject reason if ``drand_round`` doesn't
-        equal ``current_round`` exactly, else None.
+    def validate_drand_round(self, drand_round: int) -> RejectReason | None:
+        """Return the appropriate reject reason if ``drand_round`` is
+        outside the accepted window of [current - tolerance, current], else
+        None.
 
-        v2.3: tolerance is zero — the miner must attach the round currently
-        in progress at receipt time. Future rounds are always rejected
-        (σ_R doesn't exist yet); past rounds are rejected to prevent
-        antedating a submission into an earlier chronological bucket than
-        it actually earned. Network jitter that pushes a POST across a
-        round boundary now costs the submission; a future iteration may
-        relax this with a millisecond-grain check before the round
-        boundary instead of a full-round tolerance.
+        Forward direction is zero-tolerance: a miner that attaches round
+        R+1 hasn't seen σ_{R+1} yet (σ_R is the freshest signed beacon by
+        definition), so claiming a future round is unrecoverable cheating
+        and always rejected as FUTURE_ROUND.
+
+        Backward direction allows up to
+        ``self.drand_round_backward_tolerance`` rounds (default 1 = 3 s).
+        This absorbs:
+          * HTTP RTT + queue/scheduling jitter that pushes a POST across
+            a drand boundary mid-flight (miner fires at t=2.9 s of round
+            R, validator receives at t=3.0 s of round R+1)
+          * Small wall-clock skew between miner and validator. v2.3's
+            original zero-tolerance was correct in spec but turned every
+            inter-round POST into a STALE_ROUND in prod.
+        The security cost is bounded: an attacker can antedate by at most
+        ``tolerance`` rounds (3 s × tolerance) of chronological priority,
+        which is uniform across honest and malicious miners alike.
+
+        Public so the HTTP /submit handler can run it pre-queue and
+        short-circuit the rejection without waiting on the worker.
         """
         if self._drand_chain_info is None:
             from reliquary.infrastructure.drand import get_current_chain
@@ -279,7 +316,7 @@ class GrpoWindowBatcher:
         )
         if drand_round > current:
             return RejectReason.FUTURE_ROUND
-        if drand_round < current:
+        if drand_round < current - self.drand_round_backward_tolerance:
             return RejectReason.STALE_ROUND
         return None
 
@@ -300,8 +337,8 @@ class GrpoWindowBatcher:
         # to claim an earlier chronological slot than the submission
         # actually earned; attaching a future round is impossible without
         # having seen σ_R (so always rejected).
-        if self._drand_round_check_enabled:
-            round_check = self._validate_drand_round(request.drand_round)
+        if self.drand_round_check_enabled:
+            round_check = self.validate_drand_round(request.drand_round)
             if round_check is not None:
                 return self._reject(round_check, hotkey=hk, prompt_idx=pi)
         if request.prompt_idx >= len(self.env):
