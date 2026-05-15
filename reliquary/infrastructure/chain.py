@@ -6,7 +6,7 @@ import logging
 import os
 from typing import Any
 
-from reliquary.constants import BLOCK_TIME_SECONDS
+from reliquary.constants import BLOCK_TIME_SECONDS, WINDOW_LENGTH
 
 logger = logging.getLogger(__name__)
 
@@ -155,20 +155,56 @@ def compute_drand_round_for_window(
 
 
 def compute_window_randomness(
-    block_hash: str,
+    block_hash: str | None,
     drand_randomness: str | None = None,
     drand_round: int | None = None,
 ) -> str:
-    """Combine block hash, drand randomness, and round into window randomness.
+    """Combine drand randomness (+ optional block hash) into a window seed.
 
     Including the round number prevents a miner from choosing a round
     whose randomness is favorable.
+
+    As of v2.3 ``block_hash`` may be None — the drand-only path. Drand
+    quicknet provides threshold-BLS unpredictability that doesn't require
+    a chain-anchored mix to be secure. Dropping the block_hash decouples
+    window randomness from substrate availability, so a flaky WebSocket
+    no longer stalls window OPEN.
     """
-    clean_hash = block_hash.replace("0x", "")
     if drand_randomness:
-        material = bytes.fromhex(clean_hash) + bytes.fromhex(drand_randomness)
+        material = b""
+        if block_hash is not None:
+            material += bytes.fromhex(block_hash.replace("0x", ""))
+        material += bytes.fromhex(drand_randomness)
         if drand_round is not None:
             material += drand_round.to_bytes(8, "big")
-        combined = hashlib.sha256(material).hexdigest()
-        return combined
-    return clean_hash
+        return hashlib.sha256(material).hexdigest()
+    if block_hash is None:
+        raise ValueError(
+            "compute_window_randomness requires either block_hash or drand_randomness"
+        )
+    return block_hash.replace("0x", "")
+
+
+def compute_drand_round_for_ordering(
+    window_start_block: int,
+    genesis_time: int,
+    period: int,
+    window_length_blocks: int = WINDOW_LENGTH,
+    margin_seconds: int = 1,
+) -> int:
+    """Drand round whose σ_R publishes AFTER the window's nominal close.
+
+    Used by the validator at seal time to seed batch ordering and emission
+    split. Because round_time(R) > window_close + margin, σ_R is unknown
+    to miners during the submission window — making the ordering uncheatable.
+
+    Derived from chain timing (block * BLOCK_TIME_SECONDS) so all validators
+    sharing the same chain params agree on R without coordinating clocks.
+    """
+    close_ts = (window_start_block + window_length_blocks) * BLOCK_TIME_SECONDS
+    target_ts = close_ts + margin_seconds
+    if target_ts < genesis_time:
+        return 1
+    # round R such that round_time(R) > target_ts. round_at_time returns
+    # the round in progress at t (round_time ≤ t), so +1 gives strictly future.
+    return 2 + (target_ts - genesis_time) // period

@@ -262,7 +262,7 @@ async def test_verify_model_refreshed_only_after_publish(monkeypatch):
         svc._open_window()
     svc._active_batcher.seal_event.set()
     # Pretend the seal produced a full batch so trained=True.
-    svc._active_batcher.seal_batch = MagicMock(return_value=[MagicMock()] * 100)
+    svc._active_batcher.seal_batch = MagicMock(return_value=([MagicMock()] * 100, {}))
 
     await svc._train_and_publish()
 
@@ -302,7 +302,7 @@ async def test_verify_model_NOT_refreshed_when_publish_skipped(monkeypatch):
     with _patch_open_grpo_window(svc):
         svc._open_window()  # bumps to 6
     svc._active_batcher.seal_event.set()
-    svc._active_batcher.seal_batch = MagicMock(return_value=[MagicMock()] * 100)
+    svc._active_batcher.seal_batch = MagicMock(return_value=([MagicMock()] * 100, {}))
 
     await svc._train_and_publish()
 

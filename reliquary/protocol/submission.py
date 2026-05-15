@@ -42,7 +42,11 @@ class RejectReason(str, Enum):
     PROMPT_MISMATCH = "prompt_mismatch"
     DISTRIBUTION_SUSPICIOUS = "distribution_suspicious"
     PROMPT_IN_COOLDOWN = "prompt_in_cooldown"
+    # Deprecated v2.3+: SUPERSEDED is no longer emitted by the validator
+    # (drand ordering replaced the FIFO per-prompt claim). Kept in the
+    # enum so historical archives in R2 that carry the string deserialize.
     SUPERSEDED = "superseded"
+    PROMPT_FULL = "prompt_full"
     GRAIL_FAIL = "grail_fail"
     HASH_DUPLICATE = "hash_duplicate"
     LOGPROB_MISMATCH = "logprob_mismatch"

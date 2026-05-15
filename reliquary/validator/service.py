@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 from typing import Any
@@ -432,7 +433,20 @@ class ValidationService:
             return
 
         self._set_state(WindowState.TRAINING)
-        batch = self._active_batcher.seal_batch()
+        # v2.3: derive the post-close drand seed for ordering + emission
+        # split. Falls back to a deterministic zero seed if drand fetch
+        # fails so seal_batch can still proceed (validators degrade to a
+        # deterministic but uniform ordering rather than stalling).
+        try:
+            ordering_seed = await self._derive_ordering_seed(self._window_n)
+        except Exception:
+            logger.exception(
+                "Window %d: ordering seed fetch failed; falling back to zero seed",
+                self._window_n,
+            )
+            ordering_seed = b"\x00" * 32
+        batch, rewards = self._active_batcher.seal_batch(ordering_seed=ordering_seed)
+        self._active_batcher.rewards_by_hotkey = rewards
         # Note: miners earn slots regardless of training. Their contribution
         # is reflected in the next ``_submit_weights`` call, which replays
         # the EMA from R2 archives written by ``_archive_window`` below.
@@ -636,6 +650,10 @@ class ValidationService:
             "runners_up": runners_up,
             "reject_summary": dict(getattr(batcher, "reject_counts", {})),
             "rejected": rejected_entries,
+            # v2.3: per-hotkey emission share from select_batch_and_distribute.
+            # All miners whose prompt landed in the winning set appear here,
+            # even if their specific submission wasn't picked for training.
+            "rewards_by_hotkey": dict(getattr(batcher, "rewards_by_hotkey", {})),
             "late_drops": {
                 hk: dict(counts) for hk, counts in self._late_drops.items()
             },
@@ -865,7 +883,15 @@ class ValidationService:
             )
 
     async def _derive_randomness(self, subtensor, target_window: int) -> str:
-        block_hash = await chain.get_block_hash(subtensor, target_window)
+        """v2.3+: drand-only seed for the per-window GRAIL randomness.
+
+        Dropped the ``chain.get_block_hash`` call that v2.2 mixed into the
+        seed. Drand quicknet provides threshold-BLS unpredictability that
+        doesn't need a chain-anchored mix to be secure, and the substrate
+        WebSocket fetch was the bottleneck that stalled window OPEN under
+        finney 503s. ``subtensor`` is kept in the signature for the legacy
+        test path that disables drand (mock seeding off block_hash).
+        """
         if self.use_drand:
             from reliquary.infrastructure.drand import get_beacon, get_current_chain
             chain_info = get_current_chain()
@@ -874,8 +900,33 @@ class ValidationService:
             )
             beacon = get_beacon(round_id=str(drand_round), use_drand=True)
             return chain.compute_window_randomness(
-                block_hash, beacon["randomness"], drand_round=beacon["round"],
+                None, beacon["randomness"], drand_round=beacon["round"],
             )
+        # Legacy mock-only path: still uses block_hash so tests that
+        # disable drand keep working without a live drand fetch.
+        block_hash = await chain.get_block_hash(subtensor, target_window)
         return chain.compute_window_randomness(block_hash)
+
+    async def _derive_ordering_seed(self, target_window: int) -> bytes:
+        """Drand seed for batch ordering — published AFTER window close.
+
+        Used by ``select_batch_and_distribute`` to drand-order the winning
+        prompts and to seed the per-prompt training pick. Because
+        ``round_time(R) > window_close + margin``, miners cannot grind
+        submissions against it.
+        """
+        from reliquary.infrastructure.drand import get_beacon, get_current_chain
+        chain_info = get_current_chain()
+        ordering_round = chain.compute_drand_round_for_ordering(
+            target_window,
+            genesis_time=chain_info["genesis_time"],
+            period=chain_info["period"],
+        )
+        beacon = get_beacon(round_id=str(ordering_round), use_drand=self.use_drand)
+        # H(σ_R || R) — round-bound to prevent any cross-window reuse.
+        material = bytes.fromhex(beacon["randomness"]) + int(
+            beacon["round"]
+        ).to_bytes(8, "big")
+        return hashlib.sha256(material).digest()
 
 

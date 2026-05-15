@@ -118,9 +118,10 @@ def test_two_windows_with_cooldown():
         )
         resp = b0.accept_submission(req)
         assert resp.accepted, f"unexpected reject for hk{i}: {resp.reason}"
-    batch0 = b0.seal_batch()
+    batch0, _ = b0.seal_batch()
     assert len(batch0) == B_BATCH
-    # select_batch sorts by tiebreak hash; any B_BATCH of the submitted prompts may win
+    # v2.3: select_batch_and_distribute drand-orders prompts; any B_BATCH of
+    # the submitted prompts may win for a given seed.
     batched_prompts = {s.prompt_idx for s in batch0}
     assert len(batched_prompts) == B_BATCH
     assert batched_prompts.issubset(set(range(n_submissions)))

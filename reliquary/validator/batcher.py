@@ -18,6 +18,7 @@ from reliquary.constants import (
     BATCH_PROMPT_COOLDOWN_WINDOWS,
     B_BATCH,
     M_ROLLOUTS,
+    MAX_SUBMISSIONS_PER_PROMPT,
     REJECTED_LIST_CAP_PER_HOTKEY,
 )
 from reliquary.environment.base import Environment
@@ -31,7 +32,7 @@ from reliquary.protocol.submission import (
     WindowState,
 )
 from reliquary.protocol.tokens import verify_tokens
-from reliquary.validator.batch_selection import select_batch
+from reliquary.validator.batch_selection import select_batch_and_distribute
 from reliquary.validator.cooldown import CooldownMap
 from reliquary.validator.dedup import RolloutHashSet, compute_rollout_hash
 from reliquary.validator.verifier import (
@@ -46,10 +47,12 @@ from reliquary.validator.verifier import (
 logger = logging.getLogger(__name__)
 
 
-# v2.2: ``signed_round`` was removed entirely from the protocol. The batch
-# selection mechanism is now pure TCP-arrival FIFO (see ``batch_selection.py``)
-# and submissions are short-circuited to SUPERSEDED on the first claim of
-# any given ``prompt_idx`` for the active window.
+# v2.3: batch selection is drand-anchored at seal time (see
+# ``batch_selection.py``). Multiple miners may submit on the same
+# ``prompt_idx`` within a window, capped at ``MAX_SUBMISSIONS_PER_PROMPT``
+# per prompt. Emission is split uniformly across all GRAIL-validated
+# submissions whose prompt lands in the winning set, so sybiling the same
+# prompt is strictly neutral.
 
 
 @dataclass
@@ -174,14 +177,17 @@ class GrpoWindowBatcher:
 
         self._lock = threading.Lock()
         self._valid: list[ValidSubmission] = []
-        # Per-prompt claim set. As of v2.2 the FIFO mechanism is pure
-        # TCP-arrival: the first submission accepted for a given
-        # ``prompt_idx`` claims the slot, and any subsequent submission for
-        # the same prompt is rejected SUPERSEDED before any heavy
-        # validation (reward / GRAIL forward pass). This replaces the old
-        # ``_best_round_per_prompt`` mechanism keyed by ``signed_round``.
-        self._claimed_prompts: set[int] = set()
+        # v2.3: per-prompt bucket. Multiple miners may submit on the same
+        # ``prompt_idx`` up to ``MAX_SUBMISSIONS_PER_PROMPT``. Tracked
+        # alongside the flat ``_valid`` list because seal_batch needs the
+        # grouping but accept-time logic only needs the count.
+        self._submissions_per_prompt: dict[int, list[ValidSubmission]] = {}
         self.randomness: str = ""
+        # v2.3: post-seal emission distribution. Populated by seal_batch and
+        # consumed by _archive_window so the EMA / weight-setter can credit
+        # all GRAIL-validated submissions whose prompt landed in the
+        # winning set, not just the one picked for the training step.
+        self.rewards_by_hotkey: dict[str, float] = {}
         # Accumulated reject reasons this window (RejectReason.value → count).
         # Persisted in the R2 archive so miners can see which filter is
         # rejecting the most submissions in any given round.
@@ -249,18 +255,16 @@ class GrpoWindowBatcher:
             return self._reject(RejectReason.WRONG_CHECKPOINT, hotkey=hk, prompt_idx=pi)
         if request.prompt_idx >= len(self.env):
             return self._reject(RejectReason.BAD_PROMPT_IDX, hotkey=hk, prompt_idx=pi)
-        # v2.2: ``signed_round`` was removed from the protocol entirely.
-        # Cooldown and prompt-claim short-circuits below handle ordering.
         if self._cooldown.is_in_cooldown(request.prompt_idx, self.window_start):
             return self._reject(RejectReason.PROMPT_IN_COOLDOWN, hotkey=hk, prompt_idx=pi)
-        # FIFO short-circuit by TCP arrival: the first submission to pass the
-        # full validation pipeline for a given ``prompt_idx`` claims the
-        # slot. Every subsequent submission for the same prompt is rejected
-        # immediately, BEFORE the expensive reward + GRAIL checks. This is
-        # what protects the validator from being DoS'd by a flood of
-        # duplicate-prompt submissions and keeps each prompt single-winner.
-        if request.prompt_idx in self._claimed_prompts:
-            return self._reject(RejectReason.SUPERSEDED, hotkey=hk, prompt_idx=pi)
+        # v2.3: cap submissions per prompt before the heavy verify. Once a
+        # prompt has ``MAX_SUBMISSIONS_PER_PROMPT`` GRAIL-validated entries,
+        # further attempts are rejected PROMPT_FULL without running GRAIL.
+        # This bounds the validator's GPU cost in the worst case where many
+        # miners attack the same prompt.
+        existing = self._submissions_per_prompt.get(request.prompt_idx, [])
+        if len(existing) >= MAX_SUBMISSIONS_PER_PROMPT:
+            return self._reject(RejectReason.PROMPT_FULL, hotkey=hk, prompt_idx=pi)
 
         # Per-rollout hash dedup against the persistent set + within this
         # submission. Computed once here, reused at seal_batch and archive.
@@ -439,27 +443,26 @@ class GrpoWindowBatcher:
                     dist_q10_min=dist_q10_min,
                 )
 
-        # All checks passed — claim this prompt. Future submissions for the
-        # same ``prompt_idx`` are short-circuited at the top of
-        # ``_accept_locked`` and never reach the validation pipeline.
-        self._claimed_prompts.add(request.prompt_idx)
-
-        self._valid.append(
-            ValidSubmission(
-                hotkey=request.miner_hotkey,
-                prompt_idx=request.prompt_idx,
-                merkle_root_bytes=bytes.fromhex(request.merkle_root),
-                sigma=sigma,
-                rollouts=list(request.rollouts),
-                completion_texts=completion_texts,
-                arrived_at=self._time_fn(),
-                sketch_diff_max=sketch_diff_max,
-                lp_dev_max=lp_dev_max,
-                dist_q10_min=dist_q10_min,
-                claimed_checkpoint_hash=request.checkpoint_hash,
-                rollout_hashes=rollout_hashes,
-            )
+        # All checks passed — append to both the flat list and the per-prompt
+        # bucket. The bucket is what seal_batch groups over.
+        new_sub = ValidSubmission(
+            hotkey=request.miner_hotkey,
+            prompt_idx=request.prompt_idx,
+            merkle_root_bytes=bytes.fromhex(request.merkle_root),
+            sigma=sigma,
+            rollouts=list(request.rollouts),
+            completion_texts=completion_texts,
+            arrived_at=self._time_fn(),
+            sketch_diff_max=sketch_diff_max,
+            lp_dev_max=lp_dev_max,
+            dist_q10_min=dist_q10_min,
+            claimed_checkpoint_hash=request.checkpoint_hash,
+            rollout_hashes=rollout_hashes,
         )
+        self._valid.append(new_sub)
+        self._submissions_per_prompt.setdefault(
+            request.prompt_idx, []
+        ).append(new_sub)
         # Lock-free read in /state — see ``__init__`` for rationale.
         self.valid_count = len(self._valid)
 
@@ -517,22 +520,41 @@ class GrpoWindowBatcher:
         with self._lock:
             return list(self._valid)
 
-    def seal_batch(self) -> list[ValidSubmission]:
+    def seal_batch(
+        self, ordering_seed: bytes | None = None, pool: float = 1.0
+    ) -> tuple[list[ValidSubmission], dict[str, float]]:
+        """Pick the training batch and compute the reward distribution.
+
+        ``ordering_seed`` must be the drand-derived seed for the post-close
+        round (see ``compute_drand_round_for_ordering``). Defaults to a
+        zero-seed for tests that don't care about cross-validator
+        determinism; production callers always pass a real seed.
+
+        Returns (training_batch, rewards_by_hotkey). Cooldown and hash-set
+        bookkeeping is applied to every winning prompt — not just the one
+        submission picked for training — because all of them get emission
+        and were therefore "used" by this window.
+        """
         with self._lock:
-            batch = select_batch(
-                self._valid,
+            seed = ordering_seed if ordering_seed is not None else b"\x00" * 32
+            batch, rewards = select_batch_and_distribute(
+                submissions_by_prompt=self._submissions_per_prompt,
                 b=B_BATCH,
-                current_window=self.window_start,
+                ordering_seed=seed,
                 cooldown_map=self._cooldown,
+                current_window=self.window_start,
+                pool=pool,
             )
-            for sub in batch:
-                self._cooldown.record_batched(sub.prompt_idx, self.window_start)
+            winning_prompts = {sub.prompt_idx for sub in batch}
+            for p in winning_prompts:
+                self._cooldown.record_batched(p, self.window_start)
                 if self._hash_set is not None:
-                    for h in sub.rollout_hashes:
-                        self._hash_set.add(h, self.window_start)
+                    for sub in self._submissions_per_prompt.get(p, []):
+                        for h in sub.rollout_hashes:
+                            self._hash_set.add(h, self.window_start)
             if self._hash_set is not None:
                 self._hash_set.prune(self.window_start)
-            return batch
+            return batch, rewards
 
     def get_state(self) -> GrpoBatchState:
         with self._lock:

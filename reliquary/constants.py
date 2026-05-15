@@ -205,9 +205,16 @@ HASH_DEDUP_RETENTION_WINDOWS = 10000
 # Max submissions any single hotkey can send per window. Counter resets at
 # every new window (on batcher swap). Excess submissions are HTTP-rejected
 # as RATE_LIMITED before touching the validation pipeline. 8 matches B_BATCH
-# — an honest miner needs 1 winning submission per window; 8 leaves 7 retries
-# for SUPERSEDED losses on hot prompts.
+# — one slot per prompt a hotkey can credibly win in a window.
 MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW = 8
+
+# Max GRAIL-validated submissions retained per prompt per window. Once this
+# cap is reached for a prompt, further submissions for that prompt are
+# rejected as PROMPT_FULL before the heavy verify. Bounds the validator's
+# GPU cost when many miners attack the same prompt — combined with the
+# per-hotkey cap above, worst-case GRAIL load per window is
+# MAX_SUBMISSIONS_PER_PROMPT × min(|env|, MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW × n_hotkeys).
+MAX_SUBMISSIONS_PER_PROMPT = 10
 
 # Bootstrap phase: first BOOTSTRAP_WINDOWS of a new subnet/checkpoint use
 # relaxed thresholds to keep the batch filling while miner pop + env
