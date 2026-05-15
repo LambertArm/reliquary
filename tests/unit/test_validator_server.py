@@ -72,6 +72,11 @@ def _batcher(window_start=500, cooldown_map=None):
         drand_round_check_enabled=False,
     )
     batcher.current_checkpoint_hash = "sha256:test"
+    # Match the per-window randomness used by ``_make_commit`` so the
+    # randomness-binding check accepts the test request. Production sets
+    # this in service.py's ``_set_window_randomness`` step before the
+    # window opens for submissions.
+    batcher.randomness = "cd" * 16
     return batcher
 
 
