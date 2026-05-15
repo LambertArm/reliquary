@@ -33,7 +33,10 @@ def mine(
     wallet_name: str = typer.Option("default", help="Wallet name"),
     hotkey: str = typer.Option("default", help="Hotkey name"),
     checkpoint: str = typer.Option(..., help="Model checkpoint path"),
-    environment: str = typer.Option(ENVIRONMENT_NAME, help="Environment name"),
+    environment: str = typer.Option(
+        os.getenv("RELIQUARY_ENVIRONMENT_NAME", ENVIRONMENT_NAME),
+        help="Environment name (env: RELIQUARY_ENVIRONMENT_NAME)",
+    ),
     validator_url: str = typer.Option(
         "",
         help=(
@@ -173,7 +176,10 @@ def validate(
     wallet_name: str = typer.Option("default", help="Wallet name"),
     hotkey: str = typer.Option("default", help="Hotkey name"),
     checkpoint: str = typer.Option(DEFAULT_BASE_MODEL, help="HF repo id or local path of the model to load (trainer mode only)"),
-    environment: str = typer.Option(ENVIRONMENT_NAME, help="Environment name (trainer mode only)"),
+    environment: str = typer.Option(
+        os.getenv("RELIQUARY_ENVIRONMENT_NAME", ENVIRONMENT_NAME),
+        help="Environment name (trainer mode only; env: RELIQUARY_ENVIRONMENT_NAME)",
+    ),
     http_host: str = typer.Option("0.0.0.0", help="HTTP bind address (trainer mode only)"),
     http_port: int = typer.Option(VALIDATOR_HTTP_PORT, help="HTTP listen port (trainer mode only)"),
     external_ip: str = typer.Option(
