@@ -98,7 +98,7 @@ REJECTED_LIST_CAP_PER_HOTKEY = 5
 VALIDATOR_HTTP_PORT = 8888
 
 # Active environment name (resolved by reliquary.environment.load_environment).
-ENVIRONMENT_NAME = "math"
+ENVIRONMENT_NAME = "openmathinstruct"
 
 # UID that receives unused slot emission budget (the burn address).
 UID_BURN = 0
