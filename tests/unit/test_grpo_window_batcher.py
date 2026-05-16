@@ -625,27 +625,24 @@ def test_drand_round_current_accepted():
 
 
 def test_drand_round_one_behind_accepted_with_default_tolerance():
-    """Default ``DRAND_ROUND_BACKWARD_TOLERANCE = 10`` absorbs typical
-    HTTP RTT + small clock skew. ``drand_round = current - 1`` is well
-    inside that window.
+    """Default ``DRAND_ROUND_BACKWARD_TOLERANCE = 1`` covers the one
+    residual case after the arrival-time refactor: a miner firing near
+    the end of round R lands at the validator just past the R→R+1
+    boundary because of network RTT. ``drand_round = current - 1`` is
+    exactly that case and MUST be accepted.
     """
     b = _make_batcher_with_drand_check(fixed_round=100)
     assert b.validate_drand_round(99) is None
 
 
-def test_drand_round_ten_behind_accepted_with_default_tolerance():
-    """Tolerance = 10 must accept the ``current - 10`` edge — far boundary
-    of the absorption window for cross-continent RTT jitter."""
+def test_drand_round_two_behind_stale_under_default_tolerance():
+    """Tolerance = 1 means [current - 1, current] is accepted. Round =
+    current - 2 is outside that window and MUST be STALE_ROUND — the
+    gate is a hard cliff. Anything older than one round is either a
+    miner mis-timing (their clock is way off) or a genuine antedating
+    attempt, neither of which the protocol should absorb."""
     b = _make_batcher_with_drand_check(fixed_round=100)
-    assert b.validate_drand_round(90) is None  # current - 10
-
-
-def test_drand_round_eleven_behind_stale_under_default_tolerance():
-    """Tolerance = 10 means [current - 10, current] is accepted. Round =
-    current - 11 is outside that window and MUST be STALE_ROUND — the
-    gate stays a hard cliff."""
-    b = _make_batcher_with_drand_check(fixed_round=100)
-    assert b.validate_drand_round(89) == RejectReason.STALE_ROUND  # current-11
+    assert b.validate_drand_round(98) == RejectReason.STALE_ROUND  # current-2
 
 
 def test_drand_round_future_rejected():
@@ -664,17 +661,22 @@ def test_drand_round_zero_tolerance_one_behind_stale():
     assert b.validate_drand_round(99) == RejectReason.STALE_ROUND
 
 
-def test_drand_round_default_backward_tolerance_is_ten():
+def test_drand_round_default_backward_tolerance_is_one():
     """Pin the default. Changing this in constants is a deliberate
     protocol-tuning decision, not an incidental refactor — make any
     drift loud.
 
-    Bumped from 1 → 10 (PR #31) after empirical observation that the
-    validator's FastAPI event loop stalls 5–30 s during trainer GIL
-    contention. Cheap-reject ``time.time()`` is taken when the handler
-    runs, not when the TCP packet arrived, so tolerance = 1 still
-    rejected submissions across the stall. Operators can override via
-    the ``DRAND_ROUND_BACKWARD_TOLERANCE`` env var.
+    History: bumped 1 → 10 by PR #31 to absorb worker-side dequeue lag
+    when ``_accept_locked`` re-validated drand_round against
+    ``time.time()`` at dequeue (which could be minutes after arrival
+    under GRAIL queue backpressure). The arrival-time refactor + the
+    worker-side check removal (commits 6ff21d0 + f157002) eliminated
+    that source of lag entirely, so the wide tolerance was no longer
+    paying for itself. Tightening back to 1 restores meaningful
+    chronological ordering (3 s antedate cap vs the 30 s under
+    tolerance 10). Operators can re-widen via the
+    ``DRAND_ROUND_BACKWARD_TOLERANCE`` env var if their cross-continent
+    RTT profile demands it.
     """
     import os
     # Pin the *unset* default — env-var override would skew the test.
@@ -683,7 +685,7 @@ def test_drand_round_default_backward_tolerance_is_ten():
         import importlib
         import reliquary.constants
         importlib.reload(reliquary.constants)
-        assert reliquary.constants.DRAND_ROUND_BACKWARD_TOLERANCE == 10
+        assert reliquary.constants.DRAND_ROUND_BACKWARD_TOLERANCE == 1
     finally:
         if prior is not None:
             os.environ["DRAND_ROUND_BACKWARD_TOLERANCE"] = prior
