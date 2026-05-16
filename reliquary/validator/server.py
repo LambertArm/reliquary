@@ -21,7 +21,7 @@ import logging
 import time
 from typing import Any, Callable
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 import uvicorn
 
@@ -142,6 +142,29 @@ class ValidatorServer:
     def _build_app(self) -> FastAPI:
         app = FastAPI(title="Reliquary Validator", version="2.0")
 
+        @app.middleware("http")
+        async def stamp_arrival(request: Request, call_next):
+            """Stamp the wall-clock arrival time on every request.
+
+            Runs before pydantic body validation and before the route
+            handler, so ``request.state.t_arrival`` reflects when the
+            asyncio loop first picked the request up — not when the
+            handler eventually executes. The /submit cheap-reject path
+            consumes this attribute and forwards it to
+            ``validate_drand_round`` so the drand timing gate is decided
+            against the actual arrival instant, not against the moment
+            the handler eventually runs (which can lag by tens of ms
+            under load even for fast handlers).
+
+            The drand check happens EXCLUSIVELY here on the arrival path —
+            there's no worker-side re-check that would otherwise re-read
+            ``time.time()`` minutes later when GRAIL queue backpressure
+            delays dequeue (which would turn on-time submissions into
+            STALE_ROUND rejections, the bug pre-this-fix).
+            """
+            request.state.t_arrival = time.time()
+            return await call_next(request)
+
         @app.get("/health", response_model=_Health)
         async def health() -> _Health:
             return _Health(
@@ -152,8 +175,16 @@ class ValidatorServer:
             )
 
         @app.post("/submit", response_model=BatchSubmissionResponse)
-        async def submit(request: BatchSubmissionRequest) -> BatchSubmissionResponse:
+        async def submit(
+            request: BatchSubmissionRequest,
+            http_request: Request,
+        ) -> BatchSubmissionResponse:
             from reliquary.protocol.submission import WindowState
+            # ASGI middleware stamped this. Falls back to time.time() if a
+            # caller bypasses the middleware (e.g. some test harnesses).
+            t_arrival = getattr(http_request.state, "t_arrival", None)
+            if t_arrival is None:
+                t_arrival = time.time()
             # Rate limit FIRST — cheapest reject before any state/queue work.
             hk = request.miner_hotkey
             n = self._per_window_counts.get(hk, 0)
@@ -239,7 +270,9 @@ class ValidatorServer:
             if batcher.current_checkpoint_hash and request.checkpoint_hash != batcher.current_checkpoint_hash:
                 return _cheap_reject(RejectReason.WRONG_CHECKPOINT)
             if batcher.drand_round_check_enabled:
-                round_reject = batcher.validate_drand_round(request.drand_round)
+                round_reject = batcher.validate_drand_round(
+                    request.drand_round, t_arrival=t_arrival,
+                )
                 if round_reject is not None:
                     return _cheap_reject(round_reject)
             if request.prompt_idx >= len(batcher.env):

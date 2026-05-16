@@ -276,14 +276,47 @@ class GrpoWindowBatcher:
     def accept_submission(
         self, request: BatchSubmissionRequest
     ) -> BatchSubmissionResponse:
-        """Run the full verification pipeline; append to ``_valid`` on success."""
+        """Run the full verification pipeline; append to ``_valid`` on success.
+
+        Does NOT re-check ``drand_round`` — that's a wall-clock timing gate,
+        which is decided once at HTTP arrival by ``server.py``'s cheap-reject
+        path (which calls ``validate_drand_round`` directly with the
+        middleware-stamped ``t_arrival``). Re-checking here would either
+        anachronistically reject (using ``time.time()`` at worker dequeue,
+        which can be minutes after arrival in a saturated GRAIL queue) or
+        re-do the same check with the same timestamp — both bad. Drand is
+        an arrival-time check, decided once.
+        """
         with self._lock:
             return self._accept_locked(request)
 
-    def validate_drand_round(self, drand_round: int) -> RejectReason | None:
+    def validate_drand_round(
+        self,
+        drand_round: int,
+        *,
+        t_arrival: float | None = None,
+    ) -> RejectReason | None:
         """Return the appropriate reject reason if ``drand_round`` is
         outside the accepted window of [current - tolerance, current], else
         None.
+
+        ``t_arrival`` is the wall-clock time at which the request was
+        received by the validator's HTTP server (stamped by the ASGI
+        ``stamp_arrival`` middleware in ``server.py``). When provided, it
+        is used to compute the "current" round instead of ``time.time()``
+        at call time. This decouples the round check from validator-side
+        processing latency: if the asyncio loop stalls for N seconds
+        (trainer GIL contention, GRAIL queue backpressure, pydantic body
+        parsing on the loop), a submission that arrived at the validator
+        within its round is still accepted, because the round is computed
+        as of the arrival timestamp, not as of when the handler finally
+        runs. Without this, an honest submission that landed inside its
+        round can become STALE_ROUND purely because the validator was
+        busy when the handler executed.
+
+        Falls back to ``self._wall_clock()`` if ``t_arrival`` is None
+        (e.g. the worker-path re-check inside ``_accept_locked`` called
+        directly, tests that don't go through the HTTP layer).
 
         Forward direction is zero-tolerance: a miner that attaches round
         R+1 hasn't seen σ_{R+1} yet (σ_R is the freshest signed beacon by
@@ -302,6 +335,9 @@ class GrpoWindowBatcher:
         The security cost is bounded: an attacker can antedate by at most
         ``tolerance`` rounds (3 s × tolerance) of chronological priority,
         which is uniform across honest and malicious miners alike.
+        Combined with arrival-time stamping, the backward tolerance can
+        now be tightened safely (the wide default existed to absorb loop
+        stalls — that's no longer needed on the HTTP path).
 
         Public so the HTTP /submit handler can run it pre-queue and
         short-circuit the rejection without waiting on the worker.
@@ -311,8 +347,9 @@ class GrpoWindowBatcher:
             self._drand_chain_info = get_current_chain()
         ci = self._drand_chain_info
         from reliquary.infrastructure.chain import compute_current_drand_round
+        t = t_arrival if t_arrival is not None else self._wall_clock()
         current = compute_current_drand_round(
-            self._wall_clock(), ci["genesis_time"], ci["period"],
+            t, ci["genesis_time"], ci["period"],
         )
         if drand_round > current:
             return RejectReason.FUTURE_ROUND
@@ -331,16 +368,16 @@ class GrpoWindowBatcher:
         # (pre-first-publish or test convenience).
         if self.current_checkpoint_hash and request.checkpoint_hash != self.current_checkpoint_hash:
             return self._reject(RejectReason.WRONG_CHECKPOINT, hotkey=hk, prompt_idx=pi)
-        # v2.3: drand round timing gate. The miner must attach the round
-        # currently in progress at submit time, with one round of tolerance
-        # backward for network jitter. Attaching an older round attempts
-        # to claim an earlier chronological slot than the submission
-        # actually earned; attaching a future round is impossible without
-        # having seen σ_R (so always rejected).
-        if self.drand_round_check_enabled:
-            round_check = self.validate_drand_round(request.drand_round)
-            if round_check is not None:
-                return self._reject(round_check, hotkey=hk, prompt_idx=pi)
+        # NOTE: drand_round is intentionally NOT re-checked here. It's a
+        # wall-clock timing gate decided once at HTTP arrival (see
+        # ``server.py``'s cheap-reject path → ``validate_drand_round`` with
+        # the middleware-stamped ``t_arrival``). Re-checking at worker
+        # dequeue would use ``time.time()`` at dequeue, which can be
+        # minutes after the submission arrived if the GRAIL queue is
+        # saturated — turning honest, on-time submissions into STALE_ROUND
+        # rejections. Drand is the single check that depends on the
+        # validator's clock at receipt, so it belongs exclusively on the
+        # arrival path.
         if request.prompt_idx >= len(self.env):
             return self._reject(RejectReason.BAD_PROMPT_IDX, hotkey=hk, prompt_idx=pi)
         if self._cooldown.is_in_cooldown(request.prompt_idx, self.window_start):
