@@ -21,7 +21,7 @@ import logging
 import time
 from typing import Any, Callable
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 import uvicorn
 
@@ -142,6 +142,31 @@ class ValidatorServer:
     def _build_app(self) -> FastAPI:
         app = FastAPI(title="Reliquary Validator", version="2.0")
 
+        @app.middleware("http")
+        async def stamp_arrival(request: Request, call_next):
+            """Stamp the wall-clock arrival time on every request.
+
+            Runs before pydantic body validation and before the route
+            handler, so ``request.state.t_arrival`` reflects when the
+            asyncio loop first picked the request up — not when the
+            handler eventually executes. The drand-round check uses this
+            timestamp so submissions aren't penalized when the loop is
+            stalled (trainer GIL contention, slow body parsing, GRAIL
+            queue backpressure). See ``GrpoWindowBatcher.validate_drand_round``
+            for the rationale; the round computation downstream consumes
+            this attribute.
+
+            Caveat: if uvicorn's ``accept()`` itself is blocked (whole
+            event loop frozen, no coroutines running at all), this
+            middleware also doesn't run and ``t_arrival`` lands as late
+            as the handler would have anyway. That deeper case is what
+            the process-isolation refactor of the trainer addresses; the
+            stamping here covers the common 99 % where the loop is busy
+            but progressing.
+            """
+            request.state.t_arrival = time.time()
+            return await call_next(request)
+
         @app.get("/health", response_model=_Health)
         async def health() -> _Health:
             return _Health(
@@ -152,8 +177,16 @@ class ValidatorServer:
             )
 
         @app.post("/submit", response_model=BatchSubmissionResponse)
-        async def submit(request: BatchSubmissionRequest) -> BatchSubmissionResponse:
+        async def submit(
+            request: BatchSubmissionRequest,
+            http_request: Request,
+        ) -> BatchSubmissionResponse:
             from reliquary.protocol.submission import WindowState
+            # ASGI middleware stamped this. Falls back to time.time() if a
+            # caller bypasses the middleware (e.g. some test harnesses).
+            t_arrival = getattr(http_request.state, "t_arrival", None)
+            if t_arrival is None:
+                t_arrival = time.time()
             # Rate limit FIRST — cheapest reject before any state/queue work.
             hk = request.miner_hotkey
             n = self._per_window_counts.get(hk, 0)
@@ -239,7 +272,9 @@ class ValidatorServer:
             if batcher.current_checkpoint_hash and request.checkpoint_hash != batcher.current_checkpoint_hash:
                 return _cheap_reject(RejectReason.WRONG_CHECKPOINT)
             if batcher.drand_round_check_enabled:
-                round_reject = batcher.validate_drand_round(request.drand_round)
+                round_reject = batcher.validate_drand_round(
+                    request.drand_round, t_arrival=t_arrival,
+                )
                 if round_reject is not None:
                     return _cheap_reject(round_reject)
             if request.prompt_idx >= len(batcher.env):
@@ -259,7 +294,7 @@ class ValidatorServer:
             # silently draining the leftover queue at the next batcher swap
             # (see ``_submit_worker`` below), not by HTTP-level rejections.
             if self._worker_task is None:
-                resp = batcher.accept_submission(request)
+                resp = batcher.accept_submission(request, t_arrival=t_arrival)
                 # Sync path (tests) — the real verdict is already known
                 # before we return, so record it directly.
                 self.record_verdict(
@@ -268,7 +303,7 @@ class ValidatorServer:
                 )
                 return resp
 
-            await self._submit_queue.put((request, batcher))
+            await self._submit_queue.put((request, batcher, t_arrival))
             return BatchSubmissionResponse(
                 accepted=True, reason=RejectReason.SUBMITTED,
             )
@@ -353,7 +388,7 @@ class ValidatorServer:
 
         while True:
             try:
-                request, batcher = await self._submit_queue.get()
+                request, batcher, t_arrival = await self._submit_queue.get()
             except asyncio.CancelledError:
                 return
             # Silently drop items whose batcher is no longer the active one.
@@ -414,7 +449,7 @@ class ValidatorServer:
                 continue
             try:
                 response = await asyncio.to_thread(
-                    batcher.accept_submission, request
+                    batcher.accept_submission, request, t_arrival=t_arrival,
                 )
                 if response.accepted:
                     logger.info(

@@ -241,6 +241,84 @@ def test_cheap_reject_logs_warning():
     assert reject_lines, "WARNING log missing for cheap WRONG_CHECKPOINT reject"
 
 
+def test_validate_drand_round_called_with_arrival_timestamp():
+    """The HTTP cheap-reject must forward the middleware-stamped
+    ``t_arrival`` into ``batcher.validate_drand_round``. Without this,
+    the drand check uses ``time.time()`` at handler-execution time and
+    becomes vulnerable to event-loop stalls — the prod failure mode the
+    arrival-time stamping was added to fix.
+    """
+    import time
+
+    s, batcher = _setup(
+        current_checkpoint_hash="sha256:current",
+        drand_round_check_enabled=True,
+        validate_round_returns=None,  # treat round as OK so we reach acceptance
+    )
+    payload = _submission()
+    t_before = time.time()
+    with TestClient(s.app) as client:
+        client.post("/submit", json=payload)
+    t_after = time.time()
+
+    assert batcher.validate_drand_round.called, (
+        "drand check should have run on the cheap-reject path"
+    )
+    _args, kwargs = batcher.validate_drand_round.call_args
+    assert "t_arrival" in kwargs, (
+        "/submit must pass t_arrival kwarg (middleware-stamped wall clock) "
+        "into validate_drand_round — the bug this regression test pins is "
+        "the handler reading time.time() too late, after a stall"
+    )
+    t_arrival = kwargs["t_arrival"]
+    # The stamp must land between t_before and t_after — i.e. the
+    # middleware ran in real time on this request, not some cached value.
+    assert t_before <= t_arrival <= t_after, (
+        f"t_arrival={t_arrival} outside [{t_before}, {t_after}] — "
+        "middleware is stamping the wrong instant"
+    )
+
+
+def test_stalled_handler_does_not_reject_round_inside_arrival_window():
+    """Simulate the v2.3 prod failure mode: the asyncio loop stalls for
+    >30 s after the middleware ran, so by the time ``batcher.validate_drand_round``
+    executes the wall clock is many drand rounds ahead of the timestamp
+    the middleware recorded.
+
+    With arrival-time stamping, the check uses the middleware timestamp,
+    not the (stalled) wall clock. The submission lands inside its round
+    and must be accepted, even though a wall-clock-based check would
+    reject it as STALE_ROUND.
+    """
+    import time
+
+    s, batcher = _setup(
+        current_checkpoint_hash="sha256:current",
+        drand_round_check_enabled=True,
+    )
+
+    # The mocked validate_drand_round inspects t_arrival to decide.
+    # Real validate_drand_round behaviour: with t_arrival inside the
+    # accepted window, returns None (accept); without t_arrival or with
+    # a later one, returns STALE_ROUND.
+    def _round_check(drand_round, *, t_arrival=None):
+        if t_arrival is None:
+            return RejectReason.STALE_ROUND  # would happen w/o the fix
+        # arrival-stamped: accepted regardless of how late the handler is
+        return None
+    batcher.validate_drand_round.side_effect = _round_check
+
+    payload = _submission()
+    with TestClient(s.app) as client:
+        r = client.post("/submit", json=payload)
+
+    body = r.json()
+    assert body["accepted"] is True, (
+        f"arrival-stamped submission should pass cheap-reject; got {body}"
+    )
+    assert body["reason"] != RejectReason.STALE_ROUND.value
+
+
 def test_cheap_reject_does_not_burn_rate_limit_budget():
     """Cheap rejects DO consume the per-hotkey counter (rate_limit increments
     happen before the cheap rejects, intentionally — a spammer flooding bad

@@ -274,16 +274,47 @@ class GrpoWindowBatcher:
     # ----------------------------- ingestion -----------------------------
 
     def accept_submission(
-        self, request: BatchSubmissionRequest
+        self,
+        request: BatchSubmissionRequest,
+        *,
+        t_arrival: float | None = None,
     ) -> BatchSubmissionResponse:
-        """Run the full verification pipeline; append to ``_valid`` on success."""
-        with self._lock:
-            return self._accept_locked(request)
+        """Run the full verification pipeline; append to ``_valid`` on success.
 
-    def validate_drand_round(self, drand_round: int) -> RejectReason | None:
+        ``t_arrival`` is forwarded to ``validate_drand_round`` so the worker
+        path uses the HTTP arrival timestamp rather than ``time.time()`` at
+        worker-dequeue time. See ``validate_drand_round`` for the rationale.
+        """
+        with self._lock:
+            return self._accept_locked(request, t_arrival=t_arrival)
+
+    def validate_drand_round(
+        self,
+        drand_round: int,
+        *,
+        t_arrival: float | None = None,
+    ) -> RejectReason | None:
         """Return the appropriate reject reason if ``drand_round`` is
         outside the accepted window of [current - tolerance, current], else
         None.
+
+        ``t_arrival`` is the wall-clock time at which the request was
+        received by the validator's HTTP server (stamped by the ASGI
+        ``stamp_arrival`` middleware in ``server.py``). When provided, it
+        is used to compute the "current" round instead of ``time.time()``
+        at call time. This decouples the round check from validator-side
+        processing latency: if the asyncio loop stalls for N seconds
+        (trainer GIL contention, GRAIL queue backpressure, pydantic body
+        parsing on the loop), a submission that arrived at the validator
+        within its round is still accepted, because the round is computed
+        as of the arrival timestamp, not as of when the handler finally
+        runs. Without this, an honest submission that landed inside its
+        round can become STALE_ROUND purely because the validator was
+        busy when the handler executed.
+
+        Falls back to ``self._wall_clock()`` if ``t_arrival`` is None
+        (e.g. the worker-path re-check inside ``_accept_locked`` called
+        directly, tests that don't go through the HTTP layer).
 
         Forward direction is zero-tolerance: a miner that attaches round
         R+1 hasn't seen σ_{R+1} yet (σ_R is the freshest signed beacon by
@@ -302,6 +333,9 @@ class GrpoWindowBatcher:
         The security cost is bounded: an attacker can antedate by at most
         ``tolerance`` rounds (3 s × tolerance) of chronological priority,
         which is uniform across honest and malicious miners alike.
+        Combined with arrival-time stamping, the backward tolerance can
+        now be tightened safely (the wide default existed to absorb loop
+        stalls — that's no longer needed on the HTTP path).
 
         Public so the HTTP /submit handler can run it pre-queue and
         short-circuit the rejection without waiting on the worker.
@@ -311,8 +345,9 @@ class GrpoWindowBatcher:
             self._drand_chain_info = get_current_chain()
         ci = self._drand_chain_info
         from reliquary.infrastructure.chain import compute_current_drand_round
+        t = t_arrival if t_arrival is not None else self._wall_clock()
         current = compute_current_drand_round(
-            self._wall_clock(), ci["genesis_time"], ci["period"],
+            t, ci["genesis_time"], ci["period"],
         )
         if drand_round > current:
             return RejectReason.FUTURE_ROUND
@@ -321,7 +356,10 @@ class GrpoWindowBatcher:
         return None
 
     def _accept_locked(
-        self, request: BatchSubmissionRequest
+        self,
+        request: BatchSubmissionRequest,
+        *,
+        t_arrival: float | None = None,
     ) -> BatchSubmissionResponse:
         hk = request.miner_hotkey
         pi = request.prompt_idx
@@ -338,7 +376,9 @@ class GrpoWindowBatcher:
         # actually earned; attaching a future round is impossible without
         # having seen σ_R (so always rejected).
         if self.drand_round_check_enabled:
-            round_check = self.validate_drand_round(request.drand_round)
+            round_check = self.validate_drand_round(
+                request.drand_round, t_arrival=t_arrival,
+            )
             if round_check is not None:
                 return self._reject(round_check, hotkey=hk, prompt_idx=pi)
         if request.prompt_idx >= len(self.env):

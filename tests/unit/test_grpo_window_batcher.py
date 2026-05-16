@@ -756,6 +756,117 @@ def test_drand_round_explicit_tolerance_three_rejects_four_behind():
     assert resp.reason == RejectReason.STALE_ROUND
 
 
+# ---------------------------------------------------------------------------
+# Arrival-time stamping (decouples drand check from handler-execution latency)
+# ---------------------------------------------------------------------------
+
+def test_drand_round_arrival_stamp_overrides_wall_clock():
+    """When ``t_arrival`` is provided and lies inside an earlier drand round
+    than the batcher's current wall clock, the check uses ``t_arrival``.
+    This decouples the gate from validator-side processing latency — a
+    submission that landed inside its round is still accepted even if the
+    handler runs many rounds later (event-loop stall behind trainer GIL).
+
+    Pinned with ``drand_round_backward_tolerance = 0`` so the test is sharp
+    against the wall-clock vs arrival-time split without the production
+    10-round tolerance papering over it.
+    """
+    # batcher's wall clock returns a time in round 110; t_arrival is in
+    # round 100 (~30 s earlier).
+    b = _make_batcher_with_drand_check(
+        fixed_round=110, drand_round_backward_tolerance=0,
+    )
+    t_arrival = 1000 + (100 - 1) * 3 + 1.0  # +1 s into round 100
+
+    # With t_arrival, round 100 IS the current round → accepted.
+    assert b.validate_drand_round(100, t_arrival=t_arrival) is None
+
+    # Without t_arrival, the batcher's wall clock dominates → current=110,
+    # tolerance=0 → round 100 is STALE.
+    assert (
+        b.validate_drand_round(100) == RejectReason.STALE_ROUND
+    )
+
+
+def test_drand_round_arrival_stamp_still_rejects_antedating():
+    """Arrival-time stamping doesn't weaken the antedating defense: a
+    miner claiming a round many drand periods earlier than ``t_arrival``
+    is still STALE. The bound is still ``tolerance × period`` of
+    chronological antedate — the cap moves with the timestamp, but the
+    cap itself doesn't go away.
+    """
+    b = _make_batcher_with_drand_check(
+        fixed_round=110, drand_round_backward_tolerance=2,
+    )
+    t_arrival = 1000 + (100 - 1) * 3 + 1.0  # in round 100
+    # Antedating attempt: claim 50 rounds earlier than arrival.
+    assert (
+        b.validate_drand_round(50, t_arrival=t_arrival)
+        == RejectReason.STALE_ROUND
+    )
+    # At the cap (current=100 by t_arrival, tolerance=2) round 98 is OK.
+    assert b.validate_drand_round(98, t_arrival=t_arrival) is None
+    # One past the cap is STALE.
+    assert (
+        b.validate_drand_round(97, t_arrival=t_arrival)
+        == RejectReason.STALE_ROUND
+    )
+
+
+def test_drand_round_arrival_stamp_future_still_rejected():
+    """A miner attaching a round AHEAD of ``t_arrival`` still gets
+    FUTURE_ROUND. Forward direction stays zero-tolerance whether the
+    check timestamp comes from arrival stamp or wall clock — claiming a
+    beacon you haven't seen is unrecoverable cheating in both cases.
+    """
+    b = _make_batcher_with_drand_check(fixed_round=110)
+    t_arrival = 1000 + (100 - 1) * 3 + 1.0  # in round 100
+    assert (
+        b.validate_drand_round(101, t_arrival=t_arrival)
+        == RejectReason.FUTURE_ROUND
+    )
+
+
+def test_drand_round_falls_back_to_wall_clock_when_no_arrival():
+    """``t_arrival=None`` means use ``_wall_clock()`` — backward-compatible
+    for callers that don't go through the HTTP middleware (direct unit
+    tests, the worker re-check, integration fixtures from before this
+    feature)."""
+    b = _make_batcher_with_drand_check(fixed_round=100)
+    assert b.validate_drand_round(100) is None
+    assert b.validate_drand_round(101) == RejectReason.FUTURE_ROUND
+
+
+def test_accept_submission_threads_t_arrival_to_drand_check():
+    """End-to-end through ``accept_submission``: a request that would be
+    STALE under wall-clock-only checking is accepted when ``t_arrival``
+    places it inside its round. Pins the wiring: the kwarg actually flows
+    from the entry point down to ``validate_drand_round``.
+    """
+    b = _make_batcher_with_drand_check(
+        fixed_round=110, drand_round_backward_tolerance=0,
+    )
+    req = _request_v21(prompt_idx=42, hotkey="A", checkpoint_hash="")
+    req.drand_round = 100  # ten rounds behind batcher's wall clock
+
+    # Without t_arrival: STALE.
+    resp_no_arrival = b.accept_submission(req)
+    assert resp_no_arrival.accepted is False
+    assert resp_no_arrival.reason == RejectReason.STALE_ROUND
+
+    # With matching t_arrival: accepted.
+    t_arrival = 1000 + (100 - 1) * 3 + 1.0
+    # Need a fresh batcher because the first call recorded a rejection
+    # against this hotkey/prompt.
+    b2 = _make_batcher_with_drand_check(
+        fixed_round=110, drand_round_backward_tolerance=0,
+    )
+    req2 = _request_v21(prompt_idx=43, hotkey="B", checkpoint_hash="")
+    req2.drand_round = 100
+    resp_with_arrival = b2.accept_submission(req2, t_arrival=t_arrival)
+    assert resp_with_arrival.accepted is True
+
+
 def test_constructor_accepts_tokenizer():
     """Tokenizer must be passable to the batcher (used by TerminationValidator)."""
     class FakeTokenizer:
