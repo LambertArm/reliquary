@@ -147,3 +147,32 @@ def test_http_get_json_tries_all_paths_if_first_path_404s():
 
     assert result is not None
     assert result["path"] == "v1"
+
+
+def test_http_get_json_fails_fast_on_all_relays_503():
+    """When every relay returns HTTP 503, the function must return
+    None within ~2s (one timeout cycle), NOT ~11.5s (4 retries with
+    backoff per relay). This pins the contract that _RETRY does not
+    multiply the parallel race's worst-case latency.
+    """
+    relays = D.DRAND_URLS
+
+    class _Resp503:
+        status_code = 503
+        text = "service unavailable"
+        def json(self):
+            raise ValueError("not json")
+
+    def _fake_get(url, timeout=None, headers=None):
+        return _Resp503()
+
+    with patch.object(D._SESSION, "get", side_effect=_fake_get):
+        t0 = time.monotonic()
+        result = D._http_get_json(["/v2/chains/x/rounds/503"])
+        elapsed = time.monotonic() - t0
+
+    assert result is None
+    assert elapsed < 1.0, (
+        f"global-503 fast-fail took {elapsed:.2f}s — _RETRY is still "
+        f"multiplying the per-relay timeout. Expected <1s."
+    )

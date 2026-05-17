@@ -36,12 +36,17 @@ DRAND_URLS = [
     "https://api.drand.secureweb3.com:6875",
 ]
 
+# Retries disabled: _http_get_json races relays in parallel so siblings
+# provide the fallback that retries used to provide on the serial path.
+# Keeping retries here would let a single bad relay multiply its per-request
+# timeout by 4 (connect + 3 retries), stretching worst-case all-degraded
+# latency from ~2s to ~11.5s and defeating the race.
 _RETRY = Retry(
-    total=3,
-    connect=3,
-    read=3,
-    backoff_factor=0.25,
-    status_forcelist=(429, 502, 503, 504),
+    total=0,
+    connect=0,
+    read=0,
+    backoff_factor=0,
+    status_forcelist=(),
     allowed_methods={"GET"},
     raise_on_status=False,
 )
@@ -256,8 +261,9 @@ def _http_get_json(paths: list[str]) -> dict[str, Any] | None:
 
     Timeouts are tight (connect=0.5s, read=2.0s) because the other
     relays in the race act as the fallback — we don't need a long
-    per-relay budget. This caps wall-clock cost at ~2s even when every
-    relay is degraded.
+    per-relay budget. Per-relay retries are disabled (see _RETRY); the
+    race siblings provide the fallback, keeping worst-case wall-clock
+    cost at ~2s even when every relay is degraded.
     """
     relays = list(DRAND_URLS)
     if not relays:
@@ -285,11 +291,16 @@ def _http_get_json(paths: list[str]) -> dict[str, Any] | None:
 
         ex = concurrent.futures.ThreadPoolExecutor(max_workers=len(urls))
         futures = {ex.submit(_try, u): u for u in urls}
-        # Shut down immediately so threads run but we don't block on __exit__.
-        ex.shutdown(wait=False, cancel_futures=True)
+        # Don't block on __exit__; all futures are already running since
+        # max_workers == len(urls), so cancel_futures=False is safe.
+        ex.shutdown(wait=False, cancel_futures=False)
         winner = None
         for fut in concurrent.futures.as_completed(futures):
-            payload = fut.result()
+            try:
+                payload = fut.result()
+            except concurrent.futures.CancelledError:
+                # Pending future was cancelled by shutdown — treat as non-winner.
+                continue
             if payload is not None:
                 winner = payload
                 break
