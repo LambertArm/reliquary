@@ -1007,8 +1007,10 @@ class ValidationService:
                 archives, current_window=current_window,
             )
             logger.info(
-                "Rebuilt cooldown from %d archive windows (current=%d, map size=%d)",
-                len(archives), current_window, len(self._cooldown_map),
+                "Rebuilt cooldown from %d/%d archive windows "
+                "(current=%d, map size=%d)",
+                len(archives), COOLDOWN_REBUILD_LOOKBACK,
+                current_window, len(self._cooldown_map),
             )
         except Exception:
             logger.exception(
@@ -1031,8 +1033,10 @@ class ValidationService:
                 archives, current_window=current_window,
             )
             logger.info(
-                "Rebuilt hash set from %d archive windows (current=%d, size=%d)",
-                len(archives), current_window, len(self._hash_set),
+                "Rebuilt hash set from %d/%d archive windows "
+                "(current=%d, size=%d)",
+                len(archives), HASH_DEDUP_RETENTION_WINDOWS,
+                current_window, len(self._hash_set),
             )
         except Exception:
             logger.exception(
@@ -1096,5 +1100,4 @@ class ValidationService:
         # disable drand keep working without a live drand fetch.
         block_hash = await chain.get_block_hash(subtensor, target_window)
         return chain.compute_window_randomness(block_hash), None
-
 

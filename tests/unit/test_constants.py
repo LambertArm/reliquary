@@ -1,5 +1,8 @@
 """Sanity checks on v2 constants — catches accidental edits."""
 
+import importlib
+import os
+
 from reliquary import constants as C
 
 
@@ -35,7 +38,7 @@ def test_hash_dedup_retention_decoupled_from_cooldown():
     "post-cooldown safety net". The two values just need to be sensible
     and explicit; no ordering invariant.
     """
-    assert C.HASH_DEDUP_RETENTION_WINDOWS == 10000
+    assert C.HASH_DEDUP_RETENTION_WINDOWS == 300
     assert C.BATCH_PROMPT_COOLDOWN_WINDOWS == 1_000_000
 
 
@@ -43,8 +46,30 @@ def test_cooldown_rebuild_lookback_bounded():
     """The R2 rebuild cap must stay small enough for a startup scan to
     complete in seconds even when BATCH_PROMPT_COOLDOWN_WINDOWS is set to
     an astronomical value for one-shot semantics."""
-    assert C.COOLDOWN_REBUILD_LOOKBACK == 10_000
+    assert C.COOLDOWN_REBUILD_LOOKBACK == 300
     assert C.COOLDOWN_REBUILD_LOOKBACK < C.BATCH_PROMPT_COOLDOWN_WINDOWS
+
+
+def test_startup_rebuild_horizon_env_overrides():
+    """Operators can widen startup replay horizons without a code deploy."""
+    prior_cooldown = os.environ.get("COOLDOWN_REBUILD_LOOKBACK")
+    prior_hash = os.environ.get("HASH_DEDUP_RETENTION_WINDOWS")
+    os.environ["COOLDOWN_REBUILD_LOOKBACK"] = "720"
+    os.environ["HASH_DEDUP_RETENTION_WINDOWS"] = "1440"
+    try:
+        importlib.reload(C)
+        assert C.COOLDOWN_REBUILD_LOOKBACK == 720
+        assert C.HASH_DEDUP_RETENTION_WINDOWS == 1440
+    finally:
+        if prior_cooldown is None:
+            os.environ.pop("COOLDOWN_REBUILD_LOOKBACK", None)
+        else:
+            os.environ["COOLDOWN_REBUILD_LOOKBACK"] = prior_cooldown
+        if prior_hash is None:
+            os.environ.pop("HASH_DEDUP_RETENTION_WINDOWS", None)
+        else:
+            os.environ["HASH_DEDUP_RETENTION_WINDOWS"] = prior_hash
+        importlib.reload(C)
 
 
 def test_v2_bootstrap_sigma_lower_than_steady():

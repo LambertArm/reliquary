@@ -201,21 +201,26 @@ BATCH_PROMPT_COOLDOWN_WINDOWS = 1_000_000
 # Validator startup: cap the number of R2 archives scanned to rebuild
 # CooldownMap. Independent of BATCH_PROMPT_COOLDOWN_WINDOWS — that
 # constant can be astronomically large for one-shot semantics, but R2
-# rebuild must stay O(1) in elapsed wall time. 10_000 archives ≈ 8.3
-# days of windows, which dominates any realistic restart gap. Older
-# entries are still in cooldown (the in-memory map is replayed from R2
-# and any miss is treated as ``no cooldown record``, which is safe: the
-# validator's hash-blacklist still rejects re-submission of the same
-# token sequence).
-COOLDOWN_REBUILD_LOOKBACK = 10_000
+# rebuild must stay bounded in elapsed wall time. Defaulting to 300 keeps
+# prod restarts fast while still replaying recent windows; operators can
+# widen it via COOLDOWN_REBUILD_LOOKBACK for one-off backfills or recovery
+# runs. Older entries may be missing from the rebuilt in-memory cooldown
+# map, which is safe: prompt cooldown is curriculum rotation, and the
+# hash blacklist below still rejects re-submission of the same token
+# sequence within its own retention horizon.
+COOLDOWN_REBUILD_LOOKBACK = int(
+    _os.environ.get("COOLDOWN_REBUILD_LOOKBACK", "300")
+)
 
 # Per-rollout content dedup horizon. Independent of and strictly longer
 # than the prompt cooldown: cooldown lets a prompt come back for fresh
 # content, the hash set blacklists the specific (tokens) of every rollout
-# already trained on. 10000 windows ≈ 3.5 days at 5 blocks/window. After
-# that, natural model drift between training steps is large enough that
-# stale generations fall through the distribution / logprob filters.
-HASH_DEDUP_RETENTION_WINDOWS = 10000
+# already trained on. Startup rebuild is bounded for restart latency;
+# operators can widen HASH_DEDUP_RETENTION_WINDOWS when they explicitly
+# want a longer replay horizon and are willing to pay the R2 scan cost.
+HASH_DEDUP_RETENTION_WINDOWS = int(
+    _os.environ.get("HASH_DEDUP_RETENTION_WINDOWS", "300")
+)
 
 # Max submissions any single hotkey can send per window. Counter resets at
 # every new window (on batcher swap). Excess submissions are HTTP-rejected
