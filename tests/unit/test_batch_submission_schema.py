@@ -63,6 +63,17 @@ def test_valid_request_parses():
     assert len(req.rollouts) == M_ROLLOUTS
 
 
+def test_rollout_rejects_mismatched_outer_and_commit_tokens():
+    rollouts = _valid_rollouts(k=4)
+    bad = rollouts[0]
+    with pytest.raises(ValidationError, match="tokens must match commit.tokens"):
+        RolloutSubmission(
+            tokens=bad.tokens[:-1] + [999],
+            reward=bad.reward,
+            commit=bad.commit,
+        )
+
+
 def test_wrong_rollout_count_rejected():
     with pytest.raises(ValidationError, match="rollouts"):
         BatchSubmissionRequest(
@@ -126,4 +137,5 @@ def test_new_reject_reasons_exist():
     """Schema/Token/Termination validators emit dedicated reject codes."""
     assert RejectReason.BAD_SCHEMA.value == "bad_schema"
     assert RejectReason.BAD_TOKENS.value == "bad_tokens"
+    assert RejectReason.TOKENS_MISMATCH.value == "tokens_mismatch"
     assert RejectReason.BAD_TERMINATION.value == "bad_termination"

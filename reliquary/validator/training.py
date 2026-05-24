@@ -198,7 +198,7 @@ def _rollout_loss(
     π_old comes from the miner's GRAIL commit (rollout.commit["rollout"]
     ["token_logprobs"]) — saves an extra forward pass.
     """
-    tokens_list = rollout.tokens
+    tokens_list = rollout.commit["tokens"]
     prompt_length = rollout.commit.get("rollout", {}).get("prompt_length", 0)
     old_logprobs_list = rollout.commit.get("rollout", {}).get("token_logprobs", [])
 

@@ -223,6 +223,23 @@ def test_reject_reward_mismatch():
     assert resp.reason == RejectReason.REWARD_MISMATCH
 
 
+def test_reject_outer_inner_token_split_even_if_constructed():
+    b = _make_batcher()
+    req = _request()
+    honest_tokens = list(req.rollouts[0].commit["tokens"])
+    fake_outer_tokens = honest_tokens[:-1] + [999]
+    req.rollouts[0] = RolloutSubmission.model_construct(
+        tokens=fake_outer_tokens,
+        reward=req.rollouts[0].reward,
+        commit=req.rollouts[0].commit,
+    )
+
+    resp = b.accept_submission(req)
+
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.TOKENS_MISMATCH
+
+
 # --- seal_batch + cooldown lifecycle ---
 
 def test_seal_batch_empty_pool_returns_empty():

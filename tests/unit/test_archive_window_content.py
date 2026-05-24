@@ -107,16 +107,18 @@ async def test_archive_includes_prompt_and_rollout_content():
 
     captured = {}
 
-    async def fake_upload(window_start, data, **kwargs):
-        captured["data"] = data
-        return True
+    class _StubQueue:
+        def enqueue(self, window_start, data):
+            captured["window_start"] = window_start
+            captured["data"] = data
 
     with patch(
-        "reliquary.infrastructure.storage.upload_window_dataset",
-        new=fake_upload,
+        "reliquary.infrastructure.archive_queue.get_archive_queue",
+        return_value=_StubQueue(),
     ):
         await svc._archive_window(batcher, batch)
 
+    assert captured["window_start"] == 42
     archive = captured["data"]
     assert archive["window_start"] == 42
     assert archive["environment"] == "fake"

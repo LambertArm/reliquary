@@ -521,6 +521,14 @@ class GrpoWindowBatcher:
         if len(existing) >= MAX_SUBMISSIONS_PER_PROMPT:
             return reject(RejectReason.PROMPT_FULL, "prompt_capacity")
 
+        for rollout in request.rollouts:
+            try:
+                CommitModel.model_validate(rollout.commit)
+            except ValidationError:
+                return reject(RejectReason.BAD_SCHEMA, "schema")
+            if list(rollout.tokens) != list(rollout.commit["tokens"]):
+                return reject(RejectReason.TOKENS_MISMATCH, "token_invariant")
+
         # Per-rollout hash dedup against the persistent set + within this
         # submission. Computed once here, reused at seal_batch and archive.
         # Skipped entirely when hash_set is None (back-compat for tests that
@@ -580,12 +588,6 @@ class GrpoWindowBatcher:
         truncated_count = 0
 
         for rollout in request.rollouts:
-            # Schema check: structural validation of commit dict (cheap, no GPU)
-            try:
-                CommitModel.model_validate(rollout.commit)
-            except ValidationError:
-                return reject(RejectReason.BAD_SCHEMA, "schema")
-
             # Token check: vocab bounds + max length (cheap, protects forward pass)
             if not verify_tokens(rollout.commit["tokens"], self.model.config):
                 return reject(RejectReason.BAD_TOKENS, "tokens")
