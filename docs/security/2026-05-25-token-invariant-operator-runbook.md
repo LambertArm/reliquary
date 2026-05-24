@@ -166,6 +166,45 @@ published, consider:
 If training processed zero affected rollouts, scoring/archive correction may be
 sufficient.
 
+## Base-model reset procedure
+
+If the safest recovery is to restart from the base model, do it as a forward HF
+checkpoint instead of trying to downgrade miners. The trainer auto-resumes the
+latest `checkpoint N` commit on startup, and miners only pull checkpoints when
+`checkpoint_n` increases. Therefore the reset should publish the base model as
+`checkpoint N+1`, then pin the trainer to that new commit.
+
+From the validator host, after pulling an image that includes PR #41:
+
+```bash
+cd reliquary/docker
+docker compose -f docker-compose.trainer.yml pull
+docker compose -f docker-compose.trainer.yml stop reliquary-trainer
+
+docker compose -f docker-compose.trainer.yml run --rm --no-deps \
+  --entrypoint python reliquary-trainer \
+  /opt/reliquary/scripts/publish_base_reset_checkpoint.py
+```
+
+The script prints:
+
+```bash
+RELIQUARY_RESUME_FROM=sha:<new-base-reset-commit>
+RELIQUARY_WANDB_VERSION=base-reset-20260525
+```
+
+Add those lines to `docker/.env`, then restart:
+
+```bash
+docker compose -f docker-compose.trainer.yml up -d --force-recreate reliquary-trainer
+docker logs -f reliquary-trainer
+curl -s http://localhost:8080/state | jq '{state, window_n, checkpoint_n, checkpoint_revision}'
+```
+
+Expected: `checkpoint_revision` equals the commit printed by the script.
+If it does not, stop the trainer and fix the env pin before accepting miner
+traffic.
+
 ## Communication guidance
 
 Recommended private message:
@@ -182,4 +221,3 @@ We are auditing affected windows and will publish a correction/remediation plan.
 
 Avoid saying "UID 1" without a timestamped chain snapshot. Use hotkeys as the
 primary identity.
-
