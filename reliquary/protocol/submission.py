@@ -9,7 +9,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from reliquary.constants import CHALLENGE_K, M_ROLLOUTS, MAX_NEW_TOKENS_PROTOCOL_CAP
 
@@ -65,6 +65,7 @@ class RejectReason(str, Enum):
     WINDOW_NOT_ACTIVE = "window_not_active"
     BAD_SCHEMA = "bad_schema"
     BAD_TOKENS = "bad_tokens"
+    TOKENS_MISMATCH = "tokens_mismatch"
     BAD_TERMINATION = "bad_termination"
     WRONG_CHECKPOINT = "wrong_checkpoint"
     WRONG_RANDOMNESS = "wrong_randomness"
@@ -90,6 +91,13 @@ class RolloutSubmission(BaseModel):
     tokens: list[int] = Field(..., min_length=1)
     reward: float  # miner's local env.compute_reward value; validator re-checks
     commit: dict[str, Any]
+
+    @model_validator(mode="after")
+    def _tokens_match_commit_tokens(self):
+        commit_tokens = self.commit.get("tokens")
+        if commit_tokens is not None and list(self.tokens) != list(commit_tokens):
+            raise ValueError("tokens must match commit.tokens")
+        return self
 
 
 class BatchSubmissionRequest(BaseModel):

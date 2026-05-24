@@ -99,6 +99,7 @@ def _build_rollout(tokens, reward, prompt_length):
         tokens=tokens,
         reward=reward,
         commit={
+            "tokens": tokens,
             "rollout": {
                 "prompt_length": prompt_length,
                 "token_logprobs": [-1.0] * n_completion,  # arbitrary baseline
@@ -137,6 +138,25 @@ def test_rollout_loss_produces_finite_values(tiny_model_and_tokenizer):
     )
     device = next(model.parameters()).device
     ppo_loss, kl = _rollout_loss(model, ref, rollout, advantage=1.0, device=device)
+    assert torch.isfinite(ppo_loss)
+    assert torch.isfinite(kl)
+
+
+def test_rollout_loss_uses_commit_tokens_as_source_of_truth(tiny_model_and_tokenizer):
+    reset_training_state()
+    model, _ = tiny_model_and_tokenizer
+    ref = _make_ref(model)
+
+    rollout = _build_rollout(
+        tokens=[1, 2, 3, 4, 5, 6, 7, 8],
+        reward=1.0,
+        prompt_length=3,
+    )
+    rollout.tokens = [1, 2]
+
+    device = next(model.parameters()).device
+    ppo_loss, kl = _rollout_loss(model, ref, rollout, advantage=1.0, device=device)
+
     assert torch.isfinite(ppo_loss)
     assert torch.isfinite(kl)
 

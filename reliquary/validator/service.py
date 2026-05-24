@@ -124,7 +124,8 @@ def open_grpo_window(
     """
     def _completion_text(rollout: RolloutSubmission) -> str:
         prompt_len = rollout.commit.get("rollout", {}).get("prompt_length", 0)
-        return tokenizer.decode(rollout.tokens[prompt_len:])
+        tokens = rollout.commit["tokens"]
+        return tokenizer.decode(tokens[prompt_len:])
 
     def _canonical_prompt_tokens(prompt_idx: int) -> list[int]:
         problem = env.get_problem(prompt_idx)
@@ -741,7 +742,7 @@ class ValidationService:
             # in which case we omit the `hash` field rather than guessing.
             hashes = s.rollout_hashes if s.rollout_hashes else [None] * len(s.rollouts)
             for r, text, h in zip(s.rollouts, texts, hashes):
-                tokens = list(r.tokens)
+                tokens = list(r.commit["tokens"])
                 rollout_dict = (r.commit or {}).get("rollout", {}) or {}
                 prompt_length = int(rollout_dict.get("prompt_length", 0))
                 completion_length = int(rollout_dict.get(
