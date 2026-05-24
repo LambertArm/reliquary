@@ -167,6 +167,44 @@ def verify_termination(
     return ok
 
 
+def is_cap_truncation(
+    commit: dict,
+    tokenizer: Any,
+    proof: "ProofResult | None" = None,
+    model: Any = None,
+) -> bool:
+    """Return True when a cap-hit rollout did not naturally stop on EOS.
+
+    ``verify_termination`` accepts the protocol cap path so one honest runaway
+    rollout can remain usable. The batcher still needs to count those cap hits
+    as truncations when the EOS probability gate did not pass, otherwise a
+    miner can force every rollout to max length and bypass the existing
+    per-submission truncation budget.
+    """
+    from reliquary.constants import MAX_NEW_TOKENS_PROTOCOL_CAP
+
+    rollout_meta = commit.get("rollout", {}) or {}
+    completion_length = int(rollout_meta.get("completion_length", 0))
+    prompt_length = int(rollout_meta.get("prompt_length", 0))
+    if prompt_length + completion_length < MAX_NEW_TOKENS_PROTOCOL_CAP:
+        return False
+
+    eos_set = _eos_set_from_model(model, tokenizer)
+    if not eos_set:
+        return True
+
+    tokens = commit.get("tokens") or []
+    if not tokens:
+        return True
+
+    p_stop = proof.p_stop if proof is not None else None
+    return not (
+        int(tokens[-1]) in eos_set
+        and p_stop is not None
+        and p_stop >= MIN_EOS_PROBABILITY
+    )
+
+
 def verify_commitment_proofs(
     commit: dict,
     model: Any,
