@@ -987,6 +987,38 @@ def test_reject_bad_termination_when_last_token_not_eos():
     assert resp.reason == RejectReason.BAD_TERMINATION
 
 
+def test_reject_repeated_cap_path_truncations():
+    from reliquary.constants import MAX_NEW_TOKENS_PROTOCOL_CAP
+
+    class _LongContextModelStub:
+        class config:
+            vocab_size = 20000
+            max_position_embeddings = 20000
+
+    prompt_length = 4
+    seq_len = prompt_length + MAX_NEW_TOKENS_PROTOCOL_CAP
+    b = _make_batcher(
+        model=_LongContextModelStub(),
+        verify_commitment_proofs_fn=_grail_with_logits(seq_len),
+    )
+    req = _request()
+
+    for idx in range(2):
+        tokens = [t + idx for t in range(seq_len)]
+        commit = _make_commit(
+            tokens=tokens,
+            prompt_length=prompt_length,
+            success=req.rollouts[idx].reward > 0.5,
+            total_reward=req.rollouts[idx].reward,
+        )
+        req.rollouts[idx].commit = commit
+        req.rollouts[idx].tokens = commit["tokens"]
+
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.BAD_TERMINATION
+
+
 def test_termination_skipped_when_grail_returns_empty_logits():
     """Backward-compat: when the GRAIL stub returns empty logits, the
     termination check is skipped. The default ``_always_true_grail`` does

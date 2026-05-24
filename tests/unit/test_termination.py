@@ -1,9 +1,9 @@
-"""verify_termination — strict EOS-only termination check.
+"""verify_termination — EOS and protocol-cap termination checks.
 
 The miner must end every rollout with the tokenizer's EOS token, AND the
 model must have assigned probability >= MIN_EOS_PROBABILITY to EOS at the
-position that produced it. No max-tokens-fallback branch — see spec for
-RL-context rationale.
+position that produced it. A protocol-cap fallback exists for max-length
+runaways; the batcher counts cap hits without natural EOS as truncations.
 
 After the keep-logits-on-GPU refactor, ``verify_termination`` reads a
 precomputed ``p_stop`` carried on ``ProofResult`` rather than slicing a
@@ -16,7 +16,11 @@ import pytest
 import torch
 
 from reliquary.constants import MIN_EOS_PROBABILITY
-from reliquary.validator.verifier import ProofResult, verify_termination
+from reliquary.validator.verifier import (
+    ProofResult,
+    is_cap_truncation,
+    verify_termination,
+)
 
 
 class _FakeTokenizer:
@@ -135,6 +139,42 @@ def test_path1_accepts_max_model_len_bound_termination():
         _commit_with_lengths(tokens, prompt_length, completion_length),
         _FakeTokenizer(), proof,
     ) is True
+
+
+def test_cap_hit_without_natural_eos_counts_as_truncation():
+    from reliquary.constants import MAX_NEW_TOKENS_PROTOCOL_CAP
+
+    prompt_length = 33
+    completion_length = MAX_NEW_TOKENS_PROTOCOL_CAP - prompt_length
+    seq_len = prompt_length + completion_length
+    tokens = [42] * seq_len
+    proof = ProofResult(
+        all_passed=True, passed=1, checked=1,
+        has_sparse_outputs=True,
+        p_stop=1e-10,
+    )
+    commit = _commit_with_lengths(tokens, prompt_length, completion_length)
+
+    assert verify_termination(commit, _FakeTokenizer(), proof) is True
+    assert is_cap_truncation(commit, _FakeTokenizer(), proof) is True
+
+
+def test_cap_hit_with_natural_eos_is_not_truncation():
+    from reliquary.constants import MAX_NEW_TOKENS_PROTOCOL_CAP
+
+    prompt_length = 33
+    completion_length = MAX_NEW_TOKENS_PROTOCOL_CAP - prompt_length
+    seq_len = prompt_length + completion_length
+    tokens = [42] * (seq_len - 1) + [_FakeTokenizer.eos_token_id]
+    proof = ProofResult(
+        all_passed=True, passed=1, checked=1,
+        has_sparse_outputs=True,
+        p_stop=0.99,
+    )
+    commit = _commit_with_lengths(tokens, prompt_length, completion_length)
+
+    assert verify_termination(commit, _FakeTokenizer(), proof) is True
+    assert is_cap_truncation(commit, _FakeTokenizer(), proof) is False
 
 
 def test_path1_accepts_when_completion_alone_meets_cap():

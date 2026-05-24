@@ -46,6 +46,7 @@ from reliquary.validator.observability import (
 )
 from reliquary.validator.verifier import (
     evaluate_token_distribution,
+    is_cap_truncation,
     is_in_zone,
     rewards_std,
     verify_logprobs_claim,
@@ -634,14 +635,21 @@ class GrpoWindowBatcher:
                     sketch_diff_max=proof.sketch_diff_max,
                 )
 
-            # Termination check: rollout must end with EOS at p(EOS) >= threshold.
+            # Termination check: rollout must end with EOS at p(EOS) >= threshold
+            # or hit the protocol cap. Cap hits without a natural EOS are counted
+            # against the per-submission truncation budget; otherwise forced
+            # max-length sampling can make every rollout bypass EOS validation.
             # Reads precomputed p_stop on ``proof`` — no logits round-trip.
             # Skipped when the stub didn't populate sparse outputs (legacy
             # test fixtures that opted out of behavioural enforcement).
             if proof.has_sparse_outputs:
-                if not verify_termination(
+                termination_ok = verify_termination(
                     rollout.commit, self.tokenizer, proof, self.model
-                ):
+                )
+                cap_truncated = is_cap_truncation(
+                    rollout.commit, self.tokenizer, proof, self.model
+                )
+                if not termination_ok or cap_truncated:
                     truncated_count += 1
                     if truncated_count > MAX_TRUNCATED_PER_SUBMISSION:
                         return reject(
