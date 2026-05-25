@@ -30,13 +30,13 @@ Every miner runs a continuous poll-submit loop:
 
 2. **Picks a prompt.** Selects a `prompt_idx` from the **OpenMathInstruct-2** environment ([`nvidia/OpenMathInstruct-2`](https://huggingface.co/datasets/nvidia/OpenMathInstruct-2), ~14 million problems, math-reasoning style) that is not in `cooldown_prompts`. The reference engine uses uniform-random sampling with rejection against the cooldown set. (v2.3 switched from Hendrycks MATH because the 12 500-prompt env exhausted under one-shot cooldown — see "One-shot prompts" below.)
 
-3. **Generates M=8 rollouts.** Runs exactly 8 completions at the protocol-fixed `T_PROTO = 0.9`, `top_p = 1.0`, `top_k = 0`. The validator now owns reward computation, so local reward claims are not trusted. Generate cleanly, terminate at the first EOS, and do not pad or force max length.
+3. **Generates M=8 rollouts.** Runs exactly 8 completions at the protocol-fixed `T_PROTO = 0.9`, `top_p = 1.0`, `top_k = 0`. Generate cleanly, terminate at the first EOS, and do not pad or force max length.
 
-4. **Uses reward as a placeholder.** `rollout.reward` is kept for backward compatibility, but the validator recomputes and overwrites it before sigma, archive, or training. The stock miner submits `reward=0.0`; miner code should not rely on local `env.compute_reward` in the hot path.
+4. **Claims each rollout reward.** The miner computes `env.compute_reward(problem, completion_text)` locally and sends that value as `rollout.reward`. The validator recomputes the same reward and rejects with `REWARD_MISMATCH` if the claim differs. This restores miner-side frontier/prompt priors while still preventing reward lies.
 
 5. **Builds GRAIL sketches.** Runs the bit-identical HuggingFace forward pass on the proof GPU to construct sketch commitments that bind the completions to the model. The r_vec seed **must** come from `state.randomness` exactly — local re-derivation will diverge from the validator's seed and the binding check rejects with `WRONG_RANDOMNESS`.
 
-6. **Submits.** POSTs a `BatchSubmissionRequest` to `/submit` containing: `miner_hotkey`, `prompt_idx`, `window_start` (from the last `/state`), 8 rollouts, reward placeholders, GRAIL commits, `merkle_root`, `checkpoint_hash`, and **(new in v2.3) `drand_round`** — the drand quicknet round currently in progress at the wall-clock instant of the POST. Compute it as `1 + (time.time() - drand_genesis_time) // drand_period`. Quicknet's `period = 3 s` since launch.
+6. **Submits.** POSTs a `BatchSubmissionRequest` to `/submit` containing: `miner_hotkey`, `prompt_idx`, `window_start` (from the last `/state`), 8 rollouts, claimed rewards, GRAIL commits, `merkle_root`, `checkpoint_hash`, and **(new in v2.3) `drand_round`** — the drand quicknet round currently in progress at the wall-clock instant of the POST. Compute it as `1 + (time.time() - drand_genesis_time) // drand_period`. Quicknet's `period = 3 s` since launch.
    - The validator gates this field with **zero tolerance**: too old → `STALE_ROUND`, too new → `FUTURE_ROUND`. Network jitter that pushes your POST across a round boundary now costs the submission.
    - Pre-baking `drand_round` at sketch-build time is **wrong** — gen takes 50-100 s, so by fire time the round is 1-2 buckets stale → guaranteed `STALE_ROUND`. Compute the round just before the POST.
 
@@ -116,13 +116,13 @@ Techniques miners are expected to develop (non-exhaustive):
 
 - A per-prompt success-rate estimate, updated online and reset (or decayed) whenever `checkpoint_n` advances.
 - Clustering problems by difficulty or feature signature and sampling preferentially at the policy's current frontier.
-- A cheap proxy (a smaller model, draft decoding, a few low-temperature samples) used only to predict frontier likelihood. Do not build a miner around local label/reward oracle behavior; the validator owns reward, and future tasks may be private/generated.
+- A cheap proxy (a smaller model, draft decoding, a few low-temperature samples) used only to predict frontier likelihood. Do not build a miner around brittle label/reward oracle tricks; current reward claims are verifier-checked, and future tasks may be private/generated.
 
 The goal is to locate the *learning frontier* — prompts where the current policy succeeds on some attempts and fails on others. Every high-σ pick feeds the GRPO step a gradient-rich group instead of a wasted slot: miner optimization and training efficiency are aligned.
 
 ### Zone filter
 
-The validator computes the population standard deviation σ of its own recomputed rewards for your 8 rollouts. `σ ≥ 0.43` passes; `σ < 0.43` is rejected with `OUT_OF_ZONE`. During bootstrap (first `BOOTSTRAP_WINDOWS = 100` windows) the threshold is `σ ≥ 0.33`.
+The validator computes the population standard deviation σ of the verifier-checked rewards for your 8 rollouts. `σ ≥ 0.43` passes; `σ < 0.43` is rejected with `OUT_OF_ZONE`. During bootstrap (first `BOOTSTRAP_WINDOWS = 100` windows) the threshold is `σ ≥ 0.33`.
 
 For OpenMath's binary `{0, 1}` rewards, raw sigma would admit 2/8 through 6/8 correct. Steady-state OpenMath now adds a reward-distribution guard: only k=3, k=4, or k=5 correct groups pass. k=2 and k=6 reject with `REWARD_DISTRIBUTION`. Bootstrap remains governed by the relaxed sigma threshold. See [docs/concepts.md](concepts.md) for the full explanation.
 
@@ -387,6 +387,6 @@ grep -E "submitted|rejected|accepted" ~/miner.log | tail -50
 - **`no validator with permit and routable axon`**: no active validator has published an HTTP endpoint on the metagraph. During the subnet-launch phase this is expected — the owner validator (`5CXzFHfeiJ4Xkiirq4ej1MrRVCd789wEJXhpf2ZKRW6MNFJF`) does not yet hold `validator_permit`. Pass `--validator-url http://<owner-validator-ip>:8888` to pin it explicitly (see [Launch](#launch)). After launch, wait for a validator to come back online or point at a known one.
 - **CUDA out of memory**: two copies of Qwen3-4B-Instruct require ~16 GB bfloat16 total. If you have a single GPU with less than 24 GB you may hit OOM. Use a GPU with more VRAM or reduce precision.
 - **`GRAIL_FAIL` / `LOGPROB_MISMATCH`**: your local proof compute diverged from the validator's. Most often caused by a different `attn_implementation` build, CUDA/torch version mismatch, or wrong checkpoint. Re-install on a clean environment and confirm you are on the same HF revision as the validator (check `/state`).
-- **`REWARD_MISMATCH`**: validator-side reward computation failed or returned a non-finite value. Miner reward claims are placeholders now, so this is not a local reward mismatch signal.
+- **`REWARD_MISMATCH`**: validator-side reward computation disagreed with the miner's claimed `rollout.reward`, or reward computation failed. Recheck completion decoding, answer parsing, prompt indexing, and env version.
 - **All submissions land `OUT_OF_ZONE`**: the prompts you are selecting are too easy (σ ≈ 0) or too hard (σ ≈ 0) for the current checkpoint. The reference engine samples uniformly; if you have overridden prompt selection, broaden the range.
 - **Persistent `WRONG_CHECKPOINT`**: the miner is not picking up the latest revision from `/state`. Ensure the poll loop reads `checkpoint_revision` before each submission.

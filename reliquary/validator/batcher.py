@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import math
 import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -55,6 +54,7 @@ from reliquary.validator.verifier import (
     is_in_zone,
     rewards_std,
     verify_logprobs_claim,
+    verify_reward_claim,
     verify_termination,
 )
 
@@ -578,13 +578,8 @@ class GrpoWindowBatcher:
         for rollout in request.rollouts:
             text = self._completion_text(rollout)
             completion_texts.append(text)
-            try:
-                validator_reward = float(self.env.compute_reward(problem, text))
-            except Exception:
+            if not verify_reward_claim(self.env, problem, text, rollout.reward):
                 return reject(RejectReason.REWARD_MISMATCH, "reward")
-            if not math.isfinite(validator_reward):
-                return reject(RejectReason.REWARD_MISMATCH, "reward")
-            rollout.reward = validator_reward
 
         rewards = [float(r.reward) for r in request.rollouts]
         sigma = rewards_std(rewards)
