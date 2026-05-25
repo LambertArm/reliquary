@@ -90,17 +90,19 @@ Expected symptoms:
 
 ## Patch
 
-The fix preserves the cap-path exception for one honest runaway rollout, but
-counts cap hits without natural EOS as truncations. The existing truncation
-budget then rejects a submission when more than one rollout in the group uses
-that path.
+Initial hardening counted cap hits without natural EOS as truncations. The
+follow-up steady-state policy now sets `MAX_TRUNCATED_PER_SUBMISSION = 0`, so
+any cap/non-EOS truncated rollout rejects as `bad_termination`. Bootstrap keeps
+`BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION = 1` to preserve early fill rate while
+the model is weak.
 
 Natural EOS at the cap is not counted as truncation if:
 
 - the last token is in the model/tokenizer EOS set; and
 - `p_stop >= MIN_EOS_PROBABILITY`.
 
-Submissions with repeated forced-cap rollouts now reject as `bad_termination`.
+Submissions with forced-cap rollouts now reject as `bad_termination` in steady
+state.
 
 ## What To Monitor
 

@@ -46,6 +46,9 @@ Interpretation guide:
   `accepted_into_pool` means validation passed, `selected_for_batch` means the
   representative was used for training, and `rewarded` means it received
   emission under the final reward distribution.
+- Training and emission are also separate. A window can be rewarded/archived
+  but have `training_quarantine.quarantined=true`; in that case the validator
+  skipped GRPO and checkpoint publishing for model-health reasons.
 
 The `/health` endpoint exposes non-secret operator state such as image
 revision, app start time, checkpoint revision, current window, drand round,

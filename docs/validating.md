@@ -166,11 +166,16 @@ These are the live thresholds the trainer applies on every submission. The same 
 | `T_PROTO` | 0.9 | Protocol-fixed sampling temperature (validator's recompute uses this) |
 | `SIGMA_MIN` (steady) | 0.43 | Zone filter: groups below this are rejected `OUT_OF_ZONE` |
 | `BOOTSTRAP_SIGMA_MIN` | 0.33 | Relaxed zone filter during first `BOOTSTRAP_WINDOWS = 100` windows |
-| `BATCH_PROMPT_COOLDOWN_WINDOWS` | 72 | A batched prompt is ineligible for 72 windows after entering a batch |
+| `BATCH_PROMPT_COOLDOWN_WINDOWS` | 1,000,000 | A winning prompt is effectively one-shot in the OpenMath phase |
+| `COOLDOWN_REBUILD_LOOKBACK` | 300 | R2 windows replayed at startup to rebuild cooldown without scanning the whole one-shot horizon |
 | `PROOF_SKETCH_TOLERANCE_BASE` | 5000 | GRAIL sketch tolerance — actual threshold = `5000 + 5 × √position` |
 | `PROOF_SKETCH_TOLERANCE_GROWTH` | 5.0 | Per-position sqrt growth |
 | `LOGPROB_IS_EPS` | 0.10 | Per-token log-prob deviation max — exceeding triggers `LOGPROB_MISMATCH` |
 | `MIN_EOS_PROBABILITY` | 0.01 | Required EOS token probability for proper termination |
+| `MAX_TRUNCATED_PER_SUBMISSION` | 0 | Steady-state cap/non-EOS truncation allowance |
+| `BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION` | 1 | Bootstrap truncation allowance |
+| `BINARY_REWARD_MIN_CORRECT` / `MAX_CORRECT` | 3 / 5 | OpenMath steady-state binary reward groups outside k=3..5 reject `REWARD_DISTRIBUTION` |
+| `TRAINING_QUARANTINE_ENABLED` | true | Suspicious selected windows skip GRPO/publish but remain archived/credited |
 | `WINDOW_TIMEOUT_SECONDS` | 7200 | Safety-net auto-seal if fewer than B submissions arrive in 2 h |
 | `EMA_ALPHA` | ≈0.0274 | Weight-update smoothing (`2/(72+1)` — ~25-window half-life) |
 | `REJECTED_LIST_CAP_PER_HOTKEY` | 5 | Max rejected samples retained per hotkey per window archive |
@@ -184,26 +189,34 @@ Every `/submit` flows through this sequence on the validator. The first rejectio
 ```
 HTTP enqueue          worker dequeue → verify
 ─────────────         ─────────────────────────
-WINDOW_NOT_ACTIVE? → reject     →    WRONG_CHECKPOINT? → reject
-queue submission                     WINDOW_MISMATCH?  → reject
-return reason="submitted"            BAD_PROMPT_IDX?   → reject
-                                     PROMPT_IN_COOLDOWN? → reject
-                                     SUPERSEDED?       → reject
-                                     BAD_SCHEMA / BAD_TOKENS / PROMPT_MISMATCH? → reject
-                                     BAD_SIGNATURE?    → reject
-                                     REWARD_MISMATCH?  → reject
-                                     OUT_OF_ZONE?      → reject
-                                     WRONG_ROLLOUT_COUNT? → reject
+WINDOW_NOT_ACTIVE? → reject     →    WINDOW_MISMATCH? → reject
+rate/envelope/drand checks           WRONG_CHECKPOINT? → reject
+queue submission                     BAD_PROMPT_IDX / PROMPT_IN_COOLDOWN? → reject
+return reason="submitted"            PROMPT_FULL? → reject
+                                     BAD_SCHEMA / TOKENS_MISMATCH / BAD_TOKENS? → reject
+                                     PROMPT_MISMATCH / HASH_DUPLICATE? → reject
+                                     validator recomputes rollout rewards
+                                     REWARD_MISMATCH / OUT_OF_ZONE? → reject
+                                     REWARD_DISTRIBUTION? → reject
+                                     BAD_SIGNATURE / WRONG_RANDOMNESS? → reject
+                                     GRAIL_FAIL? → reject
+                                     BAD_TERMINATION / LOGPROB_MISMATCH? → reject
                                      DISTRIBUTION_SUSPICIOUS? → reject
-                                     BAD_TERMINATION?  → reject
-                                     GRAIL_FAIL?       → reject
-                                     LOGPROB_MISMATCH? → reject
                                      ─────────────────
-                                     → batch[] (first 8 valid distinct prompts)
-                                     → runners_up[] (valid but B already filled)
+                                     → batch[] (selected representative rows)
+                                     → runners_up[] (valid pool, not selected)
 
 window seals → R2 archive published at reliquary/dataset/window-<N>.json.gz
              → /set_weights at next epoch boundary
+```
+
+Before `train_step`, the validator runs the training-quarantine gate. If the
+selected batch has high-confidence poison signals, the archive still publishes
+and emissions remain replayable from `rewards_by_hotkey`, but GRPO and
+checkpoint publish are skipped for that window. The archive field is:
+
+```text
+training_quarantine = {quarantined, reasons, metrics}
 ```
 
 Submissions that get HTTP-accepted but reach the worker after the window seals are **dropped late**. They appear in container logs (`INFO | dropping late submission prompt=N hotkey=...`) but not in any R2-archive bucket. The public dashboard surfaces aggregate queue pressure (batch saturation %) as a proxy; per-hotkey late-drop counts are intentionally not exposed publicly.
