@@ -1,6 +1,21 @@
 # 2026-05-25 Reward Oracle Selection Report
 
-Status: investigated; fleet monitoring added; validator patch prepared
+Status: investigated; fleet monitoring added; PR #46, PR #48, and PR #49 shipped
+
+Update after hardening:
+
+- PR #46 deployed the OpenMath steady-state k=3..5
+  `reward_distribution` guard.
+- PR #48 added training quarantine so suspicious selected windows can be
+  archived/credited without mutating the model.
+- PR #49 made reward validator-authoritative: miner-submitted
+  `rollout.reward` is now only a placeholder, and the validator overwrites it
+  before sigma, archive, or training.
+
+Remaining caveat: OpenMath labels are still public/reconstructable, so this is
+not full reward secrecy. The durable design direction remains private/generated
+validator-side tasks and, later, commit-first sampling if miners keep shaping
+candidate pools.
 
 Target hotkey:
 
@@ -178,14 +193,22 @@ format/unit variants can score 0 while parser-friendly `\boxed{90}` scores 1.
 
 ## Why Existing Validation Accepts It
 
-Relevant validator flow:
+Historical validator flow before PR #49:
 
-- `validator/batcher.py`: reward claims are recomputed and then sigma is
+- `validator/batcher.py`: reward claims were recomputed and then sigma was
   checked before GRAIL-heavy validation.
-- `validator/verifier.py`: `verify_reward_claim` explicitly accepts
-  miner-declared rewards if `env.compute_reward` matches.
-- `validator/training.py`: GRPO trains on the submitted rollouts and their
+- `validator/verifier.py`: `verify_reward_claim` accepted miner-declared
+  rewards if `env.compute_reward` matched.
+- `validator/training.py`: GRPO trained on the submitted rollouts and their
   submitted reward vector after validation.
+
+Current validator flow:
+
+- `validator/batcher.py`: the validator recomputes each rollout reward and
+  overwrites `rollout.reward` before sigma/distribution checks.
+- `validator/training.py`: GRPO consumes validator-owned rewards.
+- `validator/service.py`: selected suspicious windows can be quarantined from
+  training/publish while still archived and credited.
 
 The validator checks:
 
@@ -198,8 +221,9 @@ GRAIL proof passes
 termination passes
 logprobs match
 token distribution is not suspicious
-reward claim equals env.compute_reward
+validator reward recompute succeeds
 sigma >= SIGMA_MIN
+binary reward distribution is in policy
 ```
 
 It does not check:
@@ -442,9 +466,8 @@ patch cycle.
      needed beyond monitoring and reward-parser improvements;
    - if it is not allowed, patch the zone rule.
 
-4. If patching today, prefer Option C. A patch has been prepared that adds a
-   `reward_distribution` rejection for steady-state binary groups outside
-   k=3..5.
+4. Option C has shipped: steady-state binary groups outside k=3..5 now reject
+   as `reward_distribution`.
 
 5. Separately test reward normalization for degree/unit variants, but do not
    mix that with the zone-rule patch unless the team is ready for a wider
@@ -452,12 +475,11 @@ patch cycle.
 
 ## Current Recommendation
 
-Recommended immediate action:
+Recommended immediate action after PR #46/#48/#49:
 
 ```text
-deploy the k=3..5 binary reward-distribution guard, monitor whether miners
-adapt toward k=5, and be ready to tighten to k=4-only if training quality or
-slot capture still degrades.
+monitor whether miners adapt toward k=5/k=4, watch quarantine windows, and
+move the next real design step toward private/generated validator-side tasks.
 ```
 
 Reason:

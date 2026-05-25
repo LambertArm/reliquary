@@ -8,17 +8,17 @@ Reliquary is a coordination protocol that turns a set of independent GPU operato
 
 **Old subnets:** miners are paid per rollout. The competition is "do as many rollouts as you can."
 
-**Reliquary:** miners are paid for the rollouts the trainer actually uses. The competition is "find the rollouts I need to train on" — i.e. predict which prompts sit at the policy's current learning frontier (group-σ in the trainable band, not yet in cooldown). A miner who picks well submits earlier, wins batch slots, and earns emission. A miner who picks poorly burns their own rollouts on `OUT_OF_ZONE` rejects.
+**Reliquary:** miners are paid for useful verified contributions to the trainer. The competition is "find the rollouts I need to train on" — i.e. predict which prompts sit at the policy's current learning frontier (group-σ in the trainable band, not yet in cooldown). A miner who picks well lands on winning prompts and earns emission; a miner who picks poorly burns their own rollouts on rejects such as `OUT_OF_ZONE` or `REWARD_DISTRIBUTION`.
 
 This converts DAPO's reactive Dynamic Sampling filter into an ex-ante prediction market: the generate-then-discard cost is pushed out of the validator and onto the miner who guessed wrong. As the policy matures and the learning frontier narrows, selection intelligence becomes more valuable, not less. See [docs/concepts.md](docs/concepts.md#the-thesis) for the full argument.
 
 ## What it does
 
-Each training window is one GRPO step. The cadence is event-driven: a window seals the instant eight valid, distinct-prompt rollout groups land. Miners race to submit; the first eight in (by validator-side TCP arrival) win the batch. The validator runs a PPO-clipped surrogate loss with a KL penalty against the frozen reference, then pushes the updated weights to a public HF repo. The whole cycle repeats immediately.
+Each training window is one possible GRPO step. The cadence is event-driven: a window seals once enough valid distinct-prompt rollout groups land, then final selection is ordered by drand/canonical rules rather than validator-side TCP latency. The validator recomputes rewards itself, quarantines suspicious selected windows from training, and runs a PPO-clipped surrogate loss with a KL penalty against the frozen reference on healthy full batches. Updated weights are published to a public HF repo on the configured publish cadence.
 
-The network produces three artefacts: a continuously-trained model (published to HF every ten windows), a per-window rollout dataset (archived to R2), and a signed checkpoint manifest (served from `/checkpoint`) that lets anyone verify the chain of custody from a base model through every training step. The audit trail is cryptographic — each rollout carries a GRAIL sketch that lets the validator re-run the forward pass and confirm the generation came from the announced checkpoint.
+The network produces three artefacts: a continuously-trained model (published to HF every ten trained windows), a per-window rollout dataset (archived to R2), and a signed checkpoint manifest (served from `/checkpoint`) that lets anyone verify the chain of custody from a base model through every training step. The audit trail is cryptographic — each rollout carries a GRAIL sketch that lets the validator re-run the forward pass and confirm the generation came from the announced checkpoint.
 
-Validators hold stake and run the training loop. Miners hold hotkeys, run GPU inference, and earn emission proportional to their share of batch slots over a rolling 72-window scoring interval; the main optimization surface for a miner is predicting which prompts sit at the policy's learning frontier — selection intelligence wins slots, and by construction also feeds the GRPO step gradient-rich groups. Downstream consumers — researchers, fine-tuning pipelines — pull the published HF checkpoint or the R2 rollout dataset directly.
+Validators hold stake and run the training loop. Miners hold hotkeys, run GPU inference, and earn emission proportional to their smoothed share of selected prompt rewards over a rolling 72-window EMA; the main optimization surface for a miner is predicting which prompts sit at the policy's learning frontier while producing clean, verifiable, naturally terminated rollouts. Downstream consumers — researchers, fine-tuning pipelines — pull the published HF checkpoint or the R2 rollout dataset directly.
 
 ## Quickstart
 
@@ -51,15 +51,15 @@ Validators hold stake and run the training loop. Miners hold hotkeys, run GPU in
                          └──────────────┘
 ```
 
-Miners submit rollout groups to `/submit` and poll `/state` for checkpoint updates. The validator trains, publishes to HF, and broadcasts weights on-chain once per subnet epoch (~360 blocks on netuid 81), aligned to the epoch boundary so all validators converge on identical weights. Miners pull new weights via `/state` → HF `snapshot_download`. R2 stores the per-window rollout archive; the validator reads it at startup to rebuild the prompt cooldown map.
+Miners submit rollout groups to `/submit` and poll `/state` for checkpoint updates. The validator trains healthy windows, publishes to HF, and broadcasts weights on-chain once per subnet epoch (~360 blocks on netuid 81), aligned to the epoch boundary so all validators converge on identical weights. Miners pull new weights via `/state` → HF `snapshot_download`. R2 stores the per-window rollout archive, including reject summaries and training-quarantine metadata; the validator reads it at startup to rebuild cooldown/hash state.
 
 ## Status
 
 - **v1** — verifiable-inference dataset production (shipped, deprecated)
 - **v2** — GRPO market with in-subnet training (shipped)
 - **v2.1** — batch-driven windows, HF checkpoint distribution, EMA scoring (shipped)
-- **v2.2** — manipulation-resistant batch ordering (current)
-- **v2.3** — multi-validator consensus (planned)
+- **v2.3** — drand ordering, multi-miner-per-prompt, prompt emission split (current)
+- **v2.4 direction** — private/generated reward tasks and stronger anti-selection protocol design (planned)
 
 ## License
 
