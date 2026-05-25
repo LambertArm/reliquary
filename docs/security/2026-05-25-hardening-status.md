@@ -17,27 +17,29 @@ file is the current-state pointer for operators and future audits.
 | Reward distribution | #46 | OpenMath steady-state binary groups outside k=3..5 reject as `reward_distribution` |
 | Cheap reject ordering | #47 | Proof-free schema/token/prompt/reward-distribution checks run before expensive GRAIL work |
 | Training quarantine | #48 | High-confidence suspicious selected windows archive/credit but skip GRPO and checkpoint publish |
-| Validator-owned rewards | #49 | Miner-submitted `rollout.reward` is a placeholder; validator recomputes and overwrites reward before sigma/archive/training |
+| Reward-claim verification restored | #49 reverted | Miners submit local `env.compute_reward` values; validator recomputes and rejects mismatches before sigma/archive/training |
 
 ## Live Design Invariants
 
 - The canonical token source is `rollout.commit["tokens"]`.
-- Miners should submit reward placeholders; the validator owns reward.
+- Miners should submit honest local reward claims; the validator verifies them.
 - Steady-state OpenMath binary rewards must have 3, 4, or 5 correct rollouts
   out of 8.
 - Steady-state training does not ingest cap/non-EOS truncated completions.
 - EOS ends a completion; repeated EOS padding is invalid.
 - Suspicious windows can still count for emission accounting, but not for model
   updates.
-- R2 selected batch entries no longer publish direct `ground_truth`; they use
-  `prompt_id` plus prompt/rollout observability.
+- R2 selected batch entries include the verifier-checked reward claims used for
+  sigma and training.
 
 ## Remaining Design Risk
 
-Validator-owned reward is not the same as full reward secrecy. OpenMath labels
-are public/reconstructable, so a sophisticated miner may still infer labels
-outside the stock miner and optimize candidate-pool selection or formatting
-behavior.
+Reward-claim verification is not reward secrecy. OpenMath labels are
+public/reconstructable, so a sophisticated miner may still infer labels outside
+the stock miner and optimize candidate-pool selection or formatting behavior.
+
+PR #49's validator-owned reward experiment was reverted because it removed too
+much miner-side frontier signal before private/generated tasks were ready.
 
 The next structural fix should not be another narrow heuristic unless live data
 forces it. The durable direction is:
@@ -70,4 +72,3 @@ the trainer with:
 ```text
 RELIQUARY_RESUME_FROM=sha:<current /health checkpoint_revision>
 ```
-

@@ -16,7 +16,7 @@ Three structural guarantees come with the market:
 
 - **Forced curriculum diversity.** A prompt that enters a winning batch is locked out for `BATCH_PROMPT_COOLDOWN_WINDOWS = 1_000_000` windows in the current OpenMath phase. In practice, prompts are one-shot. This prevents collapse onto a handful of high-variance outliers; R2 cooldown rebuild uses a bounded recent-window lookback so startup stays cheap.
 - **Cryptographic training-data provenance.** Every rollout carries a GRAIL sketch that binds the generation to the model weights that produced it. The validator re-verifies with its own forward pass. Fabricated data earns zero.
-- **Validator-owned reward and training quarantine.** Miners may submit a backward-compatible reward placeholder, but the validator recomputes and overwrites rewards before sigma, archive, or training use them. Windows with high-confidence poison signatures are archived and credited but skipped for GRPO/publish.
+- **Reward-claim verification and training quarantine.** Miners submit the reward they computed locally, and the validator independently recomputes it before accepting the group. Windows with high-confidence poison signatures are archived and credited but skipped for GRPO/publish.
 
 The zone filter (`σ ≥ 0.43`, see below) is the mechanical realization of DAPO's Dynamic Sampling, reformulated to be reward-scale-agnostic. The miner-side incentive to predict σ *before* generating is what turns DAPO's post-hoc filter into an ex-ante market.
 
@@ -30,22 +30,22 @@ One full training window, step by step.
 Miners poll `GET /state` continuously. The response (`GrpoBatchState`) carries `state`, `window_n`, `checkpoint_n`, `checkpoint_repo_id`, `checkpoint_revision`, and `cooldown_prompts`. If `checkpoint_n` has advanced since the last poll, the miner downloads the new HF revision before doing anything else.
 
 **2. Miner picks a prompt.**
-The miner selects a `prompt_idx` from OpenMathInstruct-2 (`nvidia/OpenMathInstruct-2`) that is not in `cooldown_prompts`. The reference engine uses uniform-random sampling with rejection against the cooldown set. This is a baseline: smarter miner-side selection — predicting which prompts will pass the zone filter for the current checkpoint — is expected. The reward oracle itself is validator-owned; miners should optimize prompt/frontier selection and clean generation, not visible answer-label or reward-vector shaping. See [mining.md §Prompt selection strategy](mining.md#prompt-selection-strategy).
+The miner selects a `prompt_idx` from OpenMathInstruct-2 (`nvidia/OpenMathInstruct-2`) that is not in `cooldown_prompts`. The reference engine uses uniform-random sampling with rejection against the cooldown set. This is a baseline: smarter miner-side selection — predicting which prompts will pass the zone filter for the current checkpoint — is expected. Miners must still submit honest rollout rewards: the validator recomputes each claimed reward and rejects mismatches. See [mining.md §Prompt selection strategy](mining.md#prompt-selection-strategy).
 
 **3. Miner generates M=8 rollouts.**
-The miner runs exactly `M_ROLLOUTS = 8` completions at the protocol-fixed temperature `T_PROTO = 0.9`, `top_p = 1.0`, `top_k = 0`. The validator cannot prove a miner did not generate extra candidates before submission, so the protocol now combines validator-owned rewards, binary reward-distribution guards, and training quarantine to reduce the value and blast radius of reward-vector shaping.
+The miner runs exactly `M_ROLLOUTS = 8` completions at the protocol-fixed temperature `T_PROTO = 0.9`, `top_p = 1.0`, `top_k = 0`. The validator cannot prove a miner did not generate extra candidates before submission, so the protocol combines reward-claim verification, binary reward-distribution guards, and training quarantine to reduce the value and blast radius of reward-vector shaping.
 
 **4. Miner builds GRAIL sketches.**
-For each rollout the miner runs a bit-identical HuggingFace forward pass on the proof GPU to construct a GRAIL sketch commitment. The sketch binds the completion to the model's hidden-state activations. The miner signs the commit and packages everything into a `BatchSubmissionRequest` that includes `checkpoint_hash` (the HF revision from the last `/state` response). `rollout.reward` is only a backward-compatible placeholder; the stock miner submits `0.0` and the validator recomputes the real reward.
+For each rollout the miner runs a bit-identical HuggingFace forward pass on the proof GPU to construct a GRAIL sketch commitment. The sketch binds the completion to the model's hidden-state activations. The miner signs the commit and packages everything into a `BatchSubmissionRequest` that includes `checkpoint_hash` (the HF revision from the last `/state` response). `rollout.reward` must match the miner's local `env.compute_reward` value; the validator recomputes it and rejects the submission if it differs.
 
 **5. Miner submits.**
 `POST /submit` sends the request to the validator. In production, the HTTP response is provisional (`accepted=True, reason="submitted"`) once the request is queued. A background worker later runs the full verification pipeline (see below) and appends the submission to the open window's valid pool only if it passes.
 
 **6. Validator verifies, filters, selects batch.**
-The validator checks: window match → checkpoint hash → prompt index bounds → cooldown → per-prompt capacity → schema/token invariants → prompt-token binding → rollout-hash dedup → validator reward recompute → zone filter (`σ ≥ 0.43`) → binary reward-distribution guard → signatures/randomness → GRAIL sketch → termination/logprob/token-distribution checks. Any failure returns a `RejectReason`. Valid submissions accumulate. Once `B_BATCH = 8` eligible distinct prompts pass, `seal_event` fires after the drand-round drain.
+The validator checks: window match → checkpoint hash → prompt index bounds → cooldown → per-prompt capacity → schema/token invariants → prompt-token binding → rollout-hash dedup → reward-claim verification → zone filter (`σ ≥ 0.43`) → binary reward-distribution guard → signatures/randomness → GRAIL sketch → termination/logprob/token-distribution checks. Any failure returns a `RejectReason`. Valid submissions accumulate. Once `B_BATCH = 8` eligible distinct prompts pass, `seal_event` fires after the drand-round drain.
 
 **7. Validator runs a GRPO step if the batch is healthy.**
-State transitions to `TRAINING`. Before GRPO, the validator runs a training-quarantine assessment over the selected batch and the window's reject profile. Quarantined windows are still archived and credited for emissions, but they do not mutate the train model and do not publish a checkpoint. Healthy full batches run `train_step()`, which computes group-relative advantages from validator-owned rewards, applies a PPO-clipped surrogate loss + KL penalty against the frozen reference model, and steps AdamW.
+State transitions to `TRAINING`. Before GRPO, the validator runs a training-quarantine assessment over the selected batch and the window's reject profile. Quarantined windows are still archived and credited for emissions, but they do not mutate the train model and do not publish a checkpoint. Healthy full batches run `train_step()`, which computes group-relative advantages from verifier-checked rollout rewards, applies a PPO-clipped surrogate loss + KL penalty against the frozen reference model, and steps AdamW.
 
 **8. Validator publishes a new checkpoint.**
 State transitions to `PUBLISHING`. Every `CHECKPOINT_PUBLISH_INTERVAL_WINDOWS = 10` trained windows the model is saved locally, pushed to HF Hub, and signed: `ed25519(checkpoint_n || revision)`. The signed manifest is installed in `/checkpoint`. Between publishes the miners stay on the last-published revision (enforced by the checkpoint hash gate). The window dataset is archived to R2, including quarantine metadata when present.
@@ -193,7 +193,7 @@ A miner consistently landing on 2 unshared winning prompts per window gets rough
 | Resubmit old completions | `WRONG_CHECKPOINT` (rotation invalidates stale rollouts) | 0 earnings |
 | Cherry-pick only easy prompts | σ ≈ 0 → `OUT_OF_ZONE` | 0 earnings |
 | Spam the same prompt every window | One-shot cooldown blocks re-entry after the prompt wins | 0 earnings after first winning inclusion |
-| Generate extra rollouts to select favorable reward vectors | Validator-owned rewards, k=3..5 guard, monitoring, and training quarantine reduce reward-shaping value and training blast radius | May earn less or trigger quarantine; long-term private tasks/commit-first sampling are the durable fix |
+| Generate extra rollouts to select favorable reward vectors | k=3..5 guard, monitoring, and training quarantine reduce reward-shaping value and training blast radius | May earn less or trigger quarantine; long-term private tasks/commit-first sampling are the durable fix |
 | Submit extremely fast | Drand-round ordering and prompt emission split reduce pure TCP/colo advantage | Timing still matters for being in-window, not millisecond FIFO |
 | Run a stale model | `WRONG_CHECKPOINT` rejects before GRAIL | 0 earnings |
 
@@ -201,7 +201,7 @@ A miner consistently landing on 2 unshared winning prompts per window gets rough
 
 ## Known limitations
 
-- **Public OpenMath labels.** Validator-authoritative reward removes trust in miner-claimed rewards, but OpenMath labels are public/reconstructable. Full reward secrecy requires private/generated validator-side tasks, archive redaction/delay, or a future commit-first sampling protocol.
+- **Public OpenMath labels.** The validator verifies miner reward claims, but OpenMath labels are public/reconstructable. Full reward secrecy requires private/generated validator-side tasks, archive redaction/delay, or a future commit-first sampling protocol.
 - **Single trainer.** The current deployment assumes a single trainer writing to R2. Multiple trainers in the same bucket would collide on archive keys (`reliquary/dataset/window-<N>.json.gz`). Multi-trainer consensus is future work.
 - **Optimizer and scheduler state not persisted.** A validator restart resets AdamW momentum and the LR scheduler step count to zero. Training regresses for `LR_WARMUP_WINDOWS = 10` windows before stabilizing. Minimize restarts.
 - **No automatic HF checkpoint garbage collection.** Every publish creates a new HF commit. Old revisions accumulate. Plan manual or cron-based cleanup.

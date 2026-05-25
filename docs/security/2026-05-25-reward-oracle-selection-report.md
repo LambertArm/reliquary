@@ -1,6 +1,8 @@
 # 2026-05-25 Reward Oracle Selection Report
 
-Status: investigated; fleet monitoring added; PR #46, PR #48, and PR #49 shipped
+Status: investigated; fleet monitoring added; PR #46 and PR #48 remain shipped;
+PR #49 was reverted after live miner data showed it blinded prompt/frontier
+selection too early.
 
 Update after hardening:
 
@@ -8,12 +10,12 @@ Update after hardening:
   `reward_distribution` guard.
 - PR #48 added training quarantine so suspicious selected windows can be
   archived/credited without mutating the model.
-- PR #49 made reward validator-authoritative: miner-submitted
-  `rollout.reward` is now only a placeholder, and the validator overwrites it
-  before sigma, archive, or training.
+- Reward claims are verifier-checked again: miners submit local
+  `env.compute_reward` values, and the validator recomputes them before
+  sigma, archive, or training.
 
-Remaining caveat: OpenMath labels are still public/reconstructable, so this is
-not full reward secrecy. The durable design direction remains private/generated
+Remaining caveat: OpenMath labels are public/reconstructable, so this is not
+reward secrecy. The durable design direction remains private/generated
 validator-side tasks and, later, commit-first sampling if miners keep shaping
 candidate pools.
 
@@ -193,20 +195,14 @@ format/unit variants can score 0 while parser-friendly `\boxed{90}` scores 1.
 
 ## Why Existing Validation Accepts It
 
-Historical validator flow before PR #49:
+Current validator flow after reverting PR #49:
 
 - `validator/batcher.py`: reward claims were recomputed and then sigma was
   checked before GRAIL-heavy validation.
 - `validator/verifier.py`: `verify_reward_claim` accepted miner-declared
   rewards if `env.compute_reward` matched.
 - `validator/training.py`: GRPO trained on the submitted rollouts and their
-  submitted reward vector after validation.
-
-Current validator flow:
-
-- `validator/batcher.py`: the validator recomputes each rollout reward and
-  overwrites `rollout.reward` before sigma/distribution checks.
-- `validator/training.py`: GRPO consumes validator-owned rewards.
+  verifier-checked submitted reward vector.
 - `validator/service.py`: selected suspicious windows can be quarantined from
   training/publish while still archived and credited.
 

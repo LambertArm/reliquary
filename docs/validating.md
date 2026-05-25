@@ -195,7 +195,7 @@ queue submission                     BAD_PROMPT_IDX / PROMPT_IN_COOLDOWN? → re
 return reason="submitted"            PROMPT_FULL? → reject
                                      BAD_SCHEMA / TOKENS_MISMATCH / BAD_TOKENS? → reject
                                      PROMPT_MISMATCH / HASH_DUPLICATE? → reject
-                                     validator recomputes rollout rewards
+                                     validator verifies claimed rollout rewards
                                      REWARD_MISMATCH / OUT_OF_ZONE? → reject
                                      REWARD_DISTRIBUTION? → reject
                                      BAD_SIGNATURE / WRONG_RANDOMNESS? → reject
