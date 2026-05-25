@@ -17,8 +17,10 @@ from pydantic import ValidationError
 from reliquary.constants import (
     BATCH_PROMPT_COOLDOWN_WINDOWS,
     B_BATCH,
+    BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION,
     M_ROLLOUTS,
     MAX_SUBMISSIONS_PER_PROMPT,
+    MAX_TRUNCATED_PER_SUBMISSION,
     REJECTED_LIST_CAP_PER_HOTKEY,
 )
 from reliquary.environment.base import Environment
@@ -532,6 +534,27 @@ class GrpoWindowBatcher:
             if list(rollout.tokens) != list(rollout.commit["tokens"]):
                 return reject(RejectReason.TOKENS_MISMATCH, "token_invariant")
 
+        # Proof-free checks before reward and GRAIL. These reject malformed
+        # payloads before tokenizer decode, env reward work, or GPU proof work.
+        canonical_prompt_tokens: list[int] | None = None
+        if self._canonical_prompt_tokens is not None:
+            canonical_prompt_tokens = list(
+                self._canonical_prompt_tokens(request.prompt_idx)
+            )
+
+        for rollout in request.rollouts:
+            if not verify_tokens(rollout.commit["tokens"], self.model.config):
+                return reject(RejectReason.BAD_TOKENS, "tokens")
+
+            if canonical_prompt_tokens is not None:
+                rollout_meta = rollout.commit.get("rollout", {}) or {}
+                miner_prompt_len = int(rollout_meta.get("prompt_length", 0))
+                miner_prompt_tokens = list(rollout.commit.get("tokens", []))[
+                    :miner_prompt_len
+                ]
+                if miner_prompt_tokens != canonical_prompt_tokens:
+                    return reject(RejectReason.PROMPT_MISMATCH, "prompt_binding")
+
         # Per-rollout hash dedup against the persistent set + within this
         # submission. Computed once here, reused at seal_batch and archive.
         # Skipped entirely when hash_set is None (back-compat for tests that
@@ -570,42 +593,17 @@ class GrpoWindowBatcher:
         lp_dev_max: float | None = None
         dist_q10_min: float | None = None
 
-        # Bind ``prompt_idx`` to the actual prompt tokens the miner ran their
-        # forward pass on. Without this, a miner can submit completions
-        # generated under a modified prompt (CoT prefix, alternate chat
-        # template, few-shot examples) while claiming the canonical
-        # ``prompt_idx``: the reward check still passes if the underlying
-        # question is intact, but training sees a distribution shift. Compute
-        # the canonical tokens once per submission and reject any rollout
-        # whose ``tokens[:prompt_length]`` diverges before doing GRAIL compute.
-        canonical_prompt_tokens: list[int] | None = None
-        if self._canonical_prompt_tokens is not None:
-            canonical_prompt_tokens = list(
-                self._canonical_prompt_tokens(request.prompt_idx)
-            )
-
-        # Allow up to 1 truncated rollout per submission. At T_PROTO=0.9 on
-        # math problems with Qwen3-4B, ~1/8 rollouts statistically drift past
-        # max_new_tokens without sampling EOS. Failing the entire submission
-        # for a single drift makes acceptance vanishingly rare. The truncated
-        # rollout itself is still excluded from the per-rollout behavioural
-        # checks below (logprobs / distribution) since they assume completion.
-        MAX_TRUNCATED_PER_SUBMISSION = 1
+        # Steady-state training should not ingest cap/non-EOS truncated
+        # completions. Bootstrap keeps a one-rollout allowance to preserve
+        # early-window fill rate while the model is weak.
+        max_truncated_per_submission = (
+            BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION
+            if self.bootstrap
+            else MAX_TRUNCATED_PER_SUBMISSION
+        )
         truncated_count = 0
 
         for rollout in request.rollouts:
-            # Token check: vocab bounds + max length (cheap, protects forward pass)
-            if not verify_tokens(rollout.commit["tokens"], self.model.config):
-                return reject(RejectReason.BAD_TOKENS, "tokens")
-
-            if canonical_prompt_tokens is not None:
-                rollout_meta = rollout.commit.get("rollout", {}) or {}
-                miner_prompt_len = int(rollout_meta.get("prompt_length", 0))
-                miner_prompt_tokens = list(rollout.commit.get("tokens", []))[
-                    :miner_prompt_len
-                ]
-                if miner_prompt_tokens != canonical_prompt_tokens:
-                    return reject(RejectReason.PROMPT_MISMATCH, "prompt_binding")
             if not self._verify_signature(rollout.commit, request.miner_hotkey):
                 return reject(RejectReason.BAD_SIGNATURE, "rollout_signature")
             # Randomness binding: the miner-claimed beacon randomness MUST equal
@@ -665,7 +663,7 @@ class GrpoWindowBatcher:
                 )
                 if not termination_ok or cap_truncated:
                     truncated_count += 1
-                    if truncated_count > MAX_TRUNCATED_PER_SUBMISSION:
+                    if truncated_count > max_truncated_per_submission:
                         return reject(
                             RejectReason.BAD_TERMINATION,
                             "termination",

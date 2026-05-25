@@ -86,6 +86,12 @@ UPLOAD_BUFFER = NETWORK_UPLOAD_LATENCY
 # Network-wide protocol cap on completion length.
 MAX_NEW_TOKENS_PROTOCOL_CAP = 8192
 
+# Cap/non-EOS truncation policy. Steady-state training should not ingest
+# truncated completions; bootstrap keeps the previous one-rollout allowance so
+# the network can still fill early windows while the model is weak.
+MAX_TRUNCATED_PER_SUBMISSION = 0
+BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION = 1
+
 # Soft cap on per-hotkey entries persisted to ``archive["rejected"]`` per
 # window. Beyond this, ``reject_counts`` still increments but no metadata is
 # appended — protects the R2 payload size against a flood of garbage
