@@ -201,6 +201,17 @@ def test_reject_binary_edge_low_correct_reward_distribution():
     assert resp.reason == RejectReason.REWARD_DISTRIBUTION
 
 
+def test_reward_distribution_rejects_before_grail_compute():
+    def fail_if_called(commit, model, randomness):  # pragma: no cover
+        raise AssertionError("GRAIL proof should not run for reward_distribution")
+
+    b = _make_batcher(verify_commitment_proofs_fn=fail_if_called)
+    req = _request(rewards=[1.0] * 6 + [0.0] * 2)
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.REWARD_DISTRIBUTION
+
+
 @pytest.mark.parametrize("k", [3, 4, 5])
 def test_accept_binary_middle_frontier_reward_distribution(k):
     b = _make_batcher()
@@ -1046,6 +1057,37 @@ def test_reject_repeated_cap_path_truncations():
         )
         req.rollouts[idx].commit = commit
         req.rollouts[idx].tokens = commit["tokens"]
+
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.BAD_TERMINATION
+
+
+def test_reject_single_cap_path_truncation_in_steady_state():
+    from reliquary.constants import MAX_NEW_TOKENS_PROTOCOL_CAP
+
+    class _LongContextModelStub:
+        class config:
+            vocab_size = 20000
+            max_position_embeddings = 20000
+
+    prompt_length = 4
+    seq_len = prompt_length + MAX_NEW_TOKENS_PROTOCOL_CAP
+    b = _make_batcher(
+        model=_LongContextModelStub(),
+        verify_commitment_proofs_fn=_grail_with_logits(seq_len),
+    )
+    req = _request()
+
+    tokens = list(range(seq_len))
+    commit = _make_commit(
+        tokens=tokens,
+        prompt_length=prompt_length,
+        success=req.rollouts[0].reward > 0.5,
+        total_reward=req.rollouts[0].reward,
+    )
+    req.rollouts[0].commit = commit
+    req.rollouts[0].tokens = commit["tokens"]
 
     resp = b.accept_submission(req)
     assert resp.accepted is False

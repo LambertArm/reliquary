@@ -12,6 +12,8 @@ def test_v2_sigma_bounds():
     assert C.BOOTSTRAP_SIGMA_MIN < C.SIGMA_MIN
     assert C.BINARY_REWARD_MIN_CORRECT == 3
     assert C.BINARY_REWARD_MAX_CORRECT == 5
+    assert C.MAX_TRUNCATED_PER_SUBMISSION == 0
+    assert C.BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION == 1
 
 
 def test_v2_group_sizes():
