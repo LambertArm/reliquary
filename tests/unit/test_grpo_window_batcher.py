@@ -212,6 +212,66 @@ def test_reward_distribution_rejects_before_grail_compute():
     assert resp.reason == RejectReason.REWARD_DISTRIBUTION
 
 
+def test_reject_manufactured_opposite_reward_clones_before_grail_compute():
+    def fail_if_called(commit, model, randomness):  # pragma: no cover
+        raise AssertionError("GRAIL proof should not run for clone-pattern rejects")
+
+    def paired_text(slot: int, answer: int, *, correct: bool) -> str:
+        verdict = "CORRECT" if correct else "near miss"
+        return (
+            f"To solve template {slot}, compute the same intermediate values. "
+            "First expand the expression, then simplify every term carefully. "
+            "The derivation is intentionally long enough to look like a real "
+            "math completion and all steps are repeated across the paired "
+            "rollouts. After substitution, the final numeric value is "
+            f"{answer}. Therefore the final answer is \\boxed{{{answer}}}. "
+            f"{verdict}"
+        )
+
+    req = _request(rewards=[1.0] * 4 + [0.0] * 4)
+    texts: dict[int, str] = {}
+    for slot in range(4):
+        texts[slot] = paired_text(slot, 40, correct=True)
+        texts[slot + 4] = paired_text(slot, 41 + slot, correct=False)
+
+    b = _make_batcher(
+        completion_text_fn=lambda rollout: texts[rollout.tokens[0]],
+        verify_commitment_proofs_fn=fail_if_called,
+    )
+
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.DISTRIBUTION_SUSPICIOUS
+
+
+def test_allow_less_than_three_opposite_reward_clone_pairs():
+    def paired_text(slot: int, answer: int, *, correct: bool) -> str:
+        verdict = "CORRECT" if correct else "near miss"
+        return (
+            f"To solve template {slot}, compute the same intermediate values. "
+            "First expand the expression, then simplify every term carefully. "
+            "Only two opposite-reward pairs are deliberately similar here. "
+            f"The final answer is \\boxed{{{answer}}}. {verdict}"
+        )
+
+    req = _request(rewards=[1.0] * 4 + [0.0] * 4)
+    texts = {
+        0: paired_text(0, 40, correct=True),
+        1: paired_text(1, 40, correct=True),
+        2: "A separate solution path reaches the answer. CORRECT",
+        3: "Another unrelated derivation also reaches the answer. CORRECT",
+        4: paired_text(0, 41, correct=False),
+        5: paired_text(1, 42, correct=False),
+        6: "This wrong path makes an arithmetic slip and ends elsewhere.",
+        7: "This different wrong path estimates instead of calculating.",
+    }
+    b = _make_batcher(completion_text_fn=lambda rollout: texts[rollout.tokens[0]])
+
+    resp = b.accept_submission(req)
+    assert resp.accepted is True
+    assert resp.reason == RejectReason.ACCEPTED
+
+
 @pytest.mark.parametrize("k", [3, 4, 5])
 def test_accept_binary_middle_frontier_reward_distribution(k):
     b = _make_batcher()

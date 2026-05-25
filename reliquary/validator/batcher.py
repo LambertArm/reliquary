@@ -46,6 +46,7 @@ from reliquary.validator.observability import (
     classify_drand_round,
     log_submission_stage,
 )
+from reliquary.validator.rollout_patterns import detect_opposite_reward_clones
 from reliquary.validator.verifier import (
     evaluate_token_distribution,
     binary_reward_mix_in_frontier,
@@ -587,6 +588,15 @@ class GrpoWindowBatcher:
             return reject(RejectReason.OUT_OF_ZONE, "zone")
         if not self.bootstrap and not binary_reward_mix_in_frontier(rewards):
             return reject(RejectReason.REWARD_DISTRIBUTION, "reward_distribution")
+        clone_metrics = detect_opposite_reward_clones(completion_texts, rewards)
+        if clone_metrics.suspicious:
+            logger.info(
+                "reject reason=distribution_suspicious hotkey=%s "
+                "manufactured_opposite_reward_clones=%s",
+                request.miner_hotkey,
+                clone_metrics.to_log_dict(),
+            )
+            return reject(RejectReason.DISTRIBUTION_SUSPICIOUS, "distribution")
 
         # Per-submission worst-case filter telemetry (across all rollouts).
         sketch_diff_max = 0
