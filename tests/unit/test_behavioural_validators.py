@@ -403,13 +403,13 @@ def test_evaluate_boxed_high_prob_passes():
 
 
 def test_evaluate_boxed_low_prob_rejects():
-    """One token inside \\boxed{} dropped to 0.01 → tampering signature."""
+    """One token inside \\boxed{} at tampered probability (~1/vocab) → reject."""
     completion = "answer is \\boxed{42}"
     tokens = [0] * 5 + _ords(completion)
     probs = [0.99] * len(completion)
     # Position of "4" inside the boxed content
     boxed_open = completion.index("{") + 1
-    probs[boxed_open] = 0.01
+    probs[boxed_open] = 1e-6
     proof = ProofResult(
         all_passed=True, passed=1, checked=1,
         has_sparse_outputs=True,
@@ -421,7 +421,7 @@ def test_evaluate_boxed_low_prob_rejects():
         proof=proof, tokenizer=_CharTokenizer(),
     )
     assert ok is False
-    assert metrics["min_prob"] == 0.01
+    assert metrics["min_prob"] == 1e-6
 
 
 def test_evaluate_boxed_unclosed_returns_true():
@@ -448,7 +448,7 @@ def test_evaluate_boxed_last_boxed_wins():
     probs = [0.99] * len(completion)
     # Make the FIRST boxed content low — should NOT reject.
     first_boxed_open = completion.index("{") + 1
-    probs[first_boxed_open] = 0.01
+    probs[first_boxed_open] = 1e-6
     proof = ProofResult(
         all_passed=True, passed=1, checked=1,
         has_sparse_outputs=True,
@@ -466,7 +466,7 @@ def test_evaluate_boxed_fbox_alias_also_checked():
     completion = "answer is \\fbox{42}"
     tokens = [0] * 5 + _ords(completion)
     probs = [0.99] * len(completion)
-    probs[completion.index("{") + 1] = 0.05
+    probs[completion.index("{") + 1] = 1e-6
     proof = ProofResult(
         all_passed=True, passed=1, checked=1,
         has_sparse_outputs=True,

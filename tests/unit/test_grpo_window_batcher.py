@@ -1661,14 +1661,14 @@ def _boxed_completion_padded(answer_text: str = "the final answer is \\boxed{42}
 
 
 def test_reject_boxed_answer_tampered():
-    """One token inside the last \\boxed{...} sampled at p<0.5 → reject."""
+    """One token inside the last \\boxed{...} at tampered prob → reject."""
     prompt = [10, 11, 12, 13]
     text, completion = _boxed_completion_padded()
     tokens = prompt + completion
     seq_len = len(tokens)
 
     probs = [0.99] * len(completion)
-    probs[text.index("{") + 1] = 0.05
+    probs[text.index("{") + 1] = 1e-6
 
     class _LongCtxModel:
         class config:
@@ -1696,7 +1696,7 @@ def test_reject_boxed_answer_tampered():
 
 
 def test_accept_boxed_answer_high_prob():
-    """All tokens inside \\boxed{...} sampled at p>0.5 → no boxed reject."""
+    """All tokens inside \\boxed{...} above threshold → no boxed reject."""
     prompt = [10, 11, 12, 13]
     _, completion = _boxed_completion_padded()
     tokens = prompt + completion
@@ -1750,7 +1750,7 @@ def test_cap_truncated_rollout_still_runs_behavioural_checks():
 
     probs = [0.99] * len(completion)
     # Tamper: drop chosen prob at the digit inside \boxed{}
-    probs[len(body) + answer.index("{") + 1] = 0.02
+    probs[len(body) + answer.index("{") + 1] = 1e-6
 
     class _LongCtxModel:
         class config:
