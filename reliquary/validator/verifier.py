@@ -607,3 +607,110 @@ def evaluate_token_distribution(
         or metrics["q10"] < SAMPLING_LOW_Q10_MAX
     )
     return (not suspicious), metrics
+
+
+def _find_last_boxed_token_range(
+    completion_tokens: list[int],
+    tokenizer: Any,
+) -> tuple[int, int] | None:
+    """Return ``(start, end)`` completion-relative token indices (inclusive)
+    that cover the content between ``{`` and ``}`` of the last
+    ``\\boxed{...}`` or ``\\fbox{...}`` in the decoded completion. ``None`` if
+    no closed boxed answer is present.
+
+    Walks token-by-token decode to map text offsets back to token positions.
+    Matches ``_last_boxed_only_string`` in the OMI env so the filter targets
+    the same substring the reward parser keys on.
+    """
+    if not completion_tokens:
+        return None
+    offsets: list[tuple[int, int]] = []
+    cum = ""
+    for tok in completion_tokens:
+        frag = tokenizer.decode([int(tok)], skip_special_tokens=False)
+        offsets.append((len(cum), len(cum) + len(frag)))
+        cum += frag
+
+    idx = max(cum.rfind("\\boxed{"), cum.rfind("\\fbox{"))
+    if idx < 0:
+        return None
+    try:
+        open_idx = cum.index("{", idx)
+    except ValueError:
+        return None
+    depth = 0
+    close_idx = -1
+    for j in range(open_idx, len(cum)):
+        c = cum[j]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                close_idx = j
+                break
+    if close_idx < 0:
+        return None
+
+    content_start = open_idx + 1
+    content_end = close_idx  # exclusive
+
+    start_tok = end_tok = None
+    for i, (s, e) in enumerate(offsets):
+        if start_tok is None and e > content_start:
+            start_tok = i
+        if s < content_end:
+            end_tok = i
+    if start_tok is None or end_tok is None:
+        return None
+    return start_tok, end_tok
+
+
+def evaluate_boxed_answer_probability(
+    tokens: list[int],
+    prompt_length: int,
+    completion_length: int,
+    proof: "ProofResult",
+    tokenizer: Any,
+    *,
+    threshold: float | None = None,
+) -> tuple[bool, dict]:
+    """Hard check (OMI-specific): every token inside the last ``\\boxed{...}``
+    must have chosen-token probability ≥ ``threshold``.
+
+    The OMI reward parser extracts the answer from the last ``\\boxed{...}``;
+    a miner can flip a wrong rollout to right by swapping a few answer tokens
+    post-hoc. The validator's forward pass on the tampered tokens shows a
+    collapsed chosen probability at those positions, while honest sampling
+    keeps boxed-answer probabilities high (>0.5 in measurements).
+
+    Returns ``(ok, metrics)`` where ``metrics`` carries ``min_prob`` and
+    ``n_tokens`` for telemetry. ``ok=True`` when no boxed answer is present
+    or no probabilities are available — the filter only fires on a concrete
+    low-probability boxed token.
+    """
+    from reliquary.constants import BOXED_ANSWER_MIN_PROB
+
+    if threshold is None:
+        threshold = BOXED_ANSWER_MIN_PROB
+    if completion_length <= 0:
+        return True, {}
+    probs = proof.completion_chosen_probs
+    if not probs:
+        return True, {}
+
+    completion_tokens = list(tokens[prompt_length: prompt_length + completion_length])
+    rng = _find_last_boxed_token_range(completion_tokens, tokenizer)
+    if rng is None:
+        return True, {}
+    start, end = rng
+
+    selected: list[float] = []
+    for i in range(start, end + 1):
+        if 0 <= i < len(probs):
+            selected.append(float(probs[i]))
+    if not selected:
+        return True, {}
+    min_prob = min(selected)
+    metrics = {"min_prob": min_prob, "n_tokens": len(selected)}
+    return min_prob >= threshold, metrics

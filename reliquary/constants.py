@@ -449,3 +449,9 @@ SAMPLING_LOW_P = 0.10           # prob <= this → "low" chosen token
 SAMPLING_HIGH_P = 0.90           # prob >= this → "high" chosen token
 SAMPLING_MEDIAN_LOW_MAX = 0.30  # median chosen prob must be above
 SAMPLING_LOW_Q10_MAX = 0.025    # 10th-percentile must be above
+
+# OpenMath final-answer tamper guard. The reward parser keys off the last
+# \boxed{...} content; swapping a few tokens there flips the reward without
+# moving median/q10. Honest sampling at T_PROTO leaves these tokens at high
+# probability — anything below this threshold flags as tampering.
+BOXED_ANSWER_MIN_PROB = 0.5

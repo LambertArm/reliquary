@@ -1610,3 +1610,113 @@ def test_batcher_beacon_invalid_defaults_false():
     """
     b = _make_batcher()
     assert b.beacon_invalid is False
+
+
+# ----- BoxedAnswerValidator wiring -----
+
+
+class _CharTokenizerWithEos:
+    """One-char-per-token tokenizer with eos_token_id=99 for batcher wiring."""
+
+    eos_token_id = 99
+
+    def decode(self, ids, *, skip_special_tokens=False):
+        return "".join(chr(int(i)) for i in ids if int(i) != 99)
+
+
+def _grail_with_chosen_probs(seq_len: int, completion_probs: list[float], prompt_length: int = 4):
+    """Stub returning sparse outputs incl. completion_chosen_probs.
+
+    Also pre-populates challenge_lp_indices/values with zeros at the first K
+    completion positions, matching the miner-claimed all-zero logprobs from
+    ``_make_commit`` so verify_logprobs_claim does not fire before us.
+    """
+    challenge_idxs = list(range(prompt_length, prompt_length + CHALLENGE_K))
+    challenge_vals = [0.0] * CHALLENGE_K
+
+    def _fn(commit, model, randomness):
+        return ProofResult(
+            all_passed=True, passed=1, checked=1, sketch_diff_max=0,
+            has_sparse_outputs=True,
+            p_stop=0.99,
+            challenge_lp_indices=challenge_idxs,
+            challenge_lp_values=challenge_vals,
+            completion_chosen_probs=list(completion_probs),
+        )
+    return _fn
+
+
+def _boxed_completion_padded(answer_text: str = "the final answer is \\boxed{42}") -> tuple[str, list[int]]:
+    # completion_length must be >= CHALLENGE_K to clear verify_logprobs_claim.
+    pad_chars = max(0, (CHALLENGE_K + 1) - len(answer_text))
+    text = "x" * pad_chars + answer_text
+    completion = [ord(c) for c in text] + [99]
+    return text, completion
+
+
+def test_reject_boxed_answer_tampered():
+    """One token inside the last \\boxed{...} sampled at p<0.5 → reject."""
+    prompt = [10, 11, 12, 13]
+    text, completion = _boxed_completion_padded()
+    tokens = prompt + completion
+    seq_len = len(tokens)
+
+    probs = [0.99] * len(completion)
+    probs[text.index("{") + 1] = 0.05
+
+    class _LongCtxModel:
+        class config:
+            vocab_size = 1000
+            max_position_embeddings = 4096
+
+    b = _make_batcher(
+        model=_LongCtxModel(),
+        tokenizer=_CharTokenizerWithEos(),
+        verify_commitment_proofs_fn=_grail_with_chosen_probs(seq_len, probs),
+    )
+    req = _request()
+    commit = _make_commit(
+        tokens=tokens,
+        prompt_length=len(prompt),
+        success=True,
+        total_reward=1.0,
+    )
+    req.rollouts[0].commit = commit
+    req.rollouts[0].tokens = commit["tokens"]
+
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.BOXED_ANSWER_TAMPERED
+
+
+def test_accept_boxed_answer_high_prob():
+    """All tokens inside \\boxed{...} sampled at p>0.5 → no boxed reject."""
+    prompt = [10, 11, 12, 13]
+    _, completion = _boxed_completion_padded()
+    tokens = prompt + completion
+    seq_len = len(tokens)
+    probs = [0.95] * len(completion)
+
+    class _LongCtxModel:
+        class config:
+            vocab_size = 1000
+            max_position_embeddings = 4096
+
+    b = _make_batcher(
+        model=_LongCtxModel(),
+        tokenizer=_CharTokenizerWithEos(),
+        verify_commitment_proofs_fn=_grail_with_chosen_probs(seq_len, probs),
+    )
+    req = _request()
+    for idx in range(M_ROLLOUTS):
+        commit = _make_commit(
+            tokens=tokens,
+            prompt_length=len(prompt),
+            success=req.rollouts[idx].reward > 0.5,
+            total_reward=req.rollouts[idx].reward,
+        )
+        req.rollouts[idx].commit = commit
+        req.rollouts[idx].tokens = commit["tokens"]
+
+    resp = b.accept_submission(req)
+    assert resp.reason != RejectReason.BOXED_ANSWER_TAMPERED

@@ -48,6 +48,7 @@ from reliquary.validator.observability import (
 )
 from reliquary.validator.rollout_patterns import detect_opposite_reward_clones
 from reliquary.validator.verifier import (
+    evaluate_boxed_answer_probability,
     evaluate_token_distribution,
     has_eos_padding,
     is_cap_truncation,
@@ -726,6 +727,26 @@ class GrpoWindowBatcher:
                 return reject(
                     RejectReason.DISTRIBUTION_SUSPICIOUS,
                     "distribution",
+                    sketch_diff_max=sketch_diff_max,
+                    lp_dev_max=lp_dev_max,
+                    dist_q10_min=dist_q10_min,
+                )
+
+            boxed_ok, boxed_metrics = evaluate_boxed_answer_probability(
+                tokens=rollout.commit["tokens"],
+                prompt_length=prompt_len,
+                completion_length=completion_len,
+                proof=proof,
+                tokenizer=self.tokenizer,
+            )
+            if not boxed_ok:
+                logger.info(
+                    "reject reason=boxed_answer_tampered hotkey=%s %s",
+                    request.miner_hotkey, boxed_metrics,
+                )
+                return reject(
+                    RejectReason.BOXED_ANSWER_TAMPERED,
+                    "boxed_answer",
                     sketch_diff_max=sketch_diff_max,
                     lp_dev_max=lp_dev_max,
                     dist_q10_min=dist_q10_min,
