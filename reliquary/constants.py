@@ -452,6 +452,7 @@ SAMPLING_LOW_Q10_MAX = 0.025    # 10th-percentile must be above
 
 # OpenMath final-answer tamper guard. The reward parser keys off the last
 # \boxed{...} content; swapping a few tokens there flips the reward without
-# moving median/q10. Honest sampling at T_PROTO leaves these tokens at high
-# probability — anything below this threshold flags as tampering.
-BOXED_ANSWER_MIN_PROB = 0.5
+# moving median/q10. Tampered tokens land at p ≈ 1/vocab (~10⁻⁵ or lower)
+# under the validator's forward; honest low-confidence answer tokens stay
+# above ~10⁻³. Threshold sits in the gap.
+BOXED_ANSWER_MIN_PROB = 0.001
