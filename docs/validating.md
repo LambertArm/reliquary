@@ -172,8 +172,8 @@ These are the live thresholds the trainer applies on every submission. The same 
 | `PROOF_SKETCH_TOLERANCE_GROWTH` | 5.0 | Per-position sqrt growth |
 | `LOGPROB_IS_EPS` | 0.10 | Per-token log-prob deviation max — exceeding triggers `LOGPROB_MISMATCH` |
 | `MIN_EOS_PROBABILITY` | 0.01 | Required EOS token probability for proper termination |
-| `MAX_TRUNCATED_PER_SUBMISSION` | 0 | Steady-state cap/non-EOS truncation allowance |
-| `BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION` | 1 | Bootstrap truncation allowance |
+| `MAX_TRUNCATED_PER_SUBMISSION` | 1 | Steady-state cap/non-EOS truncation allowance; cap hits are rare exceptions, not a valid majority strategy |
+| `BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION` | 2 | Bootstrap truncation allowance |
 | `TRAINING_QUARANTINE_ENABLED` | true | Suspicious selected windows skip GRPO/publish but remain archived/credited |
 | `WINDOW_TIMEOUT_SECONDS` | 7200 | Safety-net auto-seal if fewer than B submissions arrive in 2 h |
 | `EMA_ALPHA` | ≈0.0274 | Weight-update smoothing (`2/(72+1)` — ~25-window half-life) |

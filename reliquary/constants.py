@@ -86,11 +86,11 @@ UPLOAD_BUFFER = NETWORK_UPLOAD_LATENCY
 # Network-wide protocol cap on completion length.
 MAX_NEW_TOKENS_PROTOCOL_CAP = 8192
 
-# Cap/non-EOS truncation budget per submission. Sized to the model's natural
-# cap-hit rate (~40% per rollout on Qwen3-4B-Instruct), not to the cap-path
-# exploit pattern — that's caught by all-8 / sigma fingerprinting elsewhere.
-MAX_TRUNCATED_PER_SUBMISSION = 5
-BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION = 5
+# Cap/non-EOS truncation budget per submission. Cap hits are allowed only as
+# rare exceptions: a group dominated by non-EOS truncations is a sampling/config
+# artifact, not clean GRPO data, and it is expensive for the validator to verify.
+MAX_TRUNCATED_PER_SUBMISSION = 1
+BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION = 2
 
 # Training quarantine policy. Quarantine is intentionally conservative: it
 # skips train_step for windows whose selected batch has high-confidence poison

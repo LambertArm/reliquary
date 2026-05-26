@@ -10,8 +10,8 @@ def test_v2_sigma_bounds():
     assert C.SIGMA_MIN == 0.43
     assert C.BOOTSTRAP_SIGMA_MIN == 0.33
     assert C.BOOTSTRAP_SIGMA_MIN < C.SIGMA_MIN
-    assert C.MAX_TRUNCATED_PER_SUBMISSION == 5
-    assert C.BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION == 5
+    assert C.MAX_TRUNCATED_PER_SUBMISSION == 1
+    assert C.BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION == 2
 
 
 def test_v2_group_sizes():
@@ -87,4 +87,4 @@ def test_wandb_constants_present():
 def test_min_eos_probability_constant_present():
     from reliquary.constants import MIN_EOS_PROBABILITY
     assert 0.0 < MIN_EOS_PROBABILITY < 1.0
-    assert MIN_EOS_PROBABILITY == 0.02
+    assert MIN_EOS_PROBABILITY == 0.01

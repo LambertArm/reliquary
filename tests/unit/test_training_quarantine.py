@@ -72,6 +72,26 @@ def test_dominant_reward_vector_quarantines_training():
     assert "reward_vector_dominance" in decision.reasons
 
 
+def test_hotkey_dominance_alone_is_observability_not_quarantine():
+    batch = [
+        _group("solo", "11110000"),
+        _group("solo", "11001100"),
+        _group("solo", "10101010"),
+        _group("solo", "01010101"),
+        _group("solo", "00111100"),
+        _group("solo", "00001111"),
+        _group("solo", "10011001"),
+        _group("other", "01100110"),
+    ]
+
+    decision = assess_training_batch(batch, reject_counts={})
+
+    assert decision.quarantined is False
+    assert "hotkey_batch_dominance" not in decision.reasons
+    assert decision.metrics["max_hotkey_groups"] == 7
+    assert decision.metrics["max_hotkey_share"] == 7 / 8
+
+
 def test_high_risk_reject_spike_quarantines_training():
     batch = [_group(f"hk{i}", "11110000") for i in range(8)]
 

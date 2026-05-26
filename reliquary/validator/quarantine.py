@@ -88,8 +88,11 @@ def assess_training_batch(
     hotkey_counts = Counter(str(getattr(group, "hotkey", "")) for group in batch)
     max_hotkey_groups = max(hotkey_counts.values(), default=0)
     max_hotkey_share = max_hotkey_groups / n_groups
-    if max_hotkey_share >= TRAINING_QUARANTINE_MAX_HOTKEY_SHARE:
-        reasons.append("hotkey_batch_dominance")
+    # Hotkey dominance by itself is not a poison signature: if only one honest
+    # miner is producing valid frontier work, training should still progress.
+    # Keep the metric for operators/EMA policy, but quarantine on actual data
+    # shape signals below (reward-vector dominance, cap/extreme length, reject
+    # spikes) rather than identity concentration alone.
 
     reward_vectors = [_binary_reward_vector(group) for group in batch]
     vector_counts = Counter(reward_vectors)

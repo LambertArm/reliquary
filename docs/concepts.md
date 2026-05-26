@@ -84,10 +84,12 @@ The cooldown map is rebuilt from recent R2 archives using `COOLDOWN_REBUILD_LOOK
 Training quarantine is a model-health gate, not an emission slash. When a
 selected batch has high-confidence poison signatures, the validator archives
 the window and credits emissions, but skips GRPO and checkpoint publishing.
-Current signals include hotkey dominance, repeated reward-vector dominance,
-cap-length or extreme-length completions, and high-risk reject spikes such as
+Current signals include repeated reward-vector dominance, cap-length or
+extreme-length completions, and high-risk reject spikes such as
 `reward_distribution`, `bad_termination`, `tokens_mismatch`, or
-`distribution_suspicious`.
+`distribution_suspicious`. Hotkey concentration is archived as a metric, but
+does not quarantine by itself: a single honest miner may be the only one
+printing useful work in a sparse window.
 
 The archive carries:
 
