@@ -958,10 +958,16 @@ def _grail_with_logits(seq_len: int, eos_id: int = 99):
     the EOS-present and EOS-missing termination paths.
     """
     def _fn(commit, model, randomness):
+        prompt_length = int(
+            (commit.get("rollout") or {}).get("prompt_length", 0)
+        )
+        challenge_idxs = list(range(prompt_length, prompt_length + CHALLENGE_K))
         return ProofResult(
             all_passed=True, passed=1, checked=1, sketch_diff_max=0,
             has_sparse_outputs=True,
             p_stop=0.99,
+            challenge_lp_indices=challenge_idxs,
+            challenge_lp_values=[0.0] * CHALLENGE_K,
         )
     return _fn
 
@@ -1720,3 +1726,54 @@ def test_accept_boxed_answer_high_prob():
 
     resp = b.accept_submission(req)
     assert resp.reason != RejectReason.BOXED_ANSWER_TAMPERED
+
+
+def test_cap_truncated_rollout_still_runs_behavioural_checks():
+    """Regression: cap-truncated rollouts are budget-tolerated for termination
+    but MUST still pass logprob/distribution/boxed integrity checks.
+
+    Without this, a miner force-caps a rollout to bypass behavioural checks
+    and tampers the \\boxed{...} content; the truncated-budget path used to
+    ``continue`` past every per-rollout check.
+    """
+    from reliquary.constants import MAX_NEW_TOKENS_PROTOCOL_CAP
+
+    prompt = [10, 11, 12, 13]
+    answer = "the final answer is \\boxed{42}"
+    # Body filled with non-EOS, non-`{` token + appended boxed answer.
+    # Total completion = MAX_NEW_TOKENS_PROTOCOL_CAP, last token != EOS →
+    # cap-truncated path.
+    body = [5] * (MAX_NEW_TOKENS_PROTOCOL_CAP - len(answer))
+    answer_tokens = [ord(c) for c in answer]
+    completion = body + answer_tokens
+    tokens = prompt + completion
+
+    probs = [0.99] * len(completion)
+    # Tamper: drop chosen prob at the digit inside \boxed{}
+    probs[len(body) + answer.index("{") + 1] = 0.02
+
+    class _LongCtxModel:
+        class config:
+            vocab_size = 1000
+            max_position_embeddings = MAX_NEW_TOKENS_PROTOCOL_CAP + 100
+
+    b = _make_batcher(
+        model=_LongCtxModel(),
+        tokenizer=_CharTokenizerWithEos(),
+        verify_commitment_proofs_fn=_grail_with_chosen_probs(
+            len(tokens), probs, prompt_length=len(prompt),
+        ),
+    )
+    req = _request()
+    commit = _make_commit(
+        tokens=tokens,
+        prompt_length=len(prompt),
+        success=True,
+        total_reward=1.0,
+    )
+    req.rollouts[0].commit = commit
+    req.rollouts[0].tokens = commit["tokens"]
+
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.BOXED_ANSWER_TAMPERED

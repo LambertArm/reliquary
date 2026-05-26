@@ -677,7 +677,12 @@ class GrpoWindowBatcher:
                             "termination",
                             sketch_diff_max=sketch_diff_max,
                         )
-                    continue
+                    # Only the EOS signal is missing on a cap-truncated rollout;
+                    # the per-token integrity checks (logprob, distribution,
+                    # boxed-answer) still apply to its body. Do NOT skip them
+                    # — a miner who force-caps to bypass behavioural checks
+                    # otherwise gets up to max_truncated_per_submission rollouts
+                    # of free tampering inside the same submission.
 
             if not proof.has_sparse_outputs:
                 continue
