@@ -164,8 +164,8 @@ These are the live thresholds the trainer applies on every submission. The same 
 | `B_BATCH` | 8 | Number of valid distinct-prompt submissions that seal a window |
 | `M_ROLLOUTS` | 8 | Required rollout count per submission |
 | `T_PROTO` | 0.9 | Protocol-fixed sampling temperature (validator's recompute uses this) |
-| `SIGMA_MIN` (steady) | 0.43 | Zone filter: groups below this are rejected `OUT_OF_ZONE` |
-| `BOOTSTRAP_SIGMA_MIN` | 0.33 | Relaxed zone filter during first `BOOTSTRAP_WINDOWS = 100` windows |
+| `SIGMA_MIN` (steady) | 0.33 | Zone filter: groups below this are rejected `OUT_OF_ZONE` (binary equivalent: k ∈ [1, 7] for M=8) |
+| `BOOTSTRAP_SIGMA_MIN` | 0.33 | Bootstrap zone filter (currently same as steady) |
 | `BATCH_PROMPT_COOLDOWN_WINDOWS` | 1,000,000 | A winning prompt is effectively one-shot in the OpenMath phase |
 | `COOLDOWN_REBUILD_LOOKBACK` | 300 | R2 windows replayed at startup to rebuild cooldown without scanning the whole one-shot horizon |
 | `PROOF_SKETCH_TOLERANCE_BASE` | 5000 | GRAIL sketch tolerance — actual threshold = `5000 + 5 × √position` |
@@ -174,7 +174,6 @@ These are the live thresholds the trainer applies on every submission. The same 
 | `MIN_EOS_PROBABILITY` | 0.01 | Required EOS token probability for proper termination |
 | `MAX_TRUNCATED_PER_SUBMISSION` | 0 | Steady-state cap/non-EOS truncation allowance |
 | `BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION` | 1 | Bootstrap truncation allowance |
-| `BINARY_REWARD_MIN_CORRECT` / `MAX_CORRECT` | 3 / 5 | OpenMath steady-state binary reward groups outside k=3..5 reject `REWARD_DISTRIBUTION` |
 | `TRAINING_QUARANTINE_ENABLED` | true | Suspicious selected windows skip GRPO/publish but remain archived/credited |
 | `WINDOW_TIMEOUT_SECONDS` | 7200 | Safety-net auto-seal if fewer than B submissions arrive in 2 h |
 | `EMA_ALPHA` | ≈0.0274 | Weight-update smoothing (`2/(72+1)` — ~25-window half-life) |
@@ -197,7 +196,6 @@ return reason="submitted"            PROMPT_FULL? → reject
                                      PROMPT_MISMATCH / HASH_DUPLICATE? → reject
                                      validator verifies claimed rollout rewards
                                      REWARD_MISMATCH / OUT_OF_ZONE? → reject
-                                     REWARD_DISTRIBUTION? → reject
                                      BAD_SIGNATURE / WRONG_RANDOMNESS? → reject
                                      GRAIL_FAIL? → reject
                                      BAD_TERMINATION / LOGPROB_MISMATCH? → reject

@@ -49,7 +49,6 @@ from reliquary.validator.observability import (
 from reliquary.validator.rollout_patterns import detect_opposite_reward_clones
 from reliquary.validator.verifier import (
     evaluate_token_distribution,
-    binary_reward_mix_in_frontier,
     has_eos_padding,
     is_cap_truncation,
     is_in_zone,
@@ -586,8 +585,6 @@ class GrpoWindowBatcher:
         sigma = rewards_std(rewards)
         if not is_in_zone(sigma, bootstrap=self.bootstrap):
             return reject(RejectReason.OUT_OF_ZONE, "zone")
-        if not self.bootstrap and not binary_reward_mix_in_frontier(rewards):
-            return reject(RejectReason.REWARD_DISTRIBUTION, "reward_distribution")
         clone_metrics = detect_opposite_reward_clones(completion_texts, rewards)
         if clone_metrics.suspicious:
             logger.info(

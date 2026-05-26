@@ -183,24 +183,12 @@ DATASET_SPLIT = "train"
 
 # ────────────────  GRPO MARKET (v2)  ────────────────
 
-# Minimum reward-std for a group to pass the zone filter.
-# For binary Bernoulli rewards this is equivalent to the old
-# k ∈ [2, 6] gate (σ of Bernoulli(p=2/8) ≈ 0.433). For continuous
-# rewards it filters groups whose rollouts clustered too tight to
-# carry meaningful GRPO signal.
-SIGMA_MIN = 0.43
-BOOTSTRAP_SIGMA_MIN = 0.33    # matches old k ∈ [1, 7]
-
-# Binary-reward frontier band for OpenMathInstruct GRPO groups.
-#
-# SIGMA_MIN alone admits k=2 and k=6 for M=8 because both have
-# σ=sqrt((2/8)(6/8))≈0.433. In production this became a reward-oracle
-# selection target: miners can locally compute rewards, select mostly-correct
-# groups, and train the network on parser-shaped negatives while barely
-# clearing the sigma floor. Keep steady-state binary groups in the middle
-# frontier instead. Bootstrap remains governed by BOOTSTRAP_SIGMA_MIN only.
-BINARY_REWARD_MIN_CORRECT = 3
-BINARY_REWARD_MAX_CORRECT = 5
+# Minimum reward-std for a group to pass the zone filter. For binary
+# Bernoulli rewards this admits k ∈ [1, 7] for M=8 (σ at k=1/7 ≈ 0.3307).
+# For continuous rewards it filters groups whose rollouts clustered too
+# tight to carry meaningful GRPO signal.
+SIGMA_MIN = 0.33
+BOOTSTRAP_SIGMA_MIN = 0.33
 
 # Number of rollouts per submission (= size of each GRPO group).
 M_ROLLOUTS = 8

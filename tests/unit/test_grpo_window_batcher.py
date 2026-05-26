@@ -185,33 +185,6 @@ def test_reject_out_of_zone_all_pass():
     assert resp.reason == RejectReason.OUT_OF_ZONE
 
 
-def test_reject_binary_edge_high_correct_reward_distribution():
-    b = _make_batcher()
-    req = _request(rewards=[1.0] * 6 + [0.0] * 2)
-    resp = b.accept_submission(req)
-    assert resp.accepted is False
-    assert resp.reason == RejectReason.REWARD_DISTRIBUTION
-
-
-def test_reject_binary_edge_low_correct_reward_distribution():
-    b = _make_batcher()
-    req = _request(rewards=[1.0] * 2 + [0.0] * 6)
-    resp = b.accept_submission(req)
-    assert resp.accepted is False
-    assert resp.reason == RejectReason.REWARD_DISTRIBUTION
-
-
-def test_reward_distribution_rejects_before_grail_compute():
-    def fail_if_called(commit, model, randomness):  # pragma: no cover
-        raise AssertionError("GRAIL proof should not run for reward_distribution")
-
-    b = _make_batcher(verify_commitment_proofs_fn=fail_if_called)
-    req = _request(rewards=[1.0] * 6 + [0.0] * 2)
-    resp = b.accept_submission(req)
-    assert resp.accepted is False
-    assert resp.reason == RejectReason.REWARD_DISTRIBUTION
-
-
 def test_reject_manufactured_opposite_reward_clones_before_grail_compute():
     def fail_if_called(commit, model, randomness):  # pragma: no cover
         raise AssertionError("GRAIL proof should not run for clone-pattern rejects")
@@ -272,18 +245,10 @@ def test_allow_less_than_three_opposite_reward_clone_pairs():
     assert resp.reason == RejectReason.ACCEPTED
 
 
-@pytest.mark.parametrize("k", [3, 4, 5])
-def test_accept_binary_middle_frontier_reward_distribution(k):
+@pytest.mark.parametrize("k", [1, 2, 3, 4, 5, 6, 7])
+def test_accept_all_sigma_zone_binary_configs(k):
     b = _make_batcher()
     req = _request(rewards=[1.0] * k + [0.0] * (M_ROLLOUTS - k))
-    resp = b.accept_submission(req)
-    assert resp.accepted is True
-    assert resp.reason == RejectReason.ACCEPTED
-
-
-def test_bootstrap_keeps_legacy_binary_edge_band():
-    b = _make_batcher(bootstrap=True)
-    req = _request(rewards=[1.0] * 6 + [0.0] * 2)
     resp = b.accept_submission(req)
     assert resp.accepted is True
     assert resp.reason == RejectReason.ACCEPTED

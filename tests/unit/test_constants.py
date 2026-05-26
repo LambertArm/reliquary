@@ -7,11 +7,9 @@ from reliquary import constants as C
 
 
 def test_v2_sigma_bounds():
-    assert C.SIGMA_MIN == 0.43
+    assert C.SIGMA_MIN == 0.33
     assert C.BOOTSTRAP_SIGMA_MIN == 0.33
-    assert C.BOOTSTRAP_SIGMA_MIN < C.SIGMA_MIN
-    assert C.BINARY_REWARD_MIN_CORRECT == 3
-    assert C.BINARY_REWARD_MAX_CORRECT == 5
+    assert C.BOOTSTRAP_SIGMA_MIN <= C.SIGMA_MIN
     assert C.MAX_TRUNCATED_PER_SUBMISSION == 0
     assert C.BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION == 1
 
@@ -76,9 +74,8 @@ def test_startup_rebuild_horizon_env_overrides():
         importlib.reload(C)
 
 
-def test_v2_bootstrap_sigma_lower_than_steady():
-    # Bootstrap accepts groups with lower σ (σ ≥ 0.33) vs steady (σ ≥ 0.43)
-    assert C.BOOTSTRAP_SIGMA_MIN < C.SIGMA_MIN
+def test_v2_bootstrap_sigma_not_stricter_than_steady():
+    assert C.BOOTSTRAP_SIGMA_MIN <= C.SIGMA_MIN
 
 
 def test_wandb_constants_present():
