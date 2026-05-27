@@ -82,6 +82,7 @@ async def test_archive_includes_prompt_and_rollout_content():
     batcher.window_start = 42
     batcher.randomness = "0xdeadbeef"
     batcher.window_opened_at = 100.0
+    batcher.rewarded_but_not_selected_by_hotkey = {"hk_runner": 1}
     from reliquary.validator.batcher import RejectedSubmission
     batcher.reject_counts = {"out_of_zone": 3, "logprob_mismatch": 1}
     batcher.rejected_submissions = [
@@ -103,7 +104,17 @@ async def test_archive_includes_prompt_and_rollout_content():
 
     runner = _valid_submission(prompt_idx=99, k=4, hotkey="hk_runner")
     runner.arrived_at = 110.0
+    runner.rollout_hashes = [bytes([i]) * 32 for i in range(8)]
     batcher.valid_submissions.return_value = list(batch) + [runner]
+    batcher.selection_metadata_by_id = {
+        id(batch[0]): {"selected_for_batch": True, "rewarded": True},
+        id(batch[1]): {"selected_for_batch": True, "rewarded": True},
+        id(runner): {
+            "selected_for_batch": False,
+            "rewarded": True,
+            "selection_reason": "same_trigger_round_lost_canonical_ordering",
+        },
+    }
 
     captured = {}
 
@@ -168,6 +179,8 @@ async def test_archive_includes_prompt_and_rollout_content():
     assert ru["prompt_idx"] == 99
     assert ru["response_time"] == pytest.approx(10.0)
     assert "rollouts" not in ru and "prompt" not in ru  # metadata only
+    assert ru["rollout_hashes"] == [h.hex() for h in runner.rollout_hashes]
+    assert archive["rewarded_but_not_selected_by_hotkey"] == {"hk_runner": 1}
 
     # reject_summary persisted from batcher.
     assert archive["reject_summary"] == {"out_of_zone": 3, "logprob_mismatch": 1}

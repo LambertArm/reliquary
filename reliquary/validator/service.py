@@ -814,7 +814,8 @@ class ValidationService:
             key = (s.hotkey, s.prompt_idx)
             if key in batched_keys:
                 continue
-            runners_up.append({
+            obs = _submission_obs_payload(s)
+            runner_entry = {
                 "hotkey": s.hotkey,
                 "prompt_idx": s.prompt_idx,
                 "sigma": s.sigma,
@@ -823,8 +824,13 @@ class ValidationService:
                 "sketch_diff_max": s.sketch_diff_max,
                 "lp_dev_max": s.lp_dev_max,
                 "dist_q10_min": s.dist_q10_min,
-                **_submission_obs_payload(s),
-            })
+                **obs,
+            }
+            if obs.get("rewarded") and s.rollout_hashes:
+                runner_entry["rollout_hashes"] = [
+                    h.hex() for h in s.rollout_hashes
+                ]
+            runners_up.append(runner_entry)
 
         rejected_entries = [
             {
@@ -857,6 +863,9 @@ class ValidationService:
             # All miners whose prompt landed in the winning set appear here,
             # even if their specific submission wasn't picked for training.
             "rewards_by_hotkey": dict(getattr(batcher, "rewards_by_hotkey", {})),
+            "rewarded_but_not_selected_by_hotkey": dict(
+                getattr(batcher, "rewarded_but_not_selected_by_hotkey", {})
+            ),
             "late_drops": {
                 hk: dict(counts) for hk, counts in self._late_drops.items()
             },

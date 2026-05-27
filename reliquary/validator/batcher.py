@@ -253,6 +253,9 @@ class GrpoWindowBatcher:
         # all GRAIL-validated submissions whose prompt landed in the
         # winning set, not just the one picked for the training step.
         self.rewards_by_hotkey: dict[str, float] = {}
+        # Post-seal health metric: accepted submissions that earned emission
+        # via boundary sharing but did not enter the training batch.
+        self.rewarded_but_not_selected_by_hotkey: dict[str, int] = {}
         # Accumulated reject reasons this window (RejectReason.value → count).
         # Persisted in the R2 archive so miners can see which filter is
         # rejecting the most submissions in any given round.
@@ -983,13 +986,26 @@ class GrpoWindowBatcher:
                 current_window=self.window_start,
                 pool=pool,
             )
-            winning_prompts = {sub.prompt_idx for sub in batch}
-            for p in winning_prompts:
+            rewarded_submissions: list[ValidSubmission] = []
+            rewarded_but_not_selected: dict[str, int] = {}
+            for sub in self._valid:
+                meta = self.selection_metadata_by_id.get(id(sub), {})
+                if not meta.get("rewarded", False):
+                    continue
+                rewarded_submissions.append(sub)
+                if not meta.get("selected_for_batch", False):
+                    rewarded_but_not_selected[sub.hotkey] = (
+                        rewarded_but_not_selected.get(sub.hotkey, 0) + 1
+                    )
+            self.rewarded_but_not_selected_by_hotkey = rewarded_but_not_selected
+
+            rewarded_prompts = {sub.prompt_idx for sub in rewarded_submissions}
+            for p in rewarded_prompts:
                 self._cooldown.record_batched(p, self.window_start)
-                if self._hash_set is not None:
-                    for sub in self._submissions_per_prompt.get(p, []):
-                        for h in sub.rollout_hashes:
-                            self._hash_set.add(h, self.window_start)
+            if self._hash_set is not None:
+                for sub in rewarded_submissions:
+                    for h in sub.rollout_hashes:
+                        self._hash_set.add(h, self.window_start)
             if self._hash_set is not None:
                 self._hash_set.prune(self.window_start)
             return batch, rewards

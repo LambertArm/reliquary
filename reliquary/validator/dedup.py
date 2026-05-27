@@ -77,10 +77,12 @@ class RolloutHashSet:
         """Replace state from a list of archived window payloads.
 
         Each archive must carry ``window_start`` (int) and ``batch`` (list
-        of submissions). Each submission must carry ``rollouts`` (list of
-        dicts). Each rollout either has an explicit ``hash`` (hex string)
-        — used directly — or only ``tokens`` (list[int]), in which case
-        the hash is recomputed via :func:`compute_rollout_hash`.
+        of selected submissions). Batch submissions carry ``rollouts``. Each
+        rollout either has an explicit ``hash`` (hex string) — used directly
+        — or only ``tokens`` (list[int]), in which case the hash is recomputed
+        via :func:`compute_rollout_hash`. Newer archives may also include
+        rewarded ``runners_up`` entries with ``rollout_hashes``; those are
+        indexed too because rewarded runner content was paid by the window.
 
         Archives whose ``window_start`` is older than the retention horizon
         relative to ``current_window`` are skipped — same semantics as
@@ -100,3 +102,8 @@ class RolloutHashSet:
                     else:
                         h = compute_rollout_hash(rollout["tokens"])
                     self.add(h, w)
+            for sub in archive.get("runners_up", []):
+                if not sub.get("rewarded", False):
+                    continue
+                for h_hex in sub.get("rollout_hashes", []):
+                    self.add(bytes.fromhex(h_hex), w)
