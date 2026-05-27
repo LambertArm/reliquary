@@ -157,6 +157,32 @@ def test_rebuild_from_history_recomputes_when_hash_missing():
     assert compute_rollout_hash([7, 8, 9]) in s
 
 
+def test_rebuild_from_history_indexes_rewarded_runner_hashes():
+    """Rewarded runners carry hashes without full rollout text/tokens."""
+    from reliquary.validator.dedup import RolloutHashSet, compute_rollout_hash
+
+    s = RolloutHashSet(retention_windows=50)
+    h_rewarded = compute_rollout_hash([1, 1, 1]).hex()
+    h_unrewarded = compute_rollout_hash([2, 2, 2]).hex()
+    archives = [
+        {
+            "window_start": 100,
+            "batch": [],
+            "runners_up": [
+                {"prompt_idx": 7, "rewarded": True, "rollout_hashes": [h_rewarded]},
+                {
+                    "prompt_idx": 8,
+                    "rewarded": False,
+                    "rollout_hashes": [h_unrewarded],
+                },
+            ],
+        }
+    ]
+    s.rebuild_from_history(archives, current_window=110)
+    assert bytes.fromhex(h_rewarded) in s
+    assert bytes.fromhex(h_unrewarded) not in s
+
+
 def test_rebuild_from_history_skips_expired_windows():
     from reliquary.validator.dedup import RolloutHashSet, compute_rollout_hash
     s = RolloutHashSet(retention_windows=50)

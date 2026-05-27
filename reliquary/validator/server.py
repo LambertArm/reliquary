@@ -22,7 +22,7 @@ import time
 from typing import Any, Callable
 
 from fastapi import FastAPI, HTTPException, Request, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import uvicorn
 
 from reliquary.constants import (
@@ -78,6 +78,9 @@ class _Health(BaseModel):
     checkpoint_repo_id: str | None = None
     checkpoint_revision: str | None = None
     recent_reject_counts_by_reason: dict[str, int]
+    rewarded_but_not_selected_by_hotkey: dict[str, int] = Field(
+        default_factory=dict
+    )
 
 
 class ValidatorServer:
@@ -252,6 +255,10 @@ class ValidatorServer:
             checkpoint_repo_id=cp.repo_id if cp else None,
             checkpoint_revision=cp.revision if cp else None,
             recent_reject_counts_by_reason=reject_counts,
+            rewarded_but_not_selected_by_hotkey=(
+                dict(getattr(batcher, "rewarded_but_not_selected_by_hotkey", {}))
+                if batcher else {}
+            ),
         )
 
     @staticmethod

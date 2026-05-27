@@ -1,6 +1,6 @@
-"""CooldownMap: tracks last batch-membership window per prompt_idx.
+"""CooldownMap: tracks last rewarded-use window per prompt_idx.
 
-A prompt that just entered a training batch is ineligible for the batch
+A prompt that just earned emission is ineligible for the batch
 for ``cooldown_windows`` following windows. This forces the curriculum
 to rotate so the policy has time to shift between reuses of the same
 prompt.
@@ -10,7 +10,7 @@ from __future__ import annotations
 
 
 class CooldownMap:
-    """Per-prompt "last batched at window N" store + eligibility predicate.
+    """Per-prompt "last rewarded at window N" store + eligibility predicate.
 
     The cooldown window is a half-open interval:
         ``[last_batched, last_batched + cooldown_windows)`` → ineligible.
@@ -25,7 +25,7 @@ class CooldownMap:
         self._last_batched: dict[int, int] = {}
 
     def record_batched(self, prompt_idx: int, window: int) -> None:
-        """Mark *prompt_idx* as having entered the batch at *window*."""
+        """Mark *prompt_idx* as rewarded/used at *window*."""
         if prompt_idx < 0:
             raise ValueError("prompt_idx must be non-negative")
         if window < 0:
@@ -33,7 +33,7 @@ class CooldownMap:
         self._last_batched[prompt_idx] = window
 
     def is_in_cooldown(self, prompt_idx: int, current_window: int) -> bool:
-        """True iff *prompt_idx* was batched within the cooldown horizon."""
+        """True iff *prompt_idx* was rewarded within the cooldown horizon."""
         if self._cooldown_windows == 0:
             return False
         last = self._last_batched.get(prompt_idx)
@@ -99,11 +99,12 @@ class CooldownMap:
         archived_windows: list[dict],
         current_window: int,
     ) -> None:
-        """Rebuild state from the last N archived windows' batch records.
+        """Rebuild state from the last N archived windows' rewarded prompts.
 
         *archived_windows* is a list of dicts, each with ``window_start``
-        (int) and ``batch`` (list of {prompt_idx: int, ...}). Typically
-        fetched from the R2 dataset archive at validator startup.
+        (int), ``batch`` (selected training prompts), and optionally
+        ``runners_up`` entries carrying ``rewarded=True``. Typically fetched
+        from the R2 dataset archive at validator startup.
 
         Only windows within ``cooldown_windows`` of *current_window* matter —
         older entries have already expired and are skipped.
@@ -114,7 +115,12 @@ class CooldownMap:
             w = int(record["window_start"])
             if w <= horizon:
                 continue
-            for entry in record.get("batch", []):
+            rewarded_entries = list(record.get("batch", []))
+            rewarded_entries.extend(
+                entry for entry in record.get("runners_up", [])
+                if entry.get("rewarded", False)
+            )
+            for entry in rewarded_entries:
                 idx = int(entry["prompt_idx"])
                 # Keep the most recent window for each prompt.
                 if self._last_batched.get(idx, -1) < w:

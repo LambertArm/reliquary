@@ -104,6 +104,25 @@ def _request(
     )
 
 
+def _request_with_prompt_unique_tokens(
+    prompt_idx=42, window_start=500, rewards=None, hotkey="hk",
+) -> BatchSubmissionRequest:
+    req = _request(
+        prompt_idx=prompt_idx,
+        window_start=window_start,
+        rewards=rewards,
+        hotkey=hotkey,
+    )
+    for rollout_idx, rollout in enumerate(req.rollouts):
+        tokens = [
+            prompt_idx * 100 + rollout_idx * 10 + t
+            for t in range(CHALLENGE_K + 4)
+        ]
+        rollout.tokens = tokens
+        rollout.commit["tokens"] = tokens
+    return req
+
+
 def _make_batcher(**overrides) -> GrpoWindowBatcher:
     class _DefaultFakeTokenizer:
         eos_token_id = 99
@@ -1494,6 +1513,54 @@ def test_seal_extension_boundary_fair_split_fires_end_to_end():
         assert abs(rewards[f"hk_extra{j}"] - expected_per_miner) < 1e-9
     # Conservation:
     assert abs(sum(rewards.values()) - 1.0) < 1e-9
+
+
+def test_seal_batch_cooldowns_every_rewarded_boundary_prompt():
+    """Boundary runners earn emission, so their prompts must enter cooldown."""
+    b = _make_batcher()
+    for i in range(B_BATCH + 4):
+        req = _request(prompt_idx=i, hotkey=f"hk{i}")
+        req.drand_round = 100
+        assert b.accept_submission(req).accepted is True
+
+    b._seal_flag.set()
+    batch, rewards = b.seal_batch()
+
+    selected_prompts = {s.prompt_idx for s in batch}
+    runner_prompts = set(range(B_BATCH + 4)) - selected_prompts
+    assert len(batch) == B_BATCH
+    assert set(rewards) == {f"hk{i}" for i in range(B_BATCH + 4)}
+    assert runner_prompts
+    for prompt_idx in range(B_BATCH + 4):
+        assert b._cooldown.is_in_cooldown(prompt_idx, b.window_start + 1)
+    assert b.rewarded_but_not_selected_by_hotkey == {
+        f"hk{prompt_idx}": 1 for prompt_idx in runner_prompts
+    }
+
+
+def test_seal_batch_hash_dedup_records_rewarded_boundary_runners():
+    """Rollout hashes for paid runners must be blocked in later windows."""
+    from reliquary.validator.dedup import RolloutHashSet
+
+    hs = RolloutHashSet(retention_windows=50)
+    b = _make_batcher(hash_set=hs)
+    for i in range(B_BATCH + 4):
+        req = _request_with_prompt_unique_tokens(prompt_idx=i, hotkey=f"hk{i}")
+        req.drand_round = 100
+        assert b.accept_submission(req).accepted is True
+
+    b._seal_flag.set()
+    batch, _ = b.seal_batch()
+
+    selected_prompts = {s.prompt_idx for s in batch}
+    runner_submissions = [
+        s for s in b.valid_submissions() if s.prompt_idx not in selected_prompts
+    ]
+    assert runner_submissions
+    for sub in runner_submissions:
+        assert len(sub.rollout_hashes) == M_ROLLOUTS
+        for h in sub.rollout_hashes:
+            assert h in hs
 
 
 def test_seal_extension_disabled_when_no_chain_info():

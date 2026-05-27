@@ -119,6 +119,25 @@ def test_rebuild_from_history_takes_most_recent():
     assert m.is_in_cooldown(99, 154) is True
 
 
+def test_rebuild_from_history_includes_rewarded_runners_up():
+    """Paid boundary runners are cooldowned after restart too."""
+    archived = [
+        {
+            "window_start": 100,
+            "batch": [{"prompt_idx": 42}],
+            "runners_up": [
+                {"prompt_idx": 7, "rewarded": True},
+                {"prompt_idx": 99, "rewarded": False},
+            ],
+        },
+    ]
+    m = CooldownMap(cooldown_windows=50)
+    m.rebuild_from_history(archived, current_window=120)
+    assert m.is_in_cooldown(42, 120) is True
+    assert m.is_in_cooldown(7, 120) is True
+    assert m.is_in_cooldown(99, 120) is False
+
+
 def test_rebuild_ignores_windows_older_than_cooldown():
     """Windows older than cooldown horizon are pointless to load."""
     archived = [
