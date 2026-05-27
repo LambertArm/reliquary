@@ -46,7 +46,7 @@ from reliquary.validator.observability import (
     classify_drand_round,
     log_submission_stage,
 )
-from reliquary.validator.boxed_integrity import is_reward_manipulated
+from reliquary.validator.boxed_integrity import has_malformed_final_answer
 from reliquary.validator.rollout_patterns import detect_opposite_reward_clones
 from reliquary.validator.verifier import (
     evaluate_boxed_answer_probability,
@@ -600,20 +600,21 @@ class GrpoWindowBatcher:
             )
             return reject(RejectReason.DISTRIBUTION_SUSPICIOUS, "distribution")
 
-        # Reward-manipulation: a reward=0 rollout that boxed the ground truth
-        # earlier or has a malformed final box over an earlier valid one flipped
-        # correct->wrong to manufacture k=4 / sigma=0.5. Reject before GRAIL work.
-        gt_for_box = problem.get("ground_truth", "")
+        # A reward=0 rollout whose final \boxed{} is malformed (empty,
+        # special-token, or unclosed/cap-truncated) produced no parseable answer
+        # — a fake negative used to manufacture k=4 / sigma=0.5 and pass the zone
+        # filter. Aligned with the env (which scores the last box); a well-formed
+        # wrong answer is a legitimate negative and is not flagged. Before GRAIL.
         for _ri, _text in enumerate(completion_texts):
-            _flipped, _flip_reason = is_reward_manipulated(
-                rewards[_ri], _text, gt_for_box
-            )
-            if _flipped:
+            _bad, _bad_reason = has_malformed_final_answer(rewards[_ri], _text)
+            if _bad:
                 logger.info(
-                    "reject reason=reward_manipulation hotkey=%s rollout=%d cond=%s",
-                    request.miner_hotkey, _ri, _flip_reason,
+                    "reject reason=malformed_final_answer hotkey=%s rollout=%d cond=%s",
+                    request.miner_hotkey, _ri, _bad_reason,
                 )
-                return reject(RejectReason.REWARD_MANIPULATION, "reward_manipulation")
+                return reject(
+                    RejectReason.MALFORMED_FINAL_ANSWER, "malformed_final_answer"
+                )
 
         # Per-submission worst-case filter telemetry (across all rollouts).
         sketch_diff_max = 0

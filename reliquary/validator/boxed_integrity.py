@@ -1,17 +1,22 @@
-r"""Detect correct->wrong boxed-answer flips used to manufacture reward vectors.
+r"""Structural validity of a rollout's final boxed answer.
 
-The OMI reward scores the LAST ``\boxed{...}``. A miner can flip a correct
-rollout to reward 0 by corrupting the final box (appending an empty/special-token
-or unclosed box, or boxing the ground truth earlier then overriding it). This
-lets a group land on exactly k=4 / sigma=0.5 to pass the zone filter while
-keeping emission. Pure, side-effect-free; called by the batcher before GRAIL.
+The OMI reward scores the LAST ``\boxed{...}`` in the completion. A reward=0
+rollout whose final box is malformed (empty, special-token, or unclosed) did not
+produce a parseable answer — it is a "fake negative" used to manufacture a group
+reward vector (k=4 / sigma=0.5) that passes the zone filter. Examples: appending
+``\boxed{<|im_end|>`` after a correct ``\boxed{121}``, an empty ``\boxed{}``, or
+spamming boxes to the token cap so the final one is cut off.
+
+This check is purely structural and aligned with what the env scores (the last
+box): it does NOT compare to the ground truth and does NOT judge intent. A
+well-formed final box that is simply wrong is a legitimate negative and is not
+flagged here (forced wrong answers are covered by the boxed-answer probability
+check). Pure, side-effect-free; called by the batcher before GRAIL.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Optional
-
-from reliquary.environment.openmathinstruct import _normalize_answer
 
 # Stop/special tokens that must never appear inside a final answer box.
 SPECIAL_TOKENS = ("<|im_end|>", "<|endoftext|>", "<|im_start|>")
@@ -63,27 +68,20 @@ def extract_boxed_spans(text: str) -> list[BoxedSpan]:
     return spans
 
 
-def is_reward_manipulated(
-    reward: float, text: str, ground_truth: str
+def has_malformed_final_answer(
+    reward: float, text: str
 ) -> tuple[bool, Optional[str]]:
-    """True when a reward=0 rollout shows a correct->wrong boxed flip.
+    r"""True when a reward=0 rollout's final ``\boxed{}`` is malformed.
 
-    Only evaluated for reward < 0.5. Conditions:
-      (a) "boxed_gt_earlier": a well-formed span normalizes to the ground truth.
-      (b) "malformed_final": the last span is malformed while an earlier
-          well-formed span exists.
+    Aligned with the env (which scores the last box). Only evaluated for
+    reward < 0.5. Returns ``(False, None)`` when there is no box at all (a clean
+    give-up) or when the last box is well-formed (a legitimate wrong answer).
     """
     if reward is not None and reward >= 0.5:
-        return False, None
-    gt = _normalize_answer(ground_truth)
-    if gt == "":
         return False, None
     spans = extract_boxed_spans(text)
     if not spans:
         return False, None
-    well_formed = [s for s in spans if s.well_formed]
-    if any(_normalize_answer(s.content) == gt for s in well_formed):
-        return True, "boxed_gt_earlier"
-    if not spans[-1].well_formed and well_formed:
-        return True, "malformed_final"
+    if not spans[-1].well_formed:
+        return True, "malformed_final_boxed"
     return False, None
