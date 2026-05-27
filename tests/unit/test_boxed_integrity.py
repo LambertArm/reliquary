@@ -11,6 +11,14 @@ def test_extract_wellformed_and_malformed():
     assert spans[1].well_formed is False  # unclosed
 
 
+def test_extract_supports_fbox_like_reward_parser():
+    spans = extract_boxed_spans(r"first \boxed{1} later \fbox{2}")
+    assert len(spans) == 2
+    assert spans[0].marker == r"\boxed{"
+    assert spans[1].marker == r"\fbox{"
+    assert spans[1].content == "2" and spans[1].well_formed is True
+
+
 def test_extract_special_token_box_is_malformed():
     spans = extract_boxed_spans(r"\boxed{<|im_end|>}")
     assert spans[0].well_formed is False
@@ -47,8 +55,19 @@ def test_wellformed_final_after_earlier_box_not_flagged():
     assert flagged is False
 
 
+def test_wellformed_final_fbox_after_earlier_box_not_flagged():
+    flagged, _ = has_malformed_final_answer(0.0, r"\boxed{a} ... actually \fbox{9}")
+    assert flagged is False
+
+
 def test_dangling_special_token_final_box_flagged():
     text = r"answer is \boxed{9} then $$\boxed{<|im_end|>"
+    flagged, reason = has_malformed_final_answer(0.0, text)
+    assert flagged is True and reason == "malformed_final_boxed"
+
+
+def test_dangling_final_fbox_flagged():
+    text = r"answer is \boxed{9} then $$\fbox{<|im_end|>"
     flagged, reason = has_malformed_final_answer(0.0, text)
     assert flagged is True and reason == "malformed_final_boxed"
 
@@ -64,13 +83,12 @@ def test_unclosed_final_box_flagged():
     assert flagged is True and reason == "malformed_final_boxed"
 
 
-def test_cap_truncated_malformed_final_is_deferred():
-    # Near the token cap -> budget exhaustion, governed by the termination
-    # guard, not flagged here.
-    flagged, _ = has_malformed_final_answer(
+def test_cap_truncated_malformed_final_is_still_flagged():
+    # Cap-hit malformed final answers are not valid negatives for GRPO.
+    flagged, reason = has_malformed_final_answer(
         0.0, r"\boxed{8}\boxed{", completion_length=8100, cap=8192
     )
-    assert flagged is False
+    assert flagged is True and reason == "malformed_final_boxed"
 
 
 def test_non_cap_malformed_final_is_flagged():

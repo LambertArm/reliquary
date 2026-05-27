@@ -591,22 +591,12 @@ class GrpoWindowBatcher:
         sigma = rewards_std(rewards)
         if not is_in_zone(sigma, bootstrap=self.bootstrap):
             return reject(RejectReason.OUT_OF_ZONE, "zone")
-        clone_metrics = detect_opposite_reward_clones(completion_texts, rewards)
-        if clone_metrics.suspicious:
-            logger.info(
-                "reject reason=distribution_suspicious hotkey=%s "
-                "manufactured_opposite_reward_clones=%s",
-                request.miner_hotkey,
-                clone_metrics.to_log_dict(),
-            )
-            return reject(RejectReason.DISTRIBUTION_SUSPICIOUS, "distribution")
 
         # A reward=0 rollout whose final \boxed{} is malformed (empty,
         # special-token, or unclosed) produced no parseable answer — a fake
         # negative used to manufacture k=4 / sigma=0.5 and pass the zone filter.
         # Aligned with the env (which scores the last box); a well-formed wrong
-        # answer is a legitimate negative and is not flagged. Cap-truncated
-        # rollouts are deferred to the termination guard below. Before GRAIL.
+        # answer is a legitimate negative and is not flagged. Before GRAIL.
         for _ri, _text in enumerate(completion_texts):
             _rmeta = request.rollouts[_ri].commit.get("rollout", {}) or {}
             _clen = int(_rmeta.get("completion_length", 0))
@@ -622,6 +612,16 @@ class GrpoWindowBatcher:
                 return reject(
                     RejectReason.MALFORMED_FINAL_ANSWER, "malformed_final_answer"
                 )
+
+        clone_metrics = detect_opposite_reward_clones(completion_texts, rewards)
+        if clone_metrics.suspicious:
+            logger.info(
+                "reject reason=distribution_suspicious hotkey=%s "
+                "manufactured_opposite_reward_clones=%s",
+                request.miner_hotkey,
+                clone_metrics.to_log_dict(),
+            )
+            return reject(RejectReason.DISTRIBUTION_SUSPICIOUS, "distribution")
 
         # Per-submission worst-case filter telemetry (across all rollouts).
         sketch_diff_max = 0
