@@ -1844,3 +1844,35 @@ def test_cap_truncated_rollout_still_runs_behavioural_checks():
     resp = b.accept_submission(req)
     assert resp.accepted is False
     assert resp.reason == RejectReason.BOXED_ANSWER_TAMPERED
+
+
+def test_reject_malformed_final_answer_before_grail():
+    # reward=0 rollouts box "a" then dangle a special-token box -> malformed final.
+    # FakeEnv.compute_reward returns 0.0 (no "CORRECT"), so the reward claim matches.
+    def text_fn(rollout):
+        if rollout.reward > 0.5:
+            return "CORRECT \\boxed{a}"
+        return "work \\boxed{a} then $$\\boxed{<|im_end|>"
+    b = _make_batcher(completion_text_fn=text_fn)
+    req = _request_with_prompt_unique_tokens(rewards=[1.0] * 4 + [0.0] * 4)
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.MALFORMED_FINAL_ANSWER
+
+
+def test_accept_honest_failures_not_flagged_as_malformed():
+    # reward=0 rollouts are genuine give-ups (no boxed) -> not flagged.
+    b = _make_batcher()  # default text_fn: "CORRECT" / "wrong"
+    req = _request_with_prompt_unique_tokens(rewards=[1.0] * 4 + [0.0] * 4)
+    resp = b.accept_submission(req)
+    assert resp.reason != RejectReason.MALFORMED_FINAL_ANSWER
+
+
+def test_accept_genuine_wrong_wellformed_answer():
+    # reward=0 rollouts cleanly box a wrong value -> legitimate negative, accepted.
+    def text_fn(rollout):
+        return "CORRECT \\boxed{a}" if rollout.reward > 0.5 else "nope \\boxed{9}"
+    b = _make_batcher(completion_text_fn=text_fn)
+    req = _request_with_prompt_unique_tokens(rewards=[1.0] * 4 + [0.0] * 4)
+    resp = b.accept_submission(req)
+    assert resp.accepted is True

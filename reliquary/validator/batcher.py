@@ -19,6 +19,7 @@ from reliquary.constants import (
     B_BATCH,
     BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION,
     M_ROLLOUTS,
+    MAX_NEW_TOKENS_PROTOCOL_CAP,
     MAX_SUBMISSIONS_PER_PROMPT,
     MAX_TRUNCATED_PER_SUBMISSION,
     REJECTED_LIST_CAP_PER_HOTKEY,
@@ -46,6 +47,7 @@ from reliquary.validator.observability import (
     classify_drand_round,
     log_submission_stage,
 )
+from reliquary.validator.boxed_integrity import has_malformed_final_answer
 from reliquary.validator.rollout_patterns import detect_opposite_reward_clones
 from reliquary.validator.verifier import (
     evaluate_boxed_answer_probability,
@@ -589,6 +591,28 @@ class GrpoWindowBatcher:
         sigma = rewards_std(rewards)
         if not is_in_zone(sigma, bootstrap=self.bootstrap):
             return reject(RejectReason.OUT_OF_ZONE, "zone")
+
+        # A reward=0 rollout whose final \boxed{} is malformed (empty,
+        # special-token, or unclosed) produced no parseable answer — a fake
+        # negative used to manufacture k=4 / sigma=0.5 and pass the zone filter.
+        # Aligned with the env (which scores the last box); a well-formed wrong
+        # answer is a legitimate negative and is not flagged. Before GRAIL.
+        for _ri, _text in enumerate(completion_texts):
+            _rmeta = request.rollouts[_ri].commit.get("rollout", {}) or {}
+            _clen = int(_rmeta.get("completion_length", 0))
+            _bad, _bad_reason = has_malformed_final_answer(
+                rewards[_ri], _text,
+                completion_length=_clen, cap=MAX_NEW_TOKENS_PROTOCOL_CAP,
+            )
+            if _bad:
+                logger.info(
+                    "reject reason=malformed_final_answer hotkey=%s rollout=%d cond=%s",
+                    request.miner_hotkey, _ri, _bad_reason,
+                )
+                return reject(
+                    RejectReason.MALFORMED_FINAL_ANSWER, "malformed_final_answer"
+                )
+
         clone_metrics = detect_opposite_reward_clones(completion_texts, rewards)
         if clone_metrics.suspicious:
             logger.info(
