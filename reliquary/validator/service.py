@@ -1068,7 +1068,8 @@ class ValidationService:
                 key = (s.hotkey, s.prompt_idx)
                 if key in batched_keys:
                     continue
-                runners_up.append({
+                obs = _submission_obs_payload(s, batcher)
+                runner_entry = {
                     "hotkey": s.hotkey,
                     "prompt_idx": s.prompt_idx,
                     "env_name": env_name,
@@ -1078,8 +1079,14 @@ class ValidationService:
                     "sketch_diff_max": s.sketch_diff_max,
                     "lp_dev_max": s.lp_dev_max,
                     "dist_q10_min": s.dist_q10_min,
-                    **_submission_obs_payload(s, batcher),
-                })
+                    **obs,
+                }
+                # Rewarded runners-up carry rollout_hashes (ported from main):
+                # cooldown/EMA rebuild keys off these to credit miners whose
+                # prompt landed in the winning set but weren't selected for training.
+                if obs.get("rewarded") and s.rollout_hashes:
+                    runner_entry["rollout_hashes"] = [h.hex() for h in s.rollout_hashes]
+                runners_up.append(runner_entry)
 
             for r in getattr(batcher, "rejected_submissions", []):
                 rejected_entries.append({
