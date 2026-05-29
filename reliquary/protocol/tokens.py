@@ -31,6 +31,35 @@ def hash_tokens(tokens: list[int]) -> bytes:
     return hashlib.sha256(tokens_bytes).digest()
 
 
+def encode_prompt(tokenizer: Any, prompt_text: str) -> list[int]:
+    """Canonical prompt → token encoder shared by miner and validator.
+
+    Instruct models (Qwen3-4B-Instruct-2507, etc.) ship a chat template
+    that wraps the user message in role markers; feeding them the bare
+    string never reaches the assistant turn so the model just continues
+    the prompt instead of answering. Apply the chat template when one is
+    declared, fall back to plain encoding otherwise (base models, test
+    fakes). Both sides MUST go through this helper — any divergence in
+    prompt tokenisation trips PROMPT_MISMATCH before GRAIL even runs.
+    """
+    # Require chat_template to be a non-empty string so MagicMock-based test
+    # stubs (which return a MagicMock for any attribute) fall through to the
+    # plain encode() path they already declare.
+    chat_template = getattr(tokenizer, "chat_template", None)
+    if isinstance(chat_template, str) and chat_template and hasattr(
+        tokenizer, "apply_chat_template"
+    ):
+        messages = [{"role": "user", "content": prompt_text}]
+        return list(
+            tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                tokenize=True,
+            )
+        )
+    return list(tokenizer.encode(prompt_text, add_special_tokens=False))
+
+
 def verify_tokens(tokens: list[int], model_config: PretrainedConfig | Any) -> bool:
     """Verify token list validity for model processing."""
     if not tokens:

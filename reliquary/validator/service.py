@@ -131,8 +131,10 @@ def open_grpo_window(
         return tokenizer.decode(tokens[prompt_len:])
 
     def _canonical_prompt_tokens(prompt_idx: int) -> list[int]:
+        from reliquary.protocol.tokens import encode_prompt
+
         problem = env.get_problem(prompt_idx)
-        return list(tokenizer.encode(problem["prompt"], add_special_tokens=False))
+        return encode_prompt(tokenizer, problem["prompt"])
 
     return GrpoWindowBatcher(
         window_start=window_start,

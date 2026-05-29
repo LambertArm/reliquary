@@ -426,9 +426,9 @@ class MiningEngine:
         """
         import torch
 
-        prompt_tokens = self.tokenizer.encode(
-            problem["prompt"], add_special_tokens=False
-        )
+        from reliquary.protocol.tokens import encode_prompt
+
+        prompt_tokens = encode_prompt(self.tokenizer, problem["prompt"])
         prompt_length = len(prompt_tokens)
 
         with torch.no_grad():
