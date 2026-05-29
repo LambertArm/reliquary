@@ -76,6 +76,7 @@ def _submission_with_completion_tokens(
             "tokens": list(tokens),
             "reward": reward_values[idx],
             "commit": commit,
+            "env_name": rollout.get("env_name", "openmathinstruct"),
         })
     payload["rollouts"] = rollouts
     return payload
