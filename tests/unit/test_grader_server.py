@@ -148,6 +148,82 @@ def test_server_returns_grader_error_on_invalid_json_request(grader_server):
     assert resp["status"] == "grader_error"
 
 
+def test_runsc_workers_get_unique_container_ids(monkeypatch, tmp_path):
+    """Regression: under runsc each pool worker must get a UNIQUE container
+    id. ``runsc run <id>`` refuses a duplicate id, so a shared id silently
+    starts only 1 of N workers. The prod argv carries a placeholder that the
+    server substitutes per slot."""
+    from reliquary.environment.grader import server as srv
+
+    captured: list[list[str]] = []
+
+    class _FakeProc:
+        pid = 4321
+        stdin = None
+        stdout = None
+        def poll(self):
+            return None
+
+    def _fake_popen(argv, **kw):
+        captured.append(list(argv))
+        return _FakeProc()
+
+    monkeypatch.setattr(srv.subprocess, "Popen", _fake_popen)
+
+    s = srv.GraderServer(
+        socket_path=str(tmp_path / "g.sock"),
+        pool_size=3,
+        worker_argv=["runsc", "--network=none", "run", "--bundle", "/b",
+                     srv.GRADER_CONTAINER_ID_PLACEHOLDER],
+        metrics_port=0,
+    )
+    for i in range(3):
+        s._spawn_worker(i)
+
+    container_ids = [argv[-1] for argv in captured]
+    assert len(set(container_ids)) == 3, \
+        f"container ids must be unique per worker, got {container_ids}"
+    assert srv.GRADER_CONTAINER_ID_PLACEHOLDER not in container_ids, \
+        "placeholder must be substituted before exec"
+
+
+def test_runsc_respawn_force_deletes_stale_container(monkeypatch, tmp_path):
+    """A SIGKILL'd runsc container can't clean its own state, so respawning
+    the same slot must `runsc delete --force` the stale id first or the
+    re-run fails with 'container already exists'."""
+    from reliquary.environment.grader import server as srv
+
+    deletes: list[list[str]] = []
+
+    class _FakeProc:
+        pid = 4321
+        stdin = None
+        stdout = None
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(srv.subprocess, "Popen", lambda argv, **kw: _FakeProc())
+
+    def _fake_run(argv, **kw):
+        deletes.append(list(argv))
+        return None
+
+    monkeypatch.setattr(srv.subprocess, "run", _fake_run)
+
+    s = srv.GraderServer(
+        socket_path=str(tmp_path / "g.sock"),
+        pool_size=1,
+        worker_argv=["runsc", "run", "--bundle", "/b",
+                     srv.GRADER_CONTAINER_ID_PLACEHOLDER],
+        metrics_port=0,
+    )
+    s._spawn_worker(0)          # initial: no stale container to clean
+    assert deletes == []
+    s._spawn_worker(0)          # respawn: must force-delete the slot's id
+    assert deletes, "respawn must force-delete the stale container id"
+    assert deletes[-1][:3] == ["runsc", "delete", "--force"]
+
+
 def test_metrics_endpoint_exposes_eval_counter(grader_server):
     """Hit /metrics on the grader's loopback HTTP listener."""
     import urllib.request, time

@@ -37,6 +37,11 @@ from reliquary.constants import (
 
 logger = logging.getLogger(__name__)
 
+# Placeholder token in a runsc ``worker_argv``; the server substitutes a
+# unique per-slot container id at spawn time. ``runsc run <id>`` refuses a
+# duplicate id, so every pool worker needs its own.
+GRADER_CONTAINER_ID_PLACEHOLDER = "{container_id}"
+
 
 class _MetricsRegistry:
     """Tiny Prometheus-text-format counter registry. No external dep.
@@ -106,6 +111,11 @@ class GraderServer:
         self.worker_argv = worker_argv or [
             "python", "-m", "reliquary.environment.grader.worker"
         ]
+        # Runsc mode: each worker needs a unique container id (see
+        # GRADER_CONTAINER_ID_PLACEHOLDER). Track which slots have spawned
+        # before so respawns can clean up the killed container's stale state.
+        self._uses_runsc = GRADER_CONTAINER_ID_PLACEHOLDER in self.worker_argv
+        self._spawned_slots: set[int] = set()
         self.eval_timeout_s = eval_timeout_s
         self.recycle_after_evals = recycle_after_evals
         self.metrics_port = metrics_port
@@ -186,9 +196,34 @@ class GraderServer:
         except FileNotFoundError:
             pass
 
+    def _container_id_for_slot(self, slot: int) -> str:
+        return f"grader-worker-{slot}"
+
+    def _worker_argv_for_slot(self, slot: int) -> list[str]:
+        """Per-slot argv. For runsc, substitute a unique container id; a
+        SIGKILL'd container can't clean its own state, so force-delete the
+        slot's stale id before reusing it on respawn."""
+        if not self._uses_runsc:
+            return self.worker_argv
+        container_id = self._container_id_for_slot(slot)
+        if slot in self._spawned_slots:
+            try:
+                subprocess.run(
+                    [self.worker_argv[0], "delete", "--force", container_id],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=10.0,
+                )
+            except Exception:
+                pass
+        self._spawned_slots.add(slot)
+        return [
+            container_id if a == GRADER_CONTAINER_ID_PLACEHOLDER else a
+            for a in self.worker_argv
+        ]
+
     def _spawn_worker(self, slot: int) -> Worker:
         proc = subprocess.Popen(
-            self.worker_argv,
+            self._worker_argv_for_slot(slot),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -381,7 +416,7 @@ def main() -> None:
             "/opt/reliquary/reliquary/environment/grader/bundle",
         )
         worker_argv = ["runsc", "--network=none", "run",
-                       "--bundle", bundle, "grader-worker"]
+                       "--bundle", bundle, GRADER_CONTAINER_ID_PLACEHOLDER]
     else:
         worker_argv = ["python", "-m", "reliquary.environment.grader.worker"]
 

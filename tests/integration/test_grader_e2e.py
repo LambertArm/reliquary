@@ -37,12 +37,15 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture
 def grader_server(tmp_path):
-    from reliquary.environment.grader.server import GraderServer
+    from reliquary.environment.grader.server import (
+        GRADER_CONTAINER_ID_PLACEHOLDER,
+        GraderServer,
+    )
 
     sock_path = str(tmp_path / "grader.sock")
     worker_argv = [
         "runsc", "--network=none", "run",
-        "--bundle", BUNDLE_PATH, "grader-worker",
+        "--bundle", BUNDLE_PATH, GRADER_CONTAINER_ID_PLACEHOLDER,
     ]
     server = GraderServer(
         socket_path=sock_path, pool_size=2,
