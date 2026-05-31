@@ -67,6 +67,10 @@ class ProofResult:
     # be shorter than completion_length when boundary positions are
     # skipped (t == 0, t - 1 >= seq_len, t >= len(tokens)).
     completion_chosen_probs: list[float] = field(default_factory=list)
+    # Token authenticity: argmax probability and argmax token id under T_PROTO,
+    # aligned 1:1 with completion_chosen_probs (same surviving steps).
+    completion_argmax_probs: list[float] = field(default_factory=list)
+    completion_argmax_ids: list[int] = field(default_factory=list)
 
 
 def verify_signature(commit: dict, hotkey: str) -> bool:
@@ -301,7 +305,11 @@ def verify_commitment_proofs(
     challenge_lp_indices, challenge_lp_values = _gpu_challenge_logprobs(
         logits_gpu, tokens, prompt_length, completion_length, randomness, device,
     )
-    completion_chosen_probs = _gpu_completion_chosen_probs(
+    (
+        completion_chosen_probs,
+        completion_argmax_probs,
+        completion_argmax_ids,
+    ) = _gpu_completion_token_stats(
         logits_gpu, tokens, prompt_length, completion_length, seq_len, device,
     )
 
@@ -338,6 +346,8 @@ def verify_commitment_proofs(
         challenge_lp_indices=challenge_lp_indices,
         challenge_lp_values=challenge_lp_values,
         completion_chosen_probs=completion_chosen_probs,
+        completion_argmax_probs=completion_argmax_probs,
+        completion_argmax_ids=completion_argmax_ids,
     )
 
 
@@ -399,31 +409,26 @@ def _gpu_challenge_logprobs(
     return list(challenge_idxs), chosen.tolist()
 
 
-def _gpu_completion_chosen_probs(
+def _gpu_completion_token_stats(
     logits_gpu: torch.Tensor,
     tokens: list[int],
     prompt_length: int,
     completion_length: int,
     seq_len: int,
     device: Any,
-) -> list[float]:
-    """Compute chosen-token probability under T_PROTO at each valid
-    completion-producing position, on GPU, vectorised.
-
-    Mirrors the per-step loop in the legacy CPU implementation: for each
-    ``t in [prompt_length, prompt_length + completion_length)``, skip
-    when ``t == 0`` or ``t - 1`` lies outside ``logits``'s range or
-    ``t`` lies outside ``tokens``. The remaining (t-1, tokens[t]) pairs
-    are gathered in a single softmax + gather pass and shipped to CPU
-    as one Python float per surviving step.
+) -> tuple[list[float], list[float], list[int]]:
+    """Per completion-producing position under T_PROTO, on GPU, vectorised:
+    chosen-token prob, argmax prob, argmax token id. The three lists are
+    aligned 1:1. Boundary positions (t == 0, t - 1 >= seq_len, t >= len(tokens))
+    are skipped identically across all three.
     """
     if completion_length <= 0:
-        return []
+        return [], [], []
     t_start = prompt_length
     t_end = min(prompt_length + completion_length, len(tokens), seq_len + 1)
     valid_t = [t for t in range(t_start, t_end) if t > 0 and t - 1 < seq_len]
     if not valid_t:
-        return []
+        return [], [], []
 
     pos_tensor = torch.tensor(
         [t - 1 for t in valid_t], device=device, dtype=torch.long,
@@ -434,7 +439,8 @@ def _gpu_completion_chosen_probs(
     scaled = logits_gpu[pos_tensor].float() / float(T_PROTO)
     probs = scaled.softmax(dim=-1)
     chosen = probs.gather(1, tok_tensor.unsqueeze(1)).squeeze(1)
-    return chosen.tolist()
+    amax_probs, amax_ids = probs.max(dim=-1)
+    return chosen.tolist(), amax_probs.tolist(), amax_ids.tolist()
 
 
 def verify_reward_claim(
@@ -609,6 +615,41 @@ def evaluate_token_distribution(
     return (not suspicious), metrics
 
 
+def evaluate_token_authenticity(
+    proof: "ProofResult",
+    *,
+    threshold: float | None = None,
+    argmax_conf: float | None = None,
+) -> tuple[bool, dict]:
+    """Hard check: a completion token sampled at T_PROTO can never have
+    chosen probability below ``threshold`` while the model's argmax sits at
+    >= ``argmax_conf`` — that pattern is a post-hoc injection. Reads the
+    aligned ``completion_chosen_probs`` / ``completion_argmax_probs`` from the
+    GPU forward; no tokenizer needed. ``ok=True`` when no stats are available.
+    """
+    from reliquary.constants import TOKEN_AUTH_ARGMAX_CONF, TOKEN_AUTH_THRESHOLD
+
+    if threshold is None:
+        threshold = TOKEN_AUTH_THRESHOLD
+    if argmax_conf is None:
+        argmax_conf = TOKEN_AUTH_ARGMAX_CONF
+    chosen = proof.completion_chosen_probs
+    amax = proof.completion_argmax_probs
+    if not chosen or not amax:
+        return True, {}
+    n = min(len(chosen), len(amax))
+    for j in range(n):
+        if chosen[j] < threshold and amax[j] >= argmax_conf:
+            ids = proof.completion_argmax_ids
+            return False, {
+                "pos": j,
+                "p_chosen": float(chosen[j]),
+                "p_argmax": float(amax[j]),
+                "argmax_id": (ids[j] if j < len(ids) else None),
+            }
+    return True, {}
+
+
 def _find_last_boxed_token_range(
     completion_tokens: list[int],
     tokenizer: Any,
@@ -689,7 +730,7 @@ def evaluate_boxed_answer_probability(
     or no probabilities are available — the filter only fires on a concrete
     low-probability boxed token.
     """
-    from reliquary.constants import BOXED_ANSWER_MIN_PROB
+    from reliquary.constants import BOXED_ANSWER_MIN_PROB, TOKEN_AUTH_ARGMAX_CONF
 
     if threshold is None:
         threshold = BOXED_ANSWER_MIN_PROB
@@ -698,6 +739,7 @@ def evaluate_boxed_answer_probability(
     probs = proof.completion_chosen_probs
     if not probs:
         return True, {}
+    amax = proof.completion_argmax_probs
 
     completion_tokens = list(tokens[prompt_length: prompt_length + completion_length])
     rng = _find_last_boxed_token_range(completion_tokens, tokenizer)
@@ -706,11 +748,18 @@ def evaluate_boxed_answer_probability(
     start, end = rng
 
     selected: list[float] = []
+    tampered = False
     for i in range(start, end + 1):
         if 0 <= i < len(probs):
-            selected.append(float(probs[i]))
+            p = float(probs[i])
+            selected.append(p)
+            # A collapsed boxed token is a swap only if the model was confident
+            # of a different token there. A low prob with no confident argmax is
+            # genuine sampling uncertainty — don't reject (avoids vLLM->HF drift
+            # false positives near the threshold).
+            if p < threshold and i < len(amax) and amax[i] >= TOKEN_AUTH_ARGMAX_CONF:
+                tampered = True
     if not selected:
         return True, {}
-    min_prob = min(selected)
-    metrics = {"min_prob": min_prob, "n_tokens": len(selected)}
-    return min_prob >= threshold, metrics
+    metrics = {"min_prob": min(selected), "n_tokens": len(selected)}
+    return (not tampered), metrics

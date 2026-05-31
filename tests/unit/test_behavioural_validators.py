@@ -11,8 +11,9 @@ materialises a CPU logits tensor for these checks.
 import math
 
 import pytest
+import torch
 
-from reliquary.constants import CHALLENGE_K, LOGPROB_IS_EPS
+from reliquary.constants import CHALLENGE_K, LOGPROB_IS_EPS, T_PROTO
 from reliquary.validator import verifier
 from reliquary.validator.verifier import ProofResult
 
@@ -410,10 +411,12 @@ def test_evaluate_boxed_low_prob_rejects():
     # Position of "4" inside the boxed content
     boxed_open = completion.index("{") + 1
     probs[boxed_open] = 1e-6
+    argmax = [1.0] * len(completion)  # model was confident of a different token
     proof = ProofResult(
         all_passed=True, passed=1, checked=1,
         has_sparse_outputs=True,
         completion_chosen_probs=probs,
+        completion_argmax_probs=argmax,
     )
     ok, metrics = verifier.evaluate_boxed_answer_probability(
         tokens=tokens, prompt_length=5,
@@ -422,6 +425,30 @@ def test_evaluate_boxed_low_prob_rejects():
     )
     assert ok is False
     assert metrics["min_prob"] == 1e-6
+
+
+def test_evaluate_boxed_low_prob_no_confident_argmax_passes():
+    """Low boxed prob but no confident alternative (flat dist) — genuine
+    sampling uncertainty, not a post-hoc swap. With the argmax guard, accept."""
+    completion = "answer is \\boxed{42}"
+    tokens = [0] * 5 + _ords(completion)
+    probs = [0.99] * len(completion)
+    argmax = [1.0] * len(completion)
+    boxed_open = completion.index("{") + 1
+    probs[boxed_open] = 1e-6
+    argmax[boxed_open] = 0.30  # model had no confident alternative here
+    proof = ProofResult(
+        all_passed=True, passed=1, checked=1,
+        has_sparse_outputs=True,
+        completion_chosen_probs=probs,
+        completion_argmax_probs=argmax,
+    )
+    ok, _ = verifier.evaluate_boxed_answer_probability(
+        tokens=tokens, prompt_length=5,
+        completion_length=len(completion),
+        proof=proof, tokenizer=_CharTokenizer(),
+    )
+    assert ok is True
 
 
 def test_evaluate_boxed_unclosed_returns_true():
@@ -467,10 +494,12 @@ def test_evaluate_boxed_fbox_alias_also_checked():
     tokens = [0] * 5 + _ords(completion)
     probs = [0.99] * len(completion)
     probs[completion.index("{") + 1] = 1e-6
+    argmax = [1.0] * len(completion)  # model was confident of a different token
     proof = ProofResult(
         all_passed=True, passed=1, checked=1,
         has_sparse_outputs=True,
         completion_chosen_probs=probs,
+        completion_argmax_probs=argmax,
     )
     ok, _ = verifier.evaluate_boxed_answer_probability(
         tokens=tokens, prompt_length=5,
@@ -478,3 +507,59 @@ def test_evaluate_boxed_fbox_alias_also_checked():
         proof=proof, tokenizer=_CharTokenizer(),
     )
     assert ok is False
+
+
+def _proof_with_token_stats(chosen, argmax_probs, argmax_ids=None):
+    return ProofResult(
+        all_passed=True, passed=1, checked=1, has_sparse_outputs=True,
+        completion_chosen_probs=chosen,
+        completion_argmax_probs=argmax_probs,
+        completion_argmax_ids=argmax_ids or [0] * len(chosen),
+    )
+
+
+def test_token_authenticity_honest_passes():
+    proof = _proof_with_token_stats([0.99, 0.8, 1.0], [0.99, 0.8, 1.0])
+    ok, m = verifier.evaluate_token_authenticity(proof)
+    assert ok is True and m == {}
+
+
+def test_token_authenticity_injection_fails():
+    proof = _proof_with_token_stats(
+        [1.0, 2.0e-20, 1.0], [1.0, 1.0, 1.0], argmax_ids=[5, 7, 9],
+    )
+    ok, m = verifier.evaluate_token_authenticity(proof)
+    assert ok is False
+    assert m["pos"] == 1 and m["argmax_id"] == 7
+
+
+def test_token_authenticity_high_entropy_honest_passes():
+    proof = _proof_with_token_stats([1.0, 1.0e-9, 1.0], [1.0, 0.30, 1.0])
+    ok, _ = verifier.evaluate_token_authenticity(proof)
+    assert ok is True
+
+
+def test_token_authenticity_empty_skips():
+    ok, m = verifier.evaluate_token_authenticity(
+        ProofResult(all_passed=True, passed=1, checked=1)
+    )
+    assert ok is True and m == {}
+
+
+def test_gpu_completion_token_stats_returns_chosen_and_argmax():
+    # 2 completion positions, vocab 4. Build logits so argmax is known.
+    seq_len = 3
+    logits = torch.zeros(seq_len, 4)
+    logits[0] = torch.tensor([0.0, 5.0, 0.0, 0.0])   # predicts token at idx1
+    logits[1] = torch.tensor([0.0, 0.0, 0.0, 9.0])   # predicts token at idx2
+    tokens = [0, 1, 3]  # idx1 token=1 (the argmax), idx2 token=3 (the argmax)
+
+    chosen, amax_p, amax_id = verifier._gpu_completion_token_stats(
+        logits, tokens, prompt_length=1, completion_length=2,
+        seq_len=seq_len, device="cpu",
+    )
+    assert len(chosen) == len(amax_p) == len(amax_id) == 2
+    assert amax_id == [1, 3]
+    for c, a in zip(chosen, amax_p):
+        assert abs(c - a) < 1e-6
+        assert a > 0.9
