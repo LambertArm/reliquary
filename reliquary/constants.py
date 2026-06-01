@@ -520,4 +520,4 @@ TOKEN_AUTH_THRESHOLD = 1e-8
 TOKEN_AUTH_ARGMAX_CONF = 0.99
 # Shadow mode: compute + log the check without rejecting. Flip to True once prod
 # shadow logs confirm zero false positives.
-TOKEN_AUTH_ENFORCE = False
+TOKEN_AUTH_ENFORCE = True
