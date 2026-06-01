@@ -5,6 +5,16 @@ services:
     image: ghcr.io/reliquadotai/reliquary-validator:latest
     container_name: reliquary-trainer
     restart: unless-stopped
+    # Required for the OpenCodeInstruct grader's gVisor (runsc) sandbox to
+    # start: an unprivileged container fails ("cannot create gofer process /
+    # cannot create sandbox"). Verified on the prod host — only --privileged
+    # worked (seccomp=unconfined + SYS_PTRACE + SYS_ADMIN was not enough).
+    # NOTE: Watchtower clones the LIVE container's config, NOT this file, so
+    # this only takes effect after a manual `docker compose up -d` here; do
+    # that once before the grader image rolls out. Watchtower preserves it
+    # afterwards. The miner-code isolation boundary is gVisor, not the
+    # container privilege.
+    privileged: true
     env_file: .env
     # NVIDIA Container Toolkit required on the host.
     deploy:
