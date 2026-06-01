@@ -50,11 +50,18 @@ RUN pip install wandb
 
 # ────────────────  GRADER SANDBOX  ────────────────
 # Install gVisor (runsc) for the OpenCodeInstruct env's sandbox.
-# Version-pinned to the latest release at writing time; bump cautiously.
+# Pinned to an exact release + verified checksum: the grader's pass/total
+# feeds rewards, so a different runsc across validators would break the
+# cross-box-determinism guarantee (and ``latest`` changed every rebuild).
+# Bump RUNSC_RELEASE deliberately.
+ARG RUNSC_RELEASE=20260525
 RUN ARCH="$(uname -m)" \
- && RUNSC_URL="https://storage.googleapis.com/gvisor/releases/release/latest/${ARCH}/runsc" \
- && wget -q "${RUNSC_URL}" -O /usr/local/bin/runsc \
- && chmod +x /usr/local/bin/runsc
+ && BASE="https://storage.googleapis.com/gvisor/releases/release/${RUNSC_RELEASE}/${ARCH}" \
+ && wget -q "${BASE}/runsc" "${BASE}/runsc.sha512" \
+ && sha512sum -c runsc.sha512 \
+ && chmod +x runsc \
+ && mv runsc /usr/local/bin/runsc \
+ && rm -f runsc.sha512
 
 # Build the grader OCI bundle (python:3.12-slim rootfs + worker.py).
 # Requires the Docker socket at build time — provided by docker buildx.

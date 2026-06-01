@@ -12,7 +12,12 @@ set -euo pipefail
 BUNDLE_DIR="${BUNDLE_DIR:-/opt/reliquary/reliquary/environment/grader/bundle}"
 ROOTFS="${BUNDLE_DIR}/rootfs"
 WORKER_SRC="${WORKER_SRC:-/opt/reliquary/reliquary/environment/grader/worker.py}"
-PY_IMAGE="${PY_IMAGE:-python:3.12-slim}"
+# Pinned by digest: the CPython patch release in the sandbox rootfs decides
+# the grader's pass/total, so a floating `python:3.12-slim` tag would let two
+# validators grade identical code differently (cross-box determinism). Bump
+# the digest deliberately. (Resolve a new one with:
+#   docker buildx imagetools inspect python:3.12-slim --format '{{.Manifest.Digest}}')
+PY_IMAGE="${PY_IMAGE:-python:3.12-slim@sha256:090ba77e2958f6af52a5341f788b50b032dd4ca28377d2893dcf1ecbdfdfe203}"
 
 echo "[build_grader_bundle] BUNDLE_DIR=${BUNDLE_DIR}"
 echo "[build_grader_bundle] ROOTFS=${ROOTFS}"
