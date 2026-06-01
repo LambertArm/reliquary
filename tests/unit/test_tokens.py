@@ -42,23 +42,40 @@ class TestHashTokens:
 class _ChatTokenizer:
     """Minimal stand-in for an instruct-model tokenizer.
 
-    Mirrors the surface area encode_prompt depends on: a non-empty
-    ``chat_template`` string and an ``apply_chat_template`` method that
-    returns the chat-formatted token list. ``encode`` is also provided so
-    the fallback path is observable in a test.
+    Mirrors transformers >=5: ``apply_chat_template(tokenize=True)`` returns
+    a BatchEncoding (dict) *unless* ``return_dict=False`` is passed. encode_prompt
+    must request a flat list explicitly, or it ends up iterating dict keys.
     """
 
     chat_template = "<|im_start|>user\n{p}<|im_end|>\n<|im_start|>assistant\n"
 
-    def apply_chat_template(self, messages, *, add_generation_prompt, tokenize):
+    def apply_chat_template(self, messages, *, add_generation_prompt, tokenize, return_dict=True):
         assert add_generation_prompt is True
         assert tokenize is True
         prompt = messages[0]["content"]
-        return [1] + list(prompt.encode("utf-8"))
+        ids = [1] + list(prompt.encode("utf-8"))
+        if return_dict:
+            return {"input_ids": ids, "attention_mask": [1] * len(ids)}
+        return ids
 
     def encode(self, text, *, add_special_tokens):
         assert add_special_tokens is False
         return list(text.encode("utf-8"))
+
+
+class _ChatTokenizerIgnoresReturnDict:
+    """Pathological tokenizer that returns a BatchEncoding even when
+    ``return_dict=False`` is requested. encode_prompt must still extract the
+    flat token ids."""
+
+    chat_template = "x"
+
+    def apply_chat_template(self, messages, *, add_generation_prompt, tokenize, return_dict=False):
+        ids = [2] + list(messages[0]["content"].encode("utf-8"))
+        return {"input_ids": ids, "attention_mask": [1] * len(ids)}
+
+    def encode(self, text, *, add_special_tokens):
+        raise AssertionError("chat-template path expected, not encode()")
 
 
 class _BareTokenizer:
@@ -74,6 +91,15 @@ class TestEncodePrompt:
         tok = _ChatTokenizer()
         out = encode_prompt(tok, "hi")
         assert out == [1] + list(b"hi")
+        assert all(isinstance(t, int) for t in out), "must be int token ids, not dict keys"
+
+    def test_extracts_input_ids_when_return_dict_ignored(self):
+        """A tokenizer that ignores return_dict and returns a BatchEncoding
+        must still yield flat int token ids."""
+        tok = _ChatTokenizerIgnoresReturnDict()
+        out = encode_prompt(tok, "hi")
+        assert out == [2] + list(b"hi")
+        assert all(isinstance(t, int) for t in out)
 
     def test_falls_back_when_no_chat_template(self):
         tok = _BareTokenizer()
@@ -100,3 +126,35 @@ class TestEncodePrompt:
         out = encode_prompt(tok, "anything")
         assert out == [7, 8, 9]
         tok.apply_chat_template.assert_not_called()
+
+
+# Frozen reference encoding for the production model + pinned transformers.
+# Regenerate ONLY on a deliberate, coordinated encoding change (and bump the
+# transformers pin in pyproject.toml in lockstep). Any drift here means
+# miners and the validator would disagree -> mass PROMPT_MISMATCH.
+_GOLDEN_PROMPT = "What is the capital of France? Answer in one word."
+_GOLDEN_TOKENS_QWEN3_4B = [
+    151644, 872, 198, 3838, 374, 279, 6722, 315, 9625, 30,
+    21806, 304, 825, 3409, 13, 151645, 198, 151644, 77091, 198,
+]
+
+
+def test_golden_encoding_matches_production_tokenizer():
+    """Pin the exact canonical encoding for Qwen3-4B-Instruct-2507.
+
+    Network-gated: skips if the tokenizer can't be fetched. Where it runs
+    (validators, CI with the tokenizer cached), it locks the encoding so a
+    transformers bump that changes apply_chat_template output is caught."""
+    import pytest
+
+    pytest.importorskip("transformers")
+    from transformers import AutoTokenizer
+
+    from reliquary.constants import DEFAULT_BASE_MODEL
+
+    try:
+        tok = AutoTokenizer.from_pretrained(DEFAULT_BASE_MODEL)
+    except Exception as e:  # offline / model gated / network down
+        pytest.skip(f"production tokenizer unavailable: {e}")
+
+    assert encode_prompt(tok, _GOLDEN_PROMPT) == _GOLDEN_TOKENS_QWEN3_4B

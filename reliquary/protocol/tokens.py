@@ -50,13 +50,19 @@ def encode_prompt(tokenizer: Any, prompt_text: str) -> list[int]:
         tokenizer, "apply_chat_template"
     ):
         messages = [{"role": "user", "content": prompt_text}]
-        return list(
-            tokenizer.apply_chat_template(
-                messages,
-                add_generation_prompt=True,
-                tokenize=True,
-            )
+        # transformers >=5 returns a BatchEncoding from apply_chat_template
+        # even with tokenize=True; request return_dict=False for a flat list
+        # and still defensively unwrap input_ids if a version ignores it.
+        # Without this, list(...) iterates the dict keys ('input_ids', ...).
+        encoded = tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_dict=False,
         )
+        if isinstance(encoded, dict) or hasattr(encoded, "input_ids"):
+            encoded = encoded["input_ids"]
+        return list(encoded)
     return list(tokenizer.encode(prompt_text, add_special_tokens=False))
 
 
