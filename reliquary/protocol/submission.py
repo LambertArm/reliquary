@@ -70,6 +70,9 @@ class RejectReason(str, Enum):
     BAD_TERMINATION = "bad_termination"
     BOXED_ANSWER_TAMPERED = "boxed_answer_tampered"
     MALFORMED_FINAL_ANSWER = "malformed_final_answer"
+    # Deprecated: the reward-shape filter no longer rejects submissions
+    # (trivially bypassable + false-positive-prone). Kept in the enum so
+    # historical archives in R2 that carry the string still deserialize.
     REWARD_SHAPE_SUSPICIOUS = "reward_shape_suspicious"
     WRONG_CHECKPOINT = "wrong_checkpoint"
     WRONG_RANDOMNESS = "wrong_randomness"

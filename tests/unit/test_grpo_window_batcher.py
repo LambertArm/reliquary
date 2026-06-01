@@ -1167,7 +1167,10 @@ def test_accept_cap_path_truncations_at_budget():
     assert resp.reason != RejectReason.BAD_TERMINATION
 
 
-def test_reject_repeated_zero_tail_reward_shape_even_with_eos():
+def test_reward_shape_no_longer_rejects_repeated_zero_tail():
+    """The reward-shape filter was removed: it was trivially bypassed
+    (reorder rollouts / vary loser lengths) yet false-rejected honest
+    miners. A same-length zero tail is no longer grounds for rejection."""
     b = _make_batcher(
         model=_ModelStubWithVocab(),
         verify_commitment_proofs_fn=_grail_with_logits(220),
@@ -1177,8 +1180,7 @@ def test_reject_repeated_zero_tail_reward_shape_even_with_eos():
 
     resp = b.accept_submission(req)
 
-    assert resp.accepted is False
-    assert resp.reason == RejectReason.REWARD_SHAPE_SUSPICIOUS
+    assert resp.accepted is True
 
 
 def test_accept_ordered_rewards_with_varied_zero_lengths():

@@ -898,24 +898,20 @@ class GrpoWindowBatcher:
                     dist_q10_min=dist_q10_min,
                 )
 
+        # Reward-shape metrics are still computed (they feed the softer
+        # training-quarantine signal + archive telemetry) but no longer
+        # REJECT a submission: the ordered-prefix heuristic was trivially
+        # bypassed by reordering rollouts (10101010) and varying loser
+        # lengths, while false-positive-rejecting honest miners whose losers
+        # happened to share a length. The real defense is structural
+        # (zone/emission economics + rollout token authenticity), not this
+        # shape heuristic. See RejectReason.REWARD_SHAPE_SUSPICIOUS (kept for
+        # historical archive deserialization only).
         reward_shape = detect_reward_shape_manipulation(
             rewards,
             completion_lengths,
             truncated_flags,
         )
-        if reward_shape.suspicious:
-            logger.info(
-                "reject reason=reward_shape_suspicious hotkey=%s %s",
-                request.miner_hotkey,
-                reward_shape.to_log_dict(),
-            )
-            return reject(
-                RejectReason.REWARD_SHAPE_SUSPICIOUS,
-                "reward_shape",
-                sketch_diff_max=sketch_diff_max,
-                lp_dev_max=lp_dev_max,
-                dist_q10_min=dist_q10_min,
-            )
 
         # All checks passed — append to both the flat list and the per-prompt
         # bucket. The bucket is what seal_batch groups over.
