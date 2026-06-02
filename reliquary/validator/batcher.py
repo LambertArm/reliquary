@@ -27,6 +27,7 @@ from reliquary.constants import (
     MAX_SUBMISSIONS_PER_PROMPT,
     MAX_TRUNCATED_PER_SUBMISSION,
     REJECTED_LIST_CAP_PER_HOTKEY,
+    TOKEN_AUTH_ENFORCE,
 )
 from reliquary.environment.base import Environment
 from reliquary.protocol.submission import (
@@ -56,6 +57,7 @@ from reliquary.validator.reward_shape import detect_reward_shape_manipulation
 from reliquary.validator.rollout_patterns import detect_opposite_reward_clones
 from reliquary.validator.verifier import (
     evaluate_boxed_answer_probability,
+    evaluate_token_authenticity,
     evaluate_token_distribution,
     has_eos_padding,
     is_cap_truncation,
@@ -228,6 +230,8 @@ class GrpoWindowBatcher:
         self.window_opened_at: float = self._time_fn()
         self.window_opened_wall_ts: float = self._wall_clock()
         self.window_open_drand_round: int | None = None
+        self.last_valid_submission_at: float | None = None
+        self.last_valid_submission_wall_ts: float | None = None
 
         self._cooldown = (
             cooldown_map if cooldown_map is not None
@@ -397,6 +401,24 @@ class GrpoWindowBatcher:
         harmless — the worker re-checks the cap inside ``_accept_locked``.
         """
         return len(self._submissions_per_prompt.get(prompt_idx, ()))
+
+    def distinct_valid_prompt_count(self) -> int:
+        """Number of distinct, non-cooldown prompts among valid submissions.
+
+        This is the trainable fill level for the window. It can be lower than
+        ``valid_count`` when multiple miners submit the same prompt, so seal
+        liveness must reason about this value instead of raw submissions.
+        """
+        return len({
+            s.prompt_idx for s in list(self._valid)
+            if not self._cooldown.is_in_cooldown(s.prompt_idx, self.window_start)
+        })
+
+    def seconds_since_last_valid_submission(self) -> float | None:
+        """Seconds since the last accepted valid submission, or None."""
+        if self.last_valid_submission_at is None:
+            return None
+        return max(0.0, self._time_fn() - self.last_valid_submission_at)
 
     @property
     def proof_admission_count(self) -> int:
@@ -898,6 +920,21 @@ class GrpoWindowBatcher:
                     dist_q10_min=dist_q10_min,
                 )
 
+            auth_ok, auth_metrics = evaluate_token_authenticity(proof)
+            if not auth_ok:
+                logger.info(
+                    "token_tampered hotkey=%s enforce=%s %s",
+                    request.miner_hotkey, TOKEN_AUTH_ENFORCE, auth_metrics,
+                )
+                if TOKEN_AUTH_ENFORCE:
+                    return reject(
+                        RejectReason.TOKEN_TAMPERED,
+                        "token_authenticity",
+                        sketch_diff_max=sketch_diff_max,
+                        lp_dev_max=lp_dev_max,
+                        dist_q10_min=dist_q10_min,
+                    )
+
         # Reward-shape metrics are still computed (they feed the softer
         # training-quarantine signal + archive telemetry) but no longer
         # REJECT a submission: the ordered-prefix heuristic was trivially
@@ -946,14 +983,13 @@ class GrpoWindowBatcher:
         self._submissions_per_prompt.setdefault(
             request.prompt_idx, []
         ).append(new_sub)
+        self.last_valid_submission_at = self._time_fn()
+        self.last_valid_submission_wall_ts = self._wall_clock()
         # Lock-free read in /state — see ``__init__`` for rationale.
         self.valid_count = len(self._valid)
 
         # v2.1: fire seal_event when B distinct non-cooldown prompts have been accepted.
-        distinct_eligible = len({
-            s.prompt_idx for s in self._valid
-            if not self._cooldown.is_in_cooldown(s.prompt_idx, self.window_start)
-        })
+        distinct_eligible = self.distinct_valid_prompt_count()
         if distinct_eligible >= B_BATCH and self._seal_trigger_round is None:
             # B-th distinct prompt just landed. Record the trigger drand
             # round and DELAY the actual seal until the round expires —

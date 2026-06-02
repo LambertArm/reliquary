@@ -161,6 +161,14 @@ MAX_SEAL_QUEUE_DRAIN_SECONDS = 20.0
 # drained but fewer than B valid submissions survived validation.
 PROOF_ADMISSION_STALL_POLL_SECONDS = 0.5
 
+# Sparse-window liveness breaker. After recent validator hardening, honest but
+# stale/misconfigured miners can leave a window with some valid submissions but
+# fewer than B distinct trainable prompts. Keep the normal 8-distinct seal as
+# the happy path, but do not let sparse valid traffic hold checkpoint progress
+# for the long safety-net timeout.
+SPARSE_VALID_IDLE_SEAL_SECONDS = 180.0
+SPARSE_VALID_IDLE_MIN_DISTINCT_PROMPTS = 4
+SPARSE_VALID_MAX_WINDOW_SECONDS = 600.0
 
 # UID that receives unused slot emission budget (the burn address).
 UID_BURN = 0
@@ -513,6 +521,7 @@ SAMPLING_LOW_Q10_MAX = 0.025    # 10th-percentile must be above
 # under the validator's forward; honest low-confidence answer tokens stay
 # above ~10⁻³. Threshold sits in the gap.
 BOXED_ANSWER_MIN_PROB = 0.001
+
 # ────────────────  CODE EXECUTION GRADER  ────────────────
 
 # Path to the Unix domain socket the grader server listens on.
@@ -534,3 +543,13 @@ GRADER_EVAL_TIMEOUT_SECONDS = 5
 # How often (seconds) the server pings each worker via a no-op eval
 # to detect zombies. Triggers respawn if a worker fails to respond.
 GRADER_HEALTH_CHECK_INTERVAL_SECONDS = 30
+
+# Token authenticity: a completion token whose chosen probability collapses
+# below this while the model's argmax sits at >= TOKEN_AUTH_ARGMAX_CONF was not
+# sampled — it was injected. Calibrated on 550k honest vLLM->HF tokens (floor
+# 3.5e-7); measured injections <= 1e-13.
+TOKEN_AUTH_THRESHOLD = 1e-10
+TOKEN_AUTH_ARGMAX_CONF = 0.99
+# Shadow mode: compute + log the check without rejecting. Flip to True once prod
+# shadow logs confirm zero false positives.
+TOKEN_AUTH_ENFORCE = True

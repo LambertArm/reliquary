@@ -69,6 +69,7 @@ class RejectReason(str, Enum):
     TOKENS_MISMATCH = "tokens_mismatch"
     BAD_TERMINATION = "bad_termination"
     BOXED_ANSWER_TAMPERED = "boxed_answer_tampered"
+    TOKEN_TAMPERED = "token_tampered"
     MALFORMED_FINAL_ANSWER = "malformed_final_answer"
     # Deprecated: the reward-shape filter no longer rejects submissions
     # (trivially bypassable + false-positive-prone). Kept in the enum so

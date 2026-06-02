@@ -1,10 +1,12 @@
 """ValidationService state machine: OPEN → TRAINING → PUBLISHING → READY."""
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from reliquary.constants import B_BATCH
 from reliquary.protocol.submission import WindowState
 
 
@@ -159,6 +161,94 @@ def test_proof_cap_breaker_waits_for_inflight_or_queued_work():
     svc.server._inflight_proofs = 0
     svc.server._submit_queue.put_nowait((object(), batcher, object()))
     assert svc._proof_admission_exhausted_and_drained(batcher) is False
+
+
+def test_proof_cap_breaker_uses_distinct_prompt_count():
+    """Raw valid duplicates should not mask an unfillable trainable shortfall."""
+    from reliquary.validator.service import MAX_PROOF_CANDIDATES_PER_WINDOW
+
+    svc = _make_service()
+    svc._open_window()
+    svc._activate_window()
+    batcher = svc._active_batcher
+    batcher._valid = [
+        SimpleNamespace(prompt_idx=i) for i in range(B_BATCH - 1)
+    ] + [SimpleNamespace(prompt_idx=0)]
+    batcher.valid_count = B_BATCH
+    batcher._proof_admission_count = MAX_PROOF_CANDIDATES_PER_WINDOW
+
+    assert batcher.distinct_valid_prompt_count() == B_BATCH - 1
+    assert svc._proof_admission_exhausted_and_drained(batcher) is True
+
+
+@pytest.mark.asyncio
+async def test_wait_for_window_seal_force_seals_duplicate_prompt_shortfall(monkeypatch):
+    """A duplicate-filled raw batch must not wait for the long safety timeout."""
+    monkeypatch.setattr(
+        "reliquary.validator.service.MAX_SEAL_QUEUE_DRAIN_SECONDS", 0.0,
+    )
+    svc = _make_service()
+    svc._open_window()
+    svc._activate_window()
+    batcher = svc._active_batcher
+    batcher._valid = [
+        SimpleNamespace(prompt_idx=i) for i in range(B_BATCH - 1)
+    ] + [SimpleNamespace(prompt_idx=0)]
+    batcher.valid_count = B_BATCH
+    batcher._proof_admission_count = B_BATCH + 1
+
+    reason = await svc._wait_for_window_seal()
+
+    assert reason == "duplicate_prompt_distinct_shortfall_drained"
+    assert batcher.is_sealed()
+    assert batcher.force_seal_reason == reason
+
+
+@pytest.mark.asyncio
+async def test_wait_for_window_seal_force_seals_sparse_valid_idle(monkeypatch):
+    """Sparse valid traffic should not wait for the long safety timeout."""
+    monkeypatch.setattr(
+        "reliquary.validator.service.SPARSE_VALID_IDLE_SEAL_SECONDS", 0.0,
+    )
+    monkeypatch.setattr(
+        "reliquary.validator.service.SPARSE_VALID_IDLE_MIN_DISTINCT_PROMPTS", 4,
+    )
+    svc = _make_service()
+    svc._open_window()
+    svc._activate_window()
+    batcher = svc._active_batcher
+    batcher._valid = [SimpleNamespace(prompt_idx=i) for i in range(4)]
+    batcher.valid_count = 4
+    batcher.last_valid_submission_at = batcher._time_fn() - 1.0
+    batcher.last_valid_submission_wall_ts = batcher._wall_clock() - 1.0
+
+    reason = await svc._wait_for_window_seal()
+
+    assert reason == "sparse_valid_idle_timeout"
+    assert batcher.is_sealed()
+    assert batcher.force_seal_reason == reason
+
+
+@pytest.mark.asyncio
+async def test_wait_for_window_seal_force_seals_sparse_valid_max_age(monkeypatch):
+    """Very sparse windows eventually seal even below the idle distinct floor."""
+    monkeypatch.setattr(
+        "reliquary.validator.service.SPARSE_VALID_MAX_WINDOW_SECONDS", 0.0,
+    )
+    svc = _make_service()
+    svc._open_window()
+    svc._activate_window()
+    batcher = svc._active_batcher
+    batcher._valid = [SimpleNamespace(prompt_idx=123)]
+    batcher.valid_count = 1
+    batcher.last_valid_submission_at = batcher._time_fn()
+    batcher.last_valid_submission_wall_ts = batcher._wall_clock()
+
+    reason = await svc._wait_for_window_seal()
+
+    assert reason == "sparse_valid_window_timeout"
+    assert batcher.is_sealed()
+    assert batcher.force_seal_reason == reason
 
 
 def test_open_window_empty_hash_pre_first_publish():

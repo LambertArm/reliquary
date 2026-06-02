@@ -30,7 +30,11 @@ from reliquary.constants import (
     POLL_INTERVAL_SECONDS,
     PPO_CLIP_EPSILON,
     MAX_PROOF_CANDIDATES_PER_WINDOW,
+    MAX_SEAL_QUEUE_DRAIN_SECONDS,
     PROOF_ADMISSION_STALL_POLL_SECONDS,
+    SPARSE_VALID_IDLE_MIN_DISTINCT_PROMPTS,
+    SPARSE_VALID_IDLE_SEAL_SECONDS,
+    SPARSE_VALID_MAX_WINDOW_SECONDS,
     SIGMA_MIN,
     SUBNET_START_BLOCK,
     VALIDATOR_HTTP_PORT,
@@ -509,7 +513,8 @@ class ValidationService:
         """True when bounded proof admission cannot fill this window anymore."""
         if batcher is None or batcher.is_sealed():
             return False
-        if getattr(batcher, "valid_count", 0) >= B_BATCH:
+        distinct_valid = self._distinct_valid_prompt_count(batcher)
+        if distinct_valid >= B_BATCH:
             return False
         if (
             getattr(batcher, "proof_admission_count", 0)
@@ -519,6 +524,76 @@ class ValidationService:
         queue_depth = int(getattr(self.server, "submit_queue_depth", 0) or 0)
         inflight = int(getattr(self.server, "proof_verification_inflight", 0) or 0)
         return queue_depth == 0 and inflight == 0
+
+    def _distinct_valid_prompt_count(self, batcher) -> int:
+        """Best-effort distinct prompt count for liveness decisions."""
+        counter = getattr(batcher, "distinct_valid_prompt_count", None)
+        if callable(counter):
+            return int(counter())
+        return int(getattr(batcher, "valid_count", 0) or 0)
+
+    def _duplicate_prompt_shortfall_drained(self, batcher) -> bool:
+        """True when duplicates filled raw submissions but not trainable slots."""
+        if batcher is None or batcher.is_sealed():
+            return False
+        if getattr(batcher, "_seal_trigger_round", None) is not None:
+            return False
+        valid_count = int(getattr(batcher, "valid_count", 0) or 0)
+        distinct_valid = self._distinct_valid_prompt_count(batcher)
+        if valid_count < B_BATCH or distinct_valid >= B_BATCH:
+            return False
+        queue_depth = int(getattr(self.server, "submit_queue_depth", 0) or 0)
+        inflight = int(getattr(self.server, "proof_verification_inflight", 0) or 0)
+        return queue_depth == 0 and inflight == 0
+
+    def _queue_and_proofs_drained(self) -> bool:
+        queue_depth = int(getattr(self.server, "submit_queue_depth", 0) or 0)
+        inflight = int(getattr(self.server, "proof_verification_inflight", 0) or 0)
+        return queue_depth == 0 and inflight == 0
+
+    def _seconds_since_last_valid_submission(self, batcher) -> float | None:
+        counter = getattr(batcher, "seconds_since_last_valid_submission", None)
+        if callable(counter):
+            return counter()
+        return None
+
+    def _window_open_age_seconds(self, batcher) -> float | None:
+        opened_at = getattr(batcher, "window_opened_at", None)
+        time_fn = getattr(batcher, "_time_fn", None)
+        if opened_at is None or not callable(time_fn):
+            return None
+        return max(0.0, float(time_fn()) - float(opened_at))
+
+    def _sparse_valid_liveness_reason(self, batcher) -> str | None:
+        """Return force-seal reason for sparse valid windows, if any.
+
+        This is a cadence guard, not a quality gate. It only fires when the
+        validator has some valid submissions, fewer than B distinct trainable
+        prompts, no queued/in-flight proof work, and either no valid progress
+        for the sparse idle threshold or an overlong sparse window.
+        """
+        if batcher is None or batcher.is_sealed():
+            return None
+        if getattr(batcher, "_seal_trigger_round", None) is not None:
+            return None
+        valid_count = int(getattr(batcher, "valid_count", 0) or 0)
+        distinct_valid = self._distinct_valid_prompt_count(batcher)
+        if valid_count <= 0 or distinct_valid >= B_BATCH:
+            return None
+        if not self._queue_and_proofs_drained():
+            return None
+
+        idle_s = self._seconds_since_last_valid_submission(batcher)
+        age_s = self._window_open_age_seconds(batcher)
+        if (
+            distinct_valid >= SPARSE_VALID_IDLE_MIN_DISTINCT_PROMPTS
+            and idle_s is not None
+            and idle_s >= SPARSE_VALID_IDLE_SEAL_SECONDS
+        ):
+            return "sparse_valid_idle_timeout"
+        if age_s is not None and age_s >= SPARSE_VALID_MAX_WINDOW_SECONDS:
+            return "sparse_valid_window_timeout"
+        return None
 
     async def _wait_for_window_seal(self) -> str:
         """Wait for a normal seal, timeout, or bounded-admission dead end.
@@ -537,16 +612,20 @@ class ValidationService:
 
         loop = asyncio.get_running_loop()
         deadline = loop.time() + WINDOW_TIMEOUT_SECONDS
+        duplicate_shortfall_since: float | None = None
         while True:
             if self._proof_admission_exhausted_and_drained(batcher):
                 reason = "proof_admission_exhausted_drained"
                 logger.warning(
                     "Window %d force-sealing partial: reason=%s "
-                    "valid=%d/%d proof_admission=%d/%d queue_depth=%d "
+                    "valid=%d/%d distinct_valid=%d/%d "
+                    "proof_admission=%d/%d queue_depth=%d "
                     "inflight_proofs=%d",
                     self._window_n,
                     reason,
                     getattr(batcher, "valid_count", 0),
+                    B_BATCH,
+                    self._distinct_valid_prompt_count(batcher),
                     B_BATCH,
                     getattr(batcher, "proof_admission_count", 0),
                     MAX_PROOF_CANDIDATES_PER_WINDOW,
@@ -555,6 +634,58 @@ class ValidationService:
                 )
                 batcher.force_seal(reason)
                 return reason
+
+            if self._duplicate_prompt_shortfall_drained(batcher):
+                now = loop.time()
+                if duplicate_shortfall_since is None:
+                    duplicate_shortfall_since = now
+                waited_s = now - duplicate_shortfall_since
+                if waited_s >= MAX_SEAL_QUEUE_DRAIN_SECONDS:
+                    reason = "duplicate_prompt_distinct_shortfall_drained"
+                    logger.warning(
+                        "Window %d force-sealing partial: reason=%s "
+                        "valid=%d/%d distinct_valid=%d/%d "
+                        "proof_admission=%d/%d queue_depth=%d "
+                        "inflight_proofs=%d waited_s=%.2f",
+                        self._window_n,
+                        reason,
+                        getattr(batcher, "valid_count", 0),
+                        B_BATCH,
+                        self._distinct_valid_prompt_count(batcher),
+                        B_BATCH,
+                        getattr(batcher, "proof_admission_count", 0),
+                        MAX_PROOF_CANDIDATES_PER_WINDOW,
+                        getattr(self.server, "submit_queue_depth", 0),
+                        getattr(self.server, "proof_verification_inflight", 0),
+                        waited_s,
+                    )
+                    batcher.force_seal(reason)
+                    return reason
+            else:
+                duplicate_shortfall_since = None
+
+            sparse_reason = self._sparse_valid_liveness_reason(batcher)
+            if sparse_reason is not None:
+                logger.warning(
+                    "Window %d force-sealing partial: reason=%s "
+                    "valid=%d/%d distinct_valid=%d/%d "
+                    "proof_admission=%d/%d queue_depth=%d "
+                    "inflight_proofs=%d idle_s=%s age_s=%s",
+                    self._window_n,
+                    sparse_reason,
+                    getattr(batcher, "valid_count", 0),
+                    B_BATCH,
+                    self._distinct_valid_prompt_count(batcher),
+                    B_BATCH,
+                    getattr(batcher, "proof_admission_count", 0),
+                    MAX_PROOF_CANDIDATES_PER_WINDOW,
+                    getattr(self.server, "submit_queue_depth", 0),
+                    getattr(self.server, "proof_verification_inflight", 0),
+                    self._seconds_since_last_valid_submission(batcher),
+                    self._window_open_age_seconds(batcher),
+                )
+                batcher.force_seal(sparse_reason)
+                return sparse_reason
 
             remaining = deadline - loop.time()
             if remaining <= 0:
