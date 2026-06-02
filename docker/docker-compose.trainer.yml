@@ -42,4 +42,6 @@ services:
 
 volumes:
   reliquary-state:
+    name: reliquary-state
   hf-cache:
+    name: hf-cache
