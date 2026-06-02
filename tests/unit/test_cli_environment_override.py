@@ -84,6 +84,19 @@ def test_env_var_takes_precedence_over_mix_default(monkeypatch):
     assert _get_environments_option_default(cli, "validate") == "openmathinstruct,opencodeinstruct"
 
 
+def test_opencode_miner_requires_grader_by_default(monkeypatch):
+    monkeypatch.delenv("RELIQUARY_OCI_PROMPT_ONLY", raising=False)
+    cli = _reload_cli_main()
+    assert cli._miner_requires_grader(["opencodeinstruct"]) is True
+    assert cli._miner_requires_grader(["openmathinstruct"]) is False
+
+
+def test_opencode_prompt_only_miner_skips_grader(monkeypatch):
+    monkeypatch.setenv("RELIQUARY_OCI_PROMPT_ONLY", "1")
+    cli = _reload_cli_main()
+    assert cli._miner_requires_grader(["openmathinstruct", "opencodeinstruct"]) is False
+
+
 @pytest.fixture(autouse=True)
 def _cleanup_module_cache():
     """Make sure each test re-imports cleanly — leaving a side-effecting

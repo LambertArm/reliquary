@@ -29,6 +29,10 @@ def _env_flag(name: str, default: str = "0") -> bool:
     return os.environ.get(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _miner_requires_grader(env_names: list[str]) -> bool:
+    return "opencodeinstruct" in env_names and not _env_flag("RELIQUARY_OCI_PROMPT_ONLY", "0")
+
+
 def _grader_bundle_python() -> Path:
     bundle = os.environ.get(
         "GRADER_BUNDLE_PATH",
@@ -178,8 +182,10 @@ def mine(
     )
 
     # Auto-launch only when the code environment is active.
-    if "opencodeinstruct" in env_names:
+    if _miner_requires_grader(env_names):
         _ensure_grader_running()
+    elif "opencodeinstruct" in env_names:
+        logger.info("OpenCode prompt-only miner mode enabled; skipping local grader launch.")
 
     async def _run():
         import bittensor as bt
