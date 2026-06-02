@@ -5,6 +5,8 @@ import socket
 import tempfile
 import threading
 
+import pytest
+
 
 def test_grader_is_running_returns_false_for_missing_socket(tmp_path):
     from reliquary.cli.main import _grader_is_running
@@ -14,7 +16,8 @@ def test_grader_is_running_returns_false_for_missing_socket(tmp_path):
 def test_grader_is_running_returns_true_when_listener_present(tmp_path):
     """Set up a real Unix socket listener — _grader_is_running should detect it."""
     from reliquary.cli.main import _grader_is_running
-    sock_path = str(tmp_path / "fake-grader.sock")
+    tmp = tempfile.TemporaryDirectory(prefix="g-", dir="/tmp")
+    sock_path = os.path.join(tmp.name, "g.sock")
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(sock_path)
     server.listen(1)
@@ -37,3 +40,16 @@ def test_grader_is_running_returns_true_when_listener_present(tmp_path):
             os.unlink(sock_path)
         except FileNotFoundError:
             pass
+        tmp.cleanup()
+
+
+def test_ensure_grader_refuses_unsandboxed_by_default(monkeypatch, tmp_path):
+    from reliquary.cli import main
+
+    monkeypatch.setattr(main, "_grader_is_running", lambda *a, **k: False)
+    monkeypatch.setattr(main.shutil, "which", lambda name: None)
+    monkeypatch.delenv("RELIQUARY_ALLOW_UNSANDBOXED_GRADER", raising=False)
+    monkeypatch.setenv("GRADER_BUNDLE_PATH", str(tmp_path / "missing-bundle"))
+
+    with pytest.raises(RuntimeError, match="requires the gVisor/runsc grader sandbox"):
+        main._ensure_grader_running()

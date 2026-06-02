@@ -1,9 +1,9 @@
 """Grader server — manages a warm pool of worker subprocesses.
 
-Listens on a Unix domain socket. Each client connection sends one
-JSON request line; the server picks an idle worker from the pool,
-pipes the request to its stdin, reads the response from stdout,
-and writes it back to the client.
+Listens on a Unix domain socket. Each client connection sends one JSON
+request line containing untrusted code and structured hidden cases. The
+server owns the hidden expected values and scoring; workers receive only
+code, an entrypoint, and call arguments.
 
 Workers are kept warm between requests: each is a long-lived
 subprocess of `worker.py`. If a worker dies (broken pipe) or
@@ -19,15 +19,17 @@ from __future__ import annotations
 import http.server
 import json
 import logging
+import math
 import os
 import queue
 import socket
 import subprocess
+import sys
 import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 from reliquary.constants import (
     GRADER_EVAL_TIMEOUT_SECONDS,
@@ -103,13 +105,13 @@ class GraderServer:
         pool_size: int = GRADER_POOL_SIZE,
         worker_argv: Optional[list[str]] = None,
         eval_timeout_s: float = GRADER_EVAL_TIMEOUT_SECONDS,
-        recycle_after_evals: int = 1000,
+        recycle_after_evals: int = 1,
         metrics_port: int = 9876,
     ) -> None:
         self.socket_path = socket_path
         self.pool_size = pool_size
         self.worker_argv = worker_argv or [
-            "python", "-m", "reliquary.environment.grader.worker"
+            sys.executable, "-m", "reliquary.environment.grader.worker"
         ]
         # Runsc mode: each worker needs a unique container id (see
         # GRADER_CONTAINER_ID_PLACEHOLDER). Track which slots have spawned
@@ -158,6 +160,7 @@ class GraderServer:
             pass
         self._listen_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._listen_sock.bind(self.socket_path)
+        os.chmod(self.socket_path, 0o660)
         self._listen_sock.listen(self.pool_size * 4)
 
         # Spawn workers.
@@ -177,15 +180,7 @@ class GraderServer:
             except Exception:
                 pass
         for w in self._workers:
-            try:
-                w.proc.kill()
-            except Exception:
-                pass
-            try:
-                w.proc.wait(timeout=2.0)
-            except Exception:
-                # subprocess never died within 2 s — best effort, move on.
-                pass
+            self._terminate_worker(w)
         if self._metrics_server is not None:
             try:
                 self._metrics_server.shutdown()
@@ -206,15 +201,14 @@ class GraderServer:
         if not self._uses_runsc:
             return self.worker_argv
         container_id = self._container_id_for_slot(slot)
-        if slot in self._spawned_slots:
-            try:
-                subprocess.run(
-                    [self.worker_argv[0], "delete", "--force", container_id],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    timeout=10.0,
-                )
-            except Exception:
-                pass
+        try:
+            subprocess.run(
+                [self.worker_argv[0], "delete", "--force", container_id],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=10.0,
+            )
+        except Exception:
+            pass
         self._spawned_slots.add(slot)
         return [
             container_id if a == GRADER_CONTAINER_ID_PLACEHOLDER else a
@@ -282,16 +276,68 @@ class GraderServer:
                 pass
 
     def _dispatch(self, req: dict) -> dict:
+        cases = req.get("cases")
+        req_id = req.get("req_id", "")
+        if not isinstance(cases, list) or not cases:
+            self._metrics.inc("grader_cases_missing_total")
+            return {
+                "req_id": req_id,
+                "passed": 0,
+                "total": 0,
+                "status": "grader_error",
+            }
+
         # Acquire a worker (blocks if all busy).
         try:
             w = self._idle.get(timeout=30.0)
         except queue.Empty:
             return {
-                "req_id": req.get("req_id", ""),
-                "passed": 0, "total": int(len(req.get("tests", []))), "status": "grader_error",
+                "req_id": req_id,
+                "passed": 0, "total": len(cases), "status": "grader_error",
             }
         try:
-            return self._evaluate_on_worker(w, req)
+            passed = 0
+            for i, case in enumerate(cases):
+                if not self._valid_case(case):
+                    self._metrics.inc("grader_case_total", {"status": "bad_case"})
+                    continue
+
+                worker_req = {
+                    "req_id": f"{req_id}:{i}",
+                    "code": req.get("code", ""),
+                    "entry": case["entry"],
+                    "args": case.get("args", []),
+                    "kwargs": case.get("kwargs", {}),
+                    "timeout_s": req.get("timeout_s", self.eval_timeout_s),
+                }
+                resp = self._evaluate_on_worker(w, worker_req)
+                status = resp.get("status", "grader_error")
+                if status == "ok":
+                    if self._outputs_match(resp.get("output"), case.get("expected"), case.get("compare", "exact")):
+                        passed += 1
+                        self._metrics.inc("grader_case_total", {"status": "passed"})
+                    else:
+                        self._metrics.inc("grader_case_total", {"status": "failed"})
+                    continue
+                if status == "bad_output":
+                    self._metrics.inc("grader_bad_output_total")
+                    self._metrics.inc("grader_case_total", {"status": "bad_output"})
+                    continue
+                if status == "forbidden_import":
+                    self._metrics.inc("grader_forbidden_import_total")
+                self._metrics.inc("grader_case_total", {"status": status})
+                return {
+                    "req_id": req_id,
+                    "passed": 0,
+                    "total": len(cases),
+                    "status": status,
+                }
+            return {
+                "req_id": req_id,
+                "passed": passed,
+                "total": len(cases),
+                "status": "ok",
+            }
         finally:
             # If worker was respawned (timeout/crash), the new one is already in
             # the idle queue. Otherwise return this one.
@@ -308,11 +354,11 @@ class GraderServer:
             w.proc.stdin.flush()
         except BrokenPipeError:
             # Worker died between checks. Respawn and return failure for this req.
-            self._respawn(w)
+            self._respawn(w, reason="death")
             self._metrics.inc("grader_eval_total", {"status": "crash"})
             return {
                 "req_id": req.get("req_id", ""),
-                "passed": 0, "total": int(len(req.get("tests", []))), "status": "crash",
+                "output": None, "status": "crash",
             }
 
         # Read response with wall-clock timeout (no asyncio — keep stdlib only).
@@ -330,24 +376,20 @@ class GraderServer:
 
         if t.is_alive():
             # Timeout: kill and respawn worker; return timeout status.
-            try:
-                w.proc.kill()
-            except Exception:
-                pass
-            self._respawn(w)
+            self._respawn(w, reason="timeout")
             self._metrics.inc("grader_eval_total", {"status": "timeout"})
             return {
                 "req_id": req.get("req_id", ""),
-                "passed": 0, "total": int(len(req.get("tests", []))), "status": "timeout",
+                "output": None, "status": "timeout",
             }
 
         line = line_holder.get("line", "")
         if not line:
-            self._respawn(w)
+            self._respawn(w, reason="death")
             self._metrics.inc("grader_eval_total", {"status": "crash"})
             return {
                 "req_id": req.get("req_id", ""),
-                "passed": 0, "total": int(len(req.get("tests", []))), "status": "crash",
+                "output": None, "status": "crash",
             }
         try:
             resp = json.loads(line)
@@ -355,19 +397,44 @@ class GraderServer:
             self._metrics.inc("grader_eval_total", {"status": "grader_error"})
             return {
                 "req_id": req.get("req_id", ""),
-                "passed": 0, "total": int(len(req.get("tests", []))), "status": "grader_error",
+                "output": None, "status": "grader_error",
             }
         self._metrics.inc("grader_eval_total", {"status": resp.get("status", "ok")})
         self._metrics.gauge_set("grader_pool_busy_workers", self.pool_size - self._idle.qsize())
         w.eval_count += 1
         return resp
 
-    def _respawn(self, w: Worker) -> None:
+    def _terminate_worker(self, w: Worker) -> None:
         try:
-            w.proc.kill()
+            if w.proc.poll() is None:
+                w.proc.kill()
         except Exception:
             pass
-        self._metrics.inc("grader_worker_restarts_total", {"reason": "death"})
+        try:
+            w.proc.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            try:
+                w.proc.kill()
+                w.proc.wait(timeout=2.0)
+            except Exception:
+                # Best effort: the supervisor will still try to replace the
+                # worker, and runsc delete below cleans up stale containers.
+                pass
+        except Exception:
+            pass
+        if self._uses_runsc:
+            try:
+                subprocess.run(
+                    [self.worker_argv[0], "delete", "--force", self._container_id_for_slot(w.slot)],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=10.0,
+                )
+            except Exception:
+                pass
+
+    def _respawn(self, w: Worker, reason: str = "death") -> None:
+        self._terminate_worker(w)
+        self._metrics.inc("grader_worker_restarts_total", {"reason": reason})
         try:
             self._spawn_worker(w.slot)
         except Exception:
@@ -381,8 +448,7 @@ class GraderServer:
     def _needs_recycle(self, w: Worker) -> bool:
         if w.eval_count >= self.recycle_after_evals:
             logger.info("grader: recycling worker slot=%d after %d evals", w.slot, w.eval_count)
-            self._metrics.inc("grader_worker_restarts_total", {"reason": "recycle"})
-            self._respawn(w)
+            self._respawn(w, reason="recycle")
             return True
         return False
 
@@ -391,6 +457,71 @@ class GraderServer:
         return json.dumps({
             "req_id": req_id, "passed": 0, "total": 0, "status": status,
         }).encode()
+
+    @classmethod
+    def _valid_case(cls, case: Any) -> bool:
+        if not isinstance(case, dict):
+            return False
+        entry = case.get("entry")
+        if not isinstance(entry, dict):
+            return False
+        kind = entry.get("kind")
+        if kind == "function":
+            if not isinstance(entry.get("name"), str):
+                return False
+        elif kind == "method":
+            if not isinstance(entry.get("class_name"), str) or not isinstance(entry.get("method"), str):
+                return False
+        else:
+            return False
+        if not isinstance(case.get("args", []), list):
+            return False
+        if not isinstance(case.get("kwargs", {}), dict):
+            return False
+        if case.get("compare", "exact") != "exact":
+            return False
+        if "expected" not in case:
+            return False
+        return cls._is_json_safe(case.get("expected"))
+
+    @classmethod
+    def _is_json_safe(cls, value: Any) -> bool:
+        if value is None or isinstance(value, (bool, str)):
+            return True
+        if isinstance(value, int) and not isinstance(value, bool):
+            return True
+        if isinstance(value, float):
+            return math.isfinite(value)
+        if isinstance(value, list):
+            return all(cls._is_json_safe(v) for v in value)
+        if isinstance(value, dict):
+            return all(isinstance(k, str) and cls._is_json_safe(v) for k, v in value.items())
+        return False
+
+    @classmethod
+    def _outputs_match(cls, output: Any, expected: Any, compare: str) -> bool:
+        if compare != "exact":
+            return False
+        return cls._json_equal(output, expected)
+
+    @classmethod
+    def _json_equal(cls, left: Any, right: Any) -> bool:
+        if isinstance(left, bool) or isinstance(right, bool):
+            return type(left) is type(right) and left == right
+        if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+            if isinstance(left, float) or isinstance(right, float):
+                return math.isclose(float(left), float(right), rel_tol=1e-6, abs_tol=1e-9)
+            return left == right
+        if left is None or right is None or isinstance(left, str) or isinstance(right, str):
+            return type(left) is type(right) and left == right
+        if isinstance(left, list) and isinstance(right, list):
+            return len(left) == len(right) and all(cls._json_equal(a, b) for a, b in zip(left, right))
+        if isinstance(left, dict) and isinstance(right, dict):
+            return (
+                set(left.keys()) == set(right.keys())
+                and all(cls._json_equal(left[k], right[k]) for k in left)
+            )
+        return False
 
 
 def main() -> None:
@@ -405,6 +536,12 @@ def main() -> None:
         "--use-runsc", action="store_true",
         help="Wrap each worker in `runsc` (production mode).",
     )
+    parser.add_argument(
+        "--metrics-port",
+        type=int,
+        default=int(os.environ.get("GRADER_METRICS_PORT", "9876")),
+        help="Loopback Prometheus metrics port; use 0 for an ephemeral port.",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO)
@@ -418,13 +555,14 @@ def main() -> None:
         worker_argv = ["runsc", "--network=none", "run",
                        "--bundle", bundle, GRADER_CONTAINER_ID_PLACEHOLDER]
     else:
-        worker_argv = ["python", "-m", "reliquary.environment.grader.worker"]
+        worker_argv = [sys.executable, "-m", "reliquary.environment.grader.worker"]
 
     server = GraderServer(
         socket_path=args.socket,
         pool_size=args.pool_size,
         worker_argv=worker_argv,
         eval_timeout_s=args.timeout,
+        metrics_port=args.metrics_port,
     )
     server.start()
     logger.info("grader server listening on %s (pool=%d)", args.socket, args.pool_size)

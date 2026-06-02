@@ -6,12 +6,13 @@ Filters in order:
      tests (average_test_score < 1.0).
   2. Parse the unit_tests column (string-encoded list) — drop on
      parse failure.
-  3. Drop rows containing any test that imports/uses a non-
-     deterministic stdlib module (random, time, socket, ...).
-  4. Run a double-execution check on what remains (twice with
-     different PYTHONHASHSEED) — drop on mismatch.
+  3. Convert simple deterministic asserts into structured black-box
+     cases. Hidden assertion source is never stored in the output.
+  4. Run a double-execution check on the reference solution using the
+     structured cases (twice with different PYTHONHASHSEED) — drop on
+     mismatch.
   5. Push the resulting subset to HF Hub as
-     reliquadotai/opencodeinstruct-deterministic-subset.
+     reliquadotai/opencodeinstruct-structured-subset.
 
 Designed so the per-row filter functions are pure-Python and
 testable without HuggingFace, network, or subprocess.
@@ -20,15 +21,21 @@ testable without HuggingFace, network, or subprocess.
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import logging
 import os
 import re
 import subprocess
 import sys
-from typing import Optional
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
+
+_FENCE_RE = re.compile(
+    r"(```|~~~)(?:python3?|py)?\s*\n(.*?)\n\1",
+    re.DOTALL,
+)
 
 
 # Conservative regex: any of these tokens anywhere in the test code
@@ -66,29 +73,175 @@ def filter_tests(tests: list[str]) -> list[str]:
     return [t for t in tests if not has_nondeterministic_pattern(t)]
 
 
+def extract_reference_code(output: str) -> str:
+    """Return executable Python from a reference-solution field.
+
+    OpenCodeInstruct rows often wrap solutions in Markdown fences. The
+    structured-case builder must execute the code itself, not the fence text,
+    when checking that kept rows are deterministic and self-consistent.
+    """
+    if not output:
+        return ""
+    matches = _FENCE_RE.findall(output)
+    if matches:
+        return matches[-1][1]
+    return output
+
+
 def keep_row(row: dict) -> bool:
     """Stage-1 filter: reference solution must pass all its own tests."""
     return float(row.get("average_test_score", 0.0)) >= 1.0
 
 
-def double_execute(code: str, tests: list[str]) -> bool:
-    """Run (code, tests) twice with different PYTHONHASHSEEDs.
+def _json_safe_literal(node: ast.AST) -> Any:
+    value = ast.literal_eval(node)
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, tuple):
+        return [_json_safe_value(v) for v in value]
+    return _json_safe_value(value)
 
-    Returns True iff both runs yield the same passed count.
+
+def _json_safe_value(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_value(v) for v in value]
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            if not isinstance(k, str):
+                raise ValueError("dict keys must be strings")
+            out[k] = _json_safe_value(v)
+        return out
+    raise ValueError(f"unsupported literal type: {type(value).__name__}")
+
+
+def _call_to_case(call: ast.Call, expected: Any) -> Optional[dict]:
+    entry: dict[str, str]
+    if isinstance(call.func, ast.Name):
+        entry = {"kind": "function", "name": call.func.id}
+    elif (
+        isinstance(call.func, ast.Attribute)
+        and isinstance(call.func.value, ast.Call)
+        and isinstance(call.func.value.func, ast.Name)
+        and not call.func.value.args
+        and not call.func.value.keywords
+    ):
+        entry = {
+            "kind": "method",
+            "class_name": call.func.value.func.id,
+            "method": call.func.attr,
+        }
+    else:
+        return None
+
+    try:
+        args = [_json_safe_literal(a) for a in call.args]
+        kwargs = {
+            kw.arg: _json_safe_literal(kw.value)
+            for kw in call.keywords
+            if kw.arg is not None
+        }
+    except (ValueError, TypeError):
+        return None
+    if len(kwargs) != len(call.keywords):
+        return None
+    return {
+        "entry": entry,
+        "args": args,
+        "kwargs": kwargs,
+        "expected": expected,
+        "compare": "exact",
+    }
+
+
+def structure_test(test_src: str) -> Optional[dict]:
+    """Convert one simple assert into a structured case.
+
+    Supported forms:
+      * assert fn(args...) == literal
+      * assert literal == fn(args...)
+      * assert fn(args...)
+      * assert not fn(args...)
+      * same call shapes for Solution().method(args...)
+    """
+    try:
+        mod = ast.parse(test_src, mode="exec")
+    except SyntaxError:
+        return None
+    if any(isinstance(n, (ast.Import, ast.ImportFrom)) for n in ast.walk(mod)):
+        return None
+    if len(mod.body) != 1 or not isinstance(mod.body[0], ast.Assert):
+        return None
+    expr = mod.body[0].test
+
+    if isinstance(expr, ast.Compare) and len(expr.ops) == 1 and isinstance(expr.ops[0], ast.Eq):
+        left = expr.left
+        right = expr.comparators[0]
+        if isinstance(left, ast.Call):
+            try:
+                expected = _json_safe_literal(right)
+            except (ValueError, TypeError):
+                return None
+            return _call_to_case(left, expected)
+        if isinstance(right, ast.Call):
+            try:
+                expected = _json_safe_literal(left)
+            except (ValueError, TypeError):
+                return None
+            return _call_to_case(right, expected)
+        return None
+
+    if isinstance(expr, ast.Call):
+        return _call_to_case(expr, True)
+
+    if isinstance(expr, ast.UnaryOp) and isinstance(expr.op, ast.Not) and isinstance(expr.operand, ast.Call):
+        return _call_to_case(expr.operand, False)
+
+    return None
+
+
+def structure_tests(tests: list[str]) -> list[dict]:
+    cases = []
+    for test in filter_tests(tests):
+        case = structure_test(test)
+        if case is not None:
+            cases.append(case)
+    return cases
+
+
+def double_execute(code: str, cases: list[dict]) -> bool:
+    """Run (code, structured cases) twice with different PYTHONHASHSEEDs.
+
+    Returns True iff both runs pass every structured case.
     """
     runner = (
-        "import json,sys\n"
+        "import json,math,sys\n"
         "data=json.loads(sys.stdin.read())\n"
         "ns={}\n"
         "try: exec(data['code'], ns)\n"
         "except: pass\n"
+        "def eq(a,b):\n"
+        "    if isinstance(a,bool) or isinstance(b,bool): return type(a) is type(b) and a==b\n"
+        "    if isinstance(a,(int,float)) and isinstance(b,(int,float)):\n"
+        "        return math.isclose(float(a),float(b),rel_tol=1e-6,abs_tol=1e-9) if (isinstance(a,float) or isinstance(b,float)) else a==b\n"
+        "    if isinstance(a,list) and isinstance(b,list): return len(a)==len(b) and all(eq(x,y) for x,y in zip(a,b))\n"
+        "    if isinstance(a,dict) and isinstance(b,dict): return set(a)==set(b) and all(eq(a[k],b[k]) for k in a)\n"
+        "    return type(a) is type(b) and a==b\n"
+        "def call(c):\n"
+        "    e=c['entry']\n"
+        "    if e['kind']=='function': fn=ns[e['name']]\n"
+        "    else: fn=getattr(ns[e['class_name']](), e['method'])\n"
+        "    return fn(*c.get('args',[]), **c.get('kwargs',{}))\n"
         "p=0\n"
-        "for t in data['tests']:\n"
-        "    try: exec(t, dict(ns)); p+=1\n"
+        "for c in data['cases']:\n"
+        "    try:\n"
+        "        p += 1 if eq(call(c), c.get('expected')) else 0\n"
         "    except: pass\n"
         "print(p)\n"
     )
-    payload = json.dumps({"code": code, "tests": tests})
+    payload = json.dumps({"code": code, "cases": cases})
     out_seed0 = subprocess.run(
         [sys.executable, "-c", runner], input=payload, capture_output=True, text=True,
         env={**os.environ, "PYTHONHASHSEED": "0"}, timeout=30,
@@ -97,26 +250,31 @@ def double_execute(code: str, tests: list[str]) -> bool:
         [sys.executable, "-c", runner], input=payload, capture_output=True, text=True,
         env={**os.environ, "PYTHONHASHSEED": "1"}, timeout=30,
     )
-    return out_seed0.stdout.strip() == out_seed1.stdout.strip()
+    expected = str(len(cases))
+    return out_seed0.stdout.strip() == expected and out_seed1.stdout.strip() == expected
 
 
 def process_row(row: dict) -> Optional[dict]:
     """Apply all filters to one row. Return the kept row (with
-    `unit_tests_parsed` added) or None to drop."""
+    `structured_cases` added) or None to drop."""
     if not keep_row(row):
         return None
     tests = parse_unit_tests(row.get("unit_tests", ""))
     if tests is None:
         return None
-    kept_tests = filter_tests(tests)
-    if not kept_tests:
+    cases = structure_tests(tests)
+    if not cases:
         return None
-    if not double_execute(row.get("output", ""), kept_tests):
+    code = extract_reference_code(row.get("output", ""))
+    if not double_execute(code, cases):
         return None
     return {
         "input": row["input"],
-        "output": row.get("output", ""),
-        "unit_tests_parsed": kept_tests,
+        "output": code,
+        # Store as JSON text to avoid Arrow union-type problems: expected
+        # values can be ints, bools, strings, lists, dicts, or null across
+        # rows. The runtime environment parses this field back into cases.
+        "structured_cases": json.dumps(cases, sort_keys=True, separators=(",", ":")),
         "id": row.get("id", ""),
     }
 
@@ -124,7 +282,7 @@ def process_row(row: dict) -> Optional[dict]:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", default="nvidia/OpenCodeInstruct")
-    parser.add_argument("--target-repo", default="reliquadotai/opencodeinstruct-deterministic-subset")
+    parser.add_argument("--target-repo", default="reliquadotai/opencodeinstruct-structured-subset")
     parser.add_argument("--max-rows", type=int, default=None,
                         help="Cap on rows to process — for dry-runs.")
     parser.add_argument("--push", action="store_true",

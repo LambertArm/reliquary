@@ -26,10 +26,8 @@ def test_load_env_and_get_problem_shape():
     assert "prompt" in p and "ground_truth" in p and "id" in p
     assert len(p["id"]) == 16
 
-    import json
-    tests = json.loads(p["ground_truth"])
-    assert isinstance(tests, list) and len(tests) > 0
-    assert all(isinstance(t, str) for t in tests)
+    assert isinstance(p["ground_truth"], str)
+    assert len(p["ground_truth"]) == 16
 
 
 def test_compute_reward_zero_when_grader_unreachable(monkeypatch):

@@ -7,8 +7,10 @@ import os
 import shutil
 import socket as _socket
 import subprocess
+import sys
 import threading
 import time as _time
+from pathlib import Path
 
 import typer
 
@@ -21,6 +23,18 @@ app = typer.Typer(name="reliquary", help="Reliquary — Verifiable Inference Sub
 logger = logging.getLogger(__name__)
 
 _grader_proc: "subprocess.Popen | None" = None
+
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _grader_bundle_python() -> Path:
+    bundle = os.environ.get(
+        "GRADER_BUNDLE_PATH",
+        "/opt/reliquary/reliquary/environment/grader/bundle",
+    )
+    return Path(bundle) / "rootfs" / "usr" / "local" / "bin" / "python3"
 
 
 def _grader_is_running(socket_path: str, timeout: float = 0.5) -> bool:
@@ -42,9 +56,8 @@ def _ensure_grader_running(use_runsc: "bool | None" = None) -> None:
     the validator rejects every OCI submission as a reward-claim mismatch.
 
     If `use_runsc` is None, auto-detect: use runsc when both the binary
-    and the OCI bundle are present; otherwise fall back to plain Python
-    workers (sufficient for dev / single-host testing; production miners
-    should install runsc for deterministic-with-validator reward parity).
+    and the OCI bundle are present. Plain Python fallback is refused unless
+    RELIQUARY_ALLOW_UNSANDBOXED_GRADER=1 is set for an isolated lab.
     """
     global _grader_proc
     from reliquary.constants import GRADER_SOCKET_PATH
@@ -56,25 +69,40 @@ def _ensure_grader_running(use_runsc: "bool | None" = None) -> None:
         return
 
     if use_runsc is None:
-        bundle_python = (
-            "/opt/reliquary/reliquary/environment/grader/bundle/"
-            "rootfs/usr/local/bin/python3"
-        )
-        use_runsc = bool(shutil.which("runsc")) and os.path.exists(bundle_python)
+        use_runsc = bool(shutil.which("runsc")) and _grader_bundle_python().exists()
     if not use_runsc:
-        _logger.warning(
-            "Grader will run WITHOUT runsc — rewards may diverge from the "
-            "validator on edge cases. Install runsc + build the bundle "
-            "(scripts/build_grader_bundle.sh) for production miners."
-        )
+        if not _env_flag("RELIQUARY_ALLOW_UNSANDBOXED_GRADER", "0"):
+            raise RuntimeError(
+                "opencodeinstruct requires the gVisor/runsc grader sandbox. "
+                "Install runsc and build the grader bundle, or set "
+                "RELIQUARY_ALLOW_UNSANDBOXED_GRADER=1 only on isolated throwaway labs."
+            )
+        _logger.warning("Launching UNSANDBOXED grader because RELIQUARY_ALLOW_UNSANDBOXED_GRADER=1 is set.")
 
-    cmd = ["python", "-m", "reliquary.environment.grader.server"]
+    cmd = [sys.executable, "-m", "reliquary.environment.grader.server"]
     if use_runsc:
         cmd.append("--use-runsc")
 
-    _logger.info("Launching grader server (use_runsc=%s) ...", use_runsc)
+    sanitized_env = {
+        "PATH": os.environ.get("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
+        "PYTHONPATH": os.environ.get("PYTHONPATH", ""),
+        "PYTHONUNBUFFERED": "1",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "HOME": os.environ.get("GRADER_HOME", "/tmp/reliquary-grader-home"),
+        "GRADER_SOCKET_PATH": GRADER_SOCKET_PATH,
+        "GRADER_BUNDLE_PATH": os.environ.get(
+            "GRADER_BUNDLE_PATH",
+            "/opt/reliquary/reliquary/environment/grader/bundle",
+        ),
+    }
+
+    _logger.info("Launching grader server (use_runsc=%s, scrubbed_env=1) ...", use_runsc)
     _grader_proc = subprocess.Popen(
-        cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=sanitized_env,
+        start_new_session=True,
     )
 
     def _cleanup() -> None:
@@ -149,10 +177,9 @@ def mine(
         network, netuid, env_names,
     )
 
-    # Auto-launch the grader server so reward computation works for
-    # OpenCodeInstruct prompts out of the box. Idempotent: skipped if
-    # one's already listening.
-    _ensure_grader_running()
+    # Auto-launch only when the code environment is active.
+    if "opencodeinstruct" in env_names:
+        _ensure_grader_running()
 
     async def _run():
         import bittensor as bt
@@ -314,10 +341,9 @@ def validate(
     os.environ["BT_NETWORK"] = network
     os.environ["NETUID"] = str(netuid)
 
-    if train:
-        _ensure_grader_running()
-
     env_names = [n.strip() for n in environments.split(",") if n.strip()]
+    if train and "opencodeinstruct" in env_names:
+        _ensure_grader_running()
     if train:
         logger.info(
             "Starting Reliquary validator [trainer] (network=%s, netuid=%d, envs=%s, http=%s:%d)",

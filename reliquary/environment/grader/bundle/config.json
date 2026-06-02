@@ -2,7 +2,7 @@
   "ociVersion": "1.0.2",
   "process": {
     "terminal": false,
-    "user": {"uid": 0, "gid": 0},
+    "user": {"uid": 65534, "gid": 65534},
     "args": ["/usr/local/bin/python3", "/opt/worker.py"],
     "env": [
       "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -32,7 +32,7 @@
       "destination": "/tmp",
       "type": "tmpfs",
       "source": "tmpfs",
-      "options": ["nosuid", "noexec", "nodev", "size=10m"]
+      "options": ["mode=1777", "nosuid", "noexec", "nodev", "size=10m"]
     },
     {
       "destination": "/proc",
@@ -44,6 +44,23 @@
     "namespaces": [
       {"type": "pid"}, {"type": "ipc"}, {"type": "uts"},
       {"type": "mount"}, {"type": "network"}
+    ],
+    "maskedPaths": [
+      "/proc/acpi",
+      "/proc/asound",
+      "/proc/kcore",
+      "/proc/keys",
+      "/proc/latency_stats",
+      "/proc/scsi",
+      "/proc/timer_list",
+      "/sys/firmware"
+    ],
+    "readonlyPaths": [
+      "/proc/bus",
+      "/proc/fs",
+      "/proc/irq",
+      "/proc/sys",
+      "/proc/sysrq-trigger"
     ]
   }
 }

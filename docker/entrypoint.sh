@@ -49,7 +49,8 @@ if [[ ! -S "/tmp/reliquary-grader.sock" ]]; then
   echo "[entrypoint] FATAL: grader socket /tmp/reliquary-grader.sock never appeared within 15s" >&2
   exit 1
 fi
-chmod 666 /tmp/reliquary-grader.sock
+chown 1001:1000 /tmp/reliquary-grader.sock
+chmod 660 /tmp/reliquary-grader.sock
 
 # ── Build the validator argv ─────────────────────────────────────────────
 args=(

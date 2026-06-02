@@ -1,8 +1,8 @@
 """Unix-socket IPC client for the grader server.
 
 Used by OpenCodeInstructEnvironment.compute_reward to dispatch
-evaluation requests. Frames JSON-lines over SOCK_STREAM. Retries
-once on transient connection failures, then returns 0.0 — the
+structured case evaluation requests. Frames JSON-lines over SOCK_STREAM.
+Retries once on transient connection failures, then returns 0.0 — the
 Environment Protocol forbids raising from compute_reward.
 """
 
@@ -13,7 +13,7 @@ import logging
 import socket
 import time
 import uuid
-from typing import Optional
+from typing import Any
 
 from reliquary.constants import GRADER_SOCKET_PATH
 
@@ -38,18 +38,20 @@ class GraderClient:
     def __init__(self, socket_path: str = GRADER_SOCKET_PATH) -> None:
         self.socket_path = socket_path
 
-    def evaluate(self, code: str, tests: list[str], timeout_s: float) -> float:
-        """Send (code, tests) to the grader, return passed/total in [0, 1].
+    def evaluate_cases(self, code: str, cases: list[dict[str, Any]], timeout_s: float) -> float:
+        """Send (code, structured cases) and return passed/total in [0, 1].
 
         Returns 0.0 if the grader is unreachable, the response is
         malformed, the worker timed out, the worker crashed, or
         total is zero. Never raises.
         """
+        if not isinstance(cases, list) or not cases:
+            return 0.0
         response: dict = {}
         req = {
             "req_id": uuid.uuid4().hex,
             "code": code,
-            "tests": tests,
+            "cases": cases,
             "timeout_s": timeout_s,
         }
         # One retry with short backoff for transient failures (grader

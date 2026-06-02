@@ -534,7 +534,7 @@ GRADER_SOCKET_PATH = "/tmp/reliquary-grader.sock"
 # concurrent submissions. Increase for high-throughput validators.
 GRADER_POOL_SIZE = M_ROLLOUTS
 
-# Wall-clock timeout (seconds) for one `(code, tests)` evaluation.
+# Wall-clock timeout (seconds) for one structured OpenCode evaluation.
 # Subprocess inside the sandbox is killed if it exceeds this. Tuned
 # so that pathological miner code (infinite loops, slow algorithms)
 # fails fast without blocking the queue.

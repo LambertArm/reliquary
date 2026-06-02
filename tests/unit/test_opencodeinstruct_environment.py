@@ -72,6 +72,45 @@ def test_extract_python_rejects_mismatched_fence_styles():
     assert _extract_python(text) == text
 
 
+def test_load_subset_dataset_uses_load_from_disk_for_saved_dataset(tmp_path):
+    from reliquary.environment.opencodeinstruct import _load_subset_dataset
+
+    (tmp_path / "dataset_info.json").write_text("{}")
+    (tmp_path / "state.json").write_text("{}")
+
+    class _FakeHF:
+        def __init__(self):
+            self.calls = []
+        def load_from_disk(self, path):
+            self.calls.append(("disk", path))
+            return ["disk"]
+        def load_dataset(self, repo, split):
+            self.calls.append(("hub", repo, split))
+            return ["hub"]
+
+    hf = _FakeHF()
+    assert _load_subset_dataset(str(tmp_path), hf_module=hf) == ["disk"]
+    assert hf.calls == [("disk", str(tmp_path))]
+
+
+def test_load_subset_dataset_uses_hub_for_repo_id():
+    from reliquary.environment.opencodeinstruct import _load_subset_dataset
+
+    class _FakeHF:
+        def __init__(self):
+            self.calls = []
+        def load_from_disk(self, path):
+            self.calls.append(("disk", path))
+            return ["disk"]
+        def load_dataset(self, repo, split):
+            self.calls.append(("hub", repo, split))
+            return ["hub"]
+
+    hf = _FakeHF()
+    assert _load_subset_dataset("owner/repo", hf_module=hf) == ["hub"]
+    assert hf.calls == [("hub", "owner/repo", "train")]
+
+
 # ---------------------------------------------------------------------------
 # OpenCodeInstructEnvironment — exercised with a stub dataset and a
 # fake grader client. The real HF dataset and grader are covered by
@@ -92,9 +131,19 @@ class _FakeGraderClient:
     def __init__(self, response: float):
         self.response = response
         self.calls = []
-    def evaluate(self, code, tests, timeout_s):
-        self.calls.append((code, tests, timeout_s))
+    def evaluate_cases(self, code, cases, timeout_s):
+        self.calls.append((code, cases, timeout_s))
         return self.response
+
+
+def _case(expected=3):
+    return {
+        "entry": {"kind": "function", "name": "add"},
+        "args": [1, 2],
+        "kwargs": {},
+        "expected": expected,
+        "compare": "exact",
+    }
 
 
 def _env_with(dataset_rows, grader_response=1.0):
@@ -106,33 +155,34 @@ def _env_with(dataset_rows, grader_response=1.0):
     env = OpenCodeInstructEnvironment.__new__(OpenCodeInstructEnvironment)
     env._dataset = _FakeDataset(dataset_rows)
     env._grader = _FakeGraderClient(grader_response)
+    env._cases_by_id = {}
     return env
 
 
 def test_get_problem_shape():
     rows = [{
         "input": "Write a function add(a, b) returning their sum.",
-        "unit_tests_parsed": ["assert add(1, 2) == 3", "assert add(0, 0) == 0"],
+        "structured_cases": [_case()],
     }]
     env = _env_with(rows)
     p = env.get_problem(0)
     assert p["prompt"] == "Write a function add(a, b) returning their sum."
     assert isinstance(p["ground_truth"], str)
-    import json as _json
-    assert _json.loads(p["ground_truth"]) == ["assert add(1, 2) == 3", "assert add(0, 0) == 0"]
+    assert p["ground_truth"] in env._cases_by_id
+    assert env._cases_by_id[p["ground_truth"]] == [_case()]
     assert len(p["id"]) == 16
 
 
 def test_get_problem_id_is_deterministic():
-    rows = [{"input": "Same prompt", "unit_tests_parsed": ["assert True"]}]
+    rows = [{"input": "Same prompt", "structured_cases": [_case()]}]
     env = _env_with(rows)
     assert env.get_problem(0)["id"] == env.get_problem(0)["id"]
 
 
 def test_get_problem_modulo_wrap():
     rows = [
-        {"input": "p0", "unit_tests_parsed": ["assert True"]},
-        {"input": "p1", "unit_tests_parsed": ["assert True"]},
+        {"input": "p0", "structured_cases": [_case()]},
+        {"input": "p1", "structured_cases": [_case()]},
     ]
     env = _env_with(rows)
     assert env.get_problem(0)["prompt"] == "p0"
@@ -140,18 +190,18 @@ def test_get_problem_modulo_wrap():
 
 
 def test_compute_reward_delegates_to_grader():
-    rows = [{"input": "...", "unit_tests_parsed": ["assert f() == 1"]}]
+    rows = [{"input": "...", "structured_cases": [_case()]}]
     env = _env_with(rows, grader_response=0.6)
     p = env.get_problem(0)
     completion = "```python\ndef f(): return 1\n```"
     r = env.compute_reward(p, completion)
     assert r == 0.6
     assert env._grader.calls[0][0] == "def f(): return 1"
-    assert env._grader.calls[0][1] == ["assert f() == 1"]
+    assert env._grader.calls[0][1] == [_case()]
 
 
 def test_compute_reward_never_raises_on_garbled_problem():
-    rows = [{"input": "x", "unit_tests_parsed": ["assert True"]}]
+    rows = [{"input": "x", "structured_cases": [_case()]}]
     env = _env_with(rows, grader_response=0.0)
     r = env.compute_reward({"ground_truth": "not-json"}, "any completion")
     assert r == 0.0
@@ -162,10 +212,8 @@ def test_environment_name_constant():
     assert OpenCodeInstructEnvironment.name == "opencodeinstruct"
 
 
-def test_compute_reward_returns_zero_for_valid_json_non_list_ground_truth():
-    """Ground truth that JSON-parses to a non-list (e.g. number, dict)
-    must score 0 without raising."""
-    rows = [{"input": "x", "unit_tests_parsed": ["assert True"]}]
+def test_compute_reward_returns_zero_for_unknown_case_id():
+    rows = [{"input": "x", "structured_cases": [_case()]}]
     env = _env_with(rows, grader_response=0.0)
     assert env.compute_reward({"ground_truth": "42"}, "any completion") == 0.0
     assert env.compute_reward({"ground_truth": '{"key": "val"}'}, "any completion") == 0.0
@@ -173,7 +221,7 @@ def test_compute_reward_returns_zero_for_valid_json_non_list_ground_truth():
 
 def test_compute_reward_handles_none_completion():
     """compute_reward accepts None as completion (`completion or ''` guard)."""
-    rows = [{"input": "x", "unit_tests_parsed": ["assert True"]}]
+    rows = [{"input": "x", "structured_cases": [_case()]}]
     env = _env_with(rows, grader_response=0.0)
     p = env.get_problem(0)
     # Should not raise; returns whatever the grader returns for empty code.
@@ -216,4 +264,4 @@ def test_load_environments_returns_dict(monkeypatch):
 def test_load_environments_unknown_name_raises():
     from reliquary.environment import load_environments
     with pytest.raises(ValueError, match="Unknown environment"):
-        load_environments(["openmathinstruct", "nope"])
+        load_environments(["nope"])
