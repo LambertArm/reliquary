@@ -11,7 +11,7 @@ Filters in order:
   4. Run a double-execution check on the reference solution using the
      structured cases (twice with different PYTHONHASHSEED) — drop on
      mismatch.
-  5. Push the resulting subset to HF Hub as
+  5. Push the resulting private subset to HF Hub as
      reliquadotai/opencodeinstruct-structured-subset.
 
 Designed so the per-row filter functions are pure-Python and
@@ -254,7 +254,7 @@ def double_execute(code: str, cases: list[dict]) -> bool:
     return out_seed0.stdout.strip() == expected and out_seed1.stdout.strip() == expected
 
 
-def process_row(row: dict) -> Optional[dict]:
+def process_row(row: dict, *, include_reference_output: bool = False) -> Optional[dict]:
     """Apply all filters to one row. Return the kept row (with
     `structured_cases` added) or None to drop."""
     if not keep_row(row):
@@ -268,15 +268,17 @@ def process_row(row: dict) -> Optional[dict]:
     code = extract_reference_code(row.get("output", ""))
     if not double_execute(code, cases):
         return None
-    return {
+    out = {
         "input": row["input"],
-        "output": code,
         # Store as JSON text to avoid Arrow union-type problems: expected
         # values can be ints, bools, strings, lists, dicts, or null across
         # rows. The runtime environment parses this field back into cases.
         "structured_cases": json.dumps(cases, sort_keys=True, separators=(",", ":")),
         "id": row.get("id", ""),
     }
+    if include_reference_output:
+        out["output"] = code
+    return out
 
 
 def main() -> None:
@@ -285,10 +287,21 @@ def main() -> None:
     parser.add_argument("--target-repo", default="reliquadotai/opencodeinstruct-structured-subset")
     parser.add_argument("--max-rows", type=int, default=None,
                         help="Cap on rows to process — for dry-runs.")
+    parser.add_argument("--target-kept", type=int, default=None,
+                        help="Stop once this many filtered rows have been kept.")
+    parser.add_argument("--output-dir", default="./opencodeinstruct-subset",
+                        help="Local save_to_disk path when --push is not used.")
     parser.add_argument("--push", action="store_true",
                         help="Push to HF Hub (requires HF_TOKEN).")
+    parser.add_argument("--public", action="store_true",
+                        help="Make the pushed dataset public. Default is private.")
+    parser.add_argument("--include-reference-output", action="store_true",
+                        help="Include reference solutions. Do not use for production.")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
+    logging.getLogger("datasets").setLevel(logging.WARNING)
 
     import datasets as hf
     ds = hf.load_dataset(args.source, split="train", streaming=True)
@@ -298,24 +311,30 @@ def main() -> None:
     for i, row in enumerate(ds):
         if args.max_rows is not None and i >= args.max_rows:
             break
-        out = process_row(row)
+        out = process_row(row, include_reference_output=args.include_reference_output)
         if out:
             kept.append(out)
+            if args.target_kept is not None and len(kept) >= args.target_kept:
+                break
         if i % 1000 == 0:
             logger.info("processed=%d kept=%d", i, len(kept))
 
     logger.info("final: processed=%d kept=%d", i + 1, len(kept))
     out_ds = hf.Dataset.from_list(kept)
 
+    if args.output_dir:
+        out_ds.save_to_disk(args.output_dir)
+        logger.info("saved locally to %s", args.output_dir)
+
     if args.push:
         token = os.environ.get("HF_TOKEN")
         if not token:
             raise RuntimeError("HF_TOKEN env var is required to push.")
-        out_ds.push_to_hub(args.target_repo, token=token, private=False)
-        logger.info("pushed %d rows to %s", len(kept), args.target_repo)
-    else:
-        out_ds.save_to_disk("./opencodeinstruct-subset")
-        logger.info("saved locally to ./opencodeinstruct-subset")
+        out_ds.push_to_hub(args.target_repo, token=token, private=not args.public)
+        logger.info(
+            "pushed %d rows to %s private=%s",
+            len(kept), args.target_repo, not args.public,
+        )
 
 
 if __name__ == "__main__":

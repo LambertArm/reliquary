@@ -141,10 +141,11 @@ def test_process_row_outputs_structured_cases_only(monkeypatch):
     assert out is not None
     assert "structured_cases" in out
     assert "unit_tests_parsed" not in out
+    assert "output" not in out
     assert json.loads(out["structured_cases"])[0]["expected"] == 3
 
 
-def test_process_row_extracts_fenced_reference_solution():
+def test_process_row_extracts_fenced_reference_solution_without_publishing_it():
     from scripts import build_opencodeinstruct_subset as subset
 
     row = {
@@ -154,6 +155,21 @@ def test_process_row_extracts_fenced_reference_solution():
         "output": "```python\ndef add(a, b):\n    return a + b\n```",
     }
     out = subset.process_row(row)
+    assert out is not None
+    assert "output" not in out
+    assert json.loads(out["structured_cases"])[0]["expected"] == 3
+
+
+def test_process_row_can_include_reference_solution_for_lab_artifacts():
+    from scripts import build_opencodeinstruct_subset as subset
+
+    row = {
+        "average_test_score": 1.0,
+        "unit_tests": '["assert add(1, 2) == 3"]',
+        "input": "Implement add",
+        "output": "```python\ndef add(a, b):\n    return a + b\n```",
+    }
+    out = subset.process_row(row, include_reference_output=True)
     assert out is not None
     assert out["output"].startswith("def add")
     assert json.loads(out["structured_cases"])[0]["expected"] == 3
