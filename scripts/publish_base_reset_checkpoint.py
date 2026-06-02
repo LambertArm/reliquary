@@ -139,6 +139,7 @@ def main() -> None:
             folder_path=str(snapshot_dir),
             repo_id=repo_id,
             commit_message=f"checkpoint {next_n}",
+            delete_patterns="*",
         )
     finally:
         shutil.rmtree(snapshot_dir, ignore_errors=True)
@@ -146,7 +147,7 @@ def main() -> None:
     print()
     print("Add these to docker/.env before restarting the trainer:")
     print(f"RELIQUARY_RESUME_FROM=sha:{commit.oid}")
-    print("RELIQUARY_WANDB_VERSION=base-reset-20260525")
+    print("RELIQUARY_WANDB_VERSION=base-reset-qwen35")
     print(f"# checkpoint_n={next_n}")
 
 
