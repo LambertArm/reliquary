@@ -175,12 +175,15 @@ def _run_ema_windows(hotkey_counts_per_window: list[dict[str, int]]) -> dict:
     archives = []
     for window_idx, counts in enumerate(hotkey_counts_per_window):
         batch_entries = []
+        rewards_by_hotkey = {}
         for hk, n in counts.items():
             for _ in range(n):
                 batch_entries.append({"hotkey": hk, "prompt_idx": 0})
+            rewards_by_hotkey[hk] = n / B_BATCH
         archives.append({
             "window_start": window_idx,
             "batch": batch_entries,
+            "rewards_by_hotkey": rewards_by_hotkey,
         })
     return WeightOnlyValidator._replay_ema(archives)
 
