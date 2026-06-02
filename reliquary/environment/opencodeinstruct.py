@@ -90,7 +90,7 @@ class OpenCodeInstructEnvironment:
 
     The dataset is the filtered subset built by
     scripts/build_opencodeinstruct_subset.py and published to
-    reliquadotai/opencodeinstruct-structured-subset on HF Hub.
+    R0mAI/opencodeinstruct-structured-subset on HF Hub.
     Override the source repo with RELIQUARY_OCI_SUBSET_REPO.
     """
 
@@ -98,7 +98,7 @@ class OpenCodeInstructEnvironment:
     validator_authoritative_reward: ClassVar[bool] = True
 
     _dataset_cache: ClassVar = None
-    _DEFAULT_SUBSET_REPO: ClassVar[str] = "reliquadotai/opencodeinstruct-structured-subset"
+    _DEFAULT_SUBSET_REPO: ClassVar[str] = "R0mAI/opencodeinstruct-structured-subset"
 
     def __init__(self) -> None:
         if OpenCodeInstructEnvironment._dataset_cache is None:

@@ -12,7 +12,7 @@ Filters in order:
      structured cases (twice with different PYTHONHASHSEED) — drop on
      mismatch.
   5. Push the resulting private subset to HF Hub as
-     reliquadotai/opencodeinstruct-structured-subset.
+     R0mAI/opencodeinstruct-structured-subset.
   6. Optionally publish a public prompt-only mirror with the same row order
      for miners. The mirror contains `input` and `id` only.
 
@@ -301,8 +301,8 @@ def prompt_only_rows(rows: list[dict]) -> list[dict]:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", default="nvidia/OpenCodeInstruct")
-    parser.add_argument("--target-repo", default="reliquadotai/opencodeinstruct-structured-subset")
-    parser.add_argument("--prompt-target-repo", default="reliquadotai/opencodeinstruct-prompts",
+    parser.add_argument("--target-repo", default="R0mAI/opencodeinstruct-structured-subset")
+    parser.add_argument("--prompt-target-repo", default="R0mAI/opencodeinstruct-prompts",
                         help="Public prompt-only mirror repo for miners.")
     parser.add_argument("--max-rows", type=int, default=None,
                         help="Cap on rows to process — for dry-runs.")
