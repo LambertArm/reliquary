@@ -5,6 +5,7 @@ The push-to-Hub side is exercised manually when running the script.
 """
 
 import json
+import subprocess
 
 import pytest
 
@@ -187,3 +188,22 @@ def test_prompt_only_rows_preserve_order_and_hide_cases():
         {"input": "Prompt A", "id": "a"},
         {"input": "Prompt B", "id": "b"},
     ]
+
+
+def test_double_execute_timeout_drops_row(monkeypatch):
+    from scripts import build_opencodeinstruct_subset as subset
+
+    def _timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=["python"], timeout=1)
+
+    monkeypatch.setattr(subprocess, "run", _timeout)
+
+    assert subset.double_execute("def add(a, b): return a + b", [
+        {
+            "entry": {"kind": "function", "name": "add"},
+            "args": [1, 2],
+            "kwargs": {},
+            "expected": 3,
+            "compare": "exact",
+        }
+    ]) is False

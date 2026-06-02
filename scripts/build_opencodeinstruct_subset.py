@@ -34,6 +34,8 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
+DETERMINISM_TIMEOUT_SECONDS = float(os.environ.get("RELIQUARY_OCI_BUILD_TIMEOUT_SECONDS", "5"))
+
 _FENCE_RE = re.compile(
     r"(```|~~~)(?:python3?|py)?\s*\n(.*?)\n\1",
     re.DOTALL,
@@ -244,14 +246,17 @@ def double_execute(code: str, cases: list[dict]) -> bool:
         "print(p)\n"
     )
     payload = json.dumps({"code": code, "cases": cases})
-    out_seed0 = subprocess.run(
-        [sys.executable, "-c", runner], input=payload, capture_output=True, text=True,
-        env={**os.environ, "PYTHONHASHSEED": "0"}, timeout=30,
-    )
-    out_seed1 = subprocess.run(
-        [sys.executable, "-c", runner], input=payload, capture_output=True, text=True,
-        env={**os.environ, "PYTHONHASHSEED": "1"}, timeout=30,
-    )
+    try:
+        out_seed0 = subprocess.run(
+            [sys.executable, "-c", runner], input=payload, capture_output=True, text=True,
+            env={**os.environ, "PYTHONHASHSEED": "0"}, timeout=DETERMINISM_TIMEOUT_SECONDS,
+        )
+        out_seed1 = subprocess.run(
+            [sys.executable, "-c", runner], input=payload, capture_output=True, text=True,
+            env={**os.environ, "PYTHONHASHSEED": "1"}, timeout=DETERMINISM_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
     expected = str(len(cases))
     return out_seed0.stdout.strip() == expected and out_seed1.stdout.strip() == expected
 
