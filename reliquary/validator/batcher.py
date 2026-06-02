@@ -64,11 +64,19 @@ from reliquary.validator.verifier import (
     is_in_zone,
     rewards_std,
     verify_logprobs_claim,
-    verify_reward_claim,
     verify_termination,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _uses_validator_authoritative_reward(env: Any) -> bool:
+    return bool(getattr(env, "validator_authoritative_reward", False))
+
+
+def _reward_matches_claim(actual: float, claimed: float, *, tolerance: float = 1e-6) -> bool:
+    return abs(float(actual) - float(claimed)) <= tolerance
+
 
 _PROOF_FAILURE_DEBT_STAGES = frozenset(
     {
@@ -701,11 +709,22 @@ class GrpoWindowBatcher:
                 rollout_hashes.append(h)
 
         problem = self.env.get_problem(request.prompt_idx)
+        validator_scored_reward = _uses_validator_authoritative_reward(self.env)
         completion_texts = []
         for rollout in request.rollouts:
             text = self._completion_text(rollout)
             completion_texts.append(text)
-            if not verify_reward_claim(self.env, problem, text, rollout.reward):
+            try:
+                computed_reward = float(self.env.compute_reward(problem, text))
+            except Exception:
+                return reject(RejectReason.REWARD_MISMATCH, "reward")
+            if validator_scored_reward:
+                rollout.reward = computed_reward
+                rollout_meta = rollout.commit.get("rollout")
+                if isinstance(rollout_meta, dict):
+                    rollout_meta["success"] = computed_reward > 0.5
+                    rollout_meta["total_reward"] = computed_reward
+            elif not _reward_matches_claim(computed_reward, rollout.reward):
                 return reject(RejectReason.REWARD_MISMATCH, "reward")
 
         rewards = [float(r.reward) for r in request.rollouts]

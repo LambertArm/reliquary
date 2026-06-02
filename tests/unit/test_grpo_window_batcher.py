@@ -25,6 +25,11 @@ class FakeEnv:
         return 1.0 if "CORRECT" in completion else 0.0
 
 
+class PrivateRewardFakeEnv(FakeEnv):
+    name = "opencodeinstruct"
+    validator_authoritative_reward = True
+
+
 def _always_true_grail(commit, model, randomness):
     import torch
     from reliquary.validator.verifier import ProofResult
@@ -311,6 +316,32 @@ def test_reject_reward_mismatch():
     resp = b.accept_submission(req)
     assert resp.accepted is False
     assert resp.reason == RejectReason.REWARD_MISMATCH
+
+
+def test_validator_authoritative_reward_overwrites_placeholder_claims():
+    """Private-reward envs cannot require miners to know hidden cases."""
+    req = _request(rewards=[0.0] * M_ROLLOUTS)
+    for rollout in req.rollouts:
+        rollout.env_name = "opencodeinstruct"
+
+    b = _make_batcher(
+        env=PrivateRewardFakeEnv(),
+        completion_text_fn=lambda rollout: (
+            "CORRECT" if int(rollout.tokens[0]) < 4 else "wrong"
+        ),
+    )
+
+    resp = b.accept_submission(req)
+
+    assert resp.accepted is True, resp.reason
+    expected = [1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
+    assert [r.reward for r in b._valid[0].rollouts] == expected
+    assert [
+        r.commit["rollout"]["total_reward"] for r in b._valid[0].rollouts
+    ] == expected
+    assert [
+        r.commit["rollout"]["success"] for r in b._valid[0].rollouts
+    ] == [True, True, True, True, False, False, False, False]
 
 
 def test_reject_outer_inner_token_split_even_if_constructed():

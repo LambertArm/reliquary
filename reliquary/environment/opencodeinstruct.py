@@ -81,6 +81,7 @@ class OpenCodeInstructEnvironment:
     """
 
     name: str = "opencodeinstruct"
+    validator_authoritative_reward: ClassVar[bool] = True
 
     _dataset_cache: ClassVar = None
     _DEFAULT_SUBSET_REPO: ClassVar[str] = "reliquadotai/opencodeinstruct-structured-subset"

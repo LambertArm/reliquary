@@ -521,7 +521,10 @@ class MiningEngine:
         prompt_length = generation["prompt_length"]
         completion_tokens = all_tokens[prompt_length:]
         completion_text = self.tokenizer.decode(completion_tokens)
-        reward = active_env.compute_reward(problem, completion_text)
+        if getattr(active_env, "validator_authoritative_reward", False):
+            reward = 0.0
+        else:
+            reward = active_env.compute_reward(problem, completion_text)
 
         commit = self._build_grail_commit(generation, randomness)
         return RolloutSubmission(

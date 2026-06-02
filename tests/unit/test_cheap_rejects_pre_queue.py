@@ -426,6 +426,33 @@ def test_claimed_out_of_zone_rejected_before_proof_admission():
     assert verdicts[-1]["reject_stage"] == "zone"
 
 
+def test_private_reward_env_skips_claimed_reward_zone_preflight():
+    """Private-reward envs score after hidden reward recomputation.
+
+    Miners may submit placeholder rewards for OpenCode; the HTTP preflight
+    must not reject those placeholders before the batcher can overwrite them.
+    """
+    s = ValidatorServer()
+    s.set_current_state(WindowState.OPEN)
+    batcher = _PreflightAdmissionBatcher(eos_token_id=99)
+    batcher.env.validator_authoritative_reward = True
+    s.set_active_batcher(batcher)
+    payload = _submission_with_completion_tokens(
+        list(range(4, 35)) + [99],
+        rewards=[0.0] * 8,
+    )
+    for rollout in payload["rollouts"]:
+        rollout["env_name"] = "opencodeinstruct"
+
+    with TestClient(s.app) as client:
+        r = client.post("/submit", json=payload)
+
+    body = r.json()
+    assert body["accepted"] is True, body
+    assert body["reason"] == RejectReason.ACCEPTED.value
+    assert batcher.proof_admission_count == 1
+
+
 def test_prompt_mismatch_rejected_before_proof_admission():
     """Prompt-token binding is deterministic from the commit and canonical
     prompt tokens, so mismatches should not consume proof admission."""

@@ -173,3 +173,17 @@ def test_process_row_can_include_reference_solution_for_lab_artifacts():
     assert out is not None
     assert out["output"].startswith("def add")
     assert json.loads(out["structured_cases"])[0]["expected"] == 3
+
+
+def test_prompt_only_rows_preserve_order_and_hide_cases():
+    from scripts import build_opencodeinstruct_subset as subset
+
+    rows = [
+        {"input": "Prompt A", "id": "a", "structured_cases": "[secret]"},
+        {"input": "Prompt B", "id": "b", "structured_cases": "[secret]", "output": "ref"},
+    ]
+
+    assert subset.prompt_only_rows(rows) == [
+        {"input": "Prompt A", "id": "a"},
+        {"input": "Prompt B", "id": "b"},
+    ]

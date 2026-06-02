@@ -173,6 +173,17 @@ def test_get_problem_shape():
     assert len(p["id"]) == 16
 
 
+def test_get_problem_supports_prompt_only_rows():
+    rows = [{"input": "Write a function add(a, b) returning their sum."}]
+    env = _env_with(rows)
+    p = env.get_problem(0)
+    assert p["prompt"] == "Write a function add(a, b) returning their sum."
+    assert p["ground_truth"] in env._cases_by_id
+    assert env._cases_by_id[p["ground_truth"]] == []
+    assert env.compute_reward(p, "```python\ndef add(a, b): return a + b\n```") == 0.0
+    assert env._grader.calls == []
+
+
 def test_get_problem_id_is_deterministic():
     rows = [{"input": "Same prompt", "structured_cases": [_case()]}]
     env = _env_with(rows)

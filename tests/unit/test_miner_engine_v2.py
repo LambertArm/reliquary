@@ -1,6 +1,8 @@
 """Miner prompt-picking strategy: pull random in-range, skip cooldown."""
 
 import random
+from unittest.mock import MagicMock
+
 import pytest
 
 from reliquary.miner.engine import pick_prompt_idx
@@ -51,3 +53,32 @@ def test_engine_default_max_new_tokens_is_protocol_cap():
     # `int(os.environ.get("RELIQUARY_MAX_NEW_TOKENS", ...))` default.
     src = inspect.getsource(MiningEngine.__init__)
     assert "RELIQUARY_MAX_NEW_TOKENS" not in src
+
+
+def test_build_rollout_submission_uses_placeholder_for_authoritative_reward_env():
+    from reliquary.miner.engine import MiningEngine
+
+    class _PrivateRewardEnv:
+        name = "opencodeinstruct"
+        validator_authoritative_reward = True
+        compute_reward = MagicMock(side_effect=AssertionError("must not score locally"))
+
+    eng = object.__new__(MiningEngine)
+    eng.env = _PrivateRewardEnv()
+    eng.tokenizer = MagicMock()
+    eng.tokenizer.decode.return_value = "```python\ndef add(a, b): return a + b\n```"
+    eng._build_grail_commit = MagicMock(
+        return_value={
+            "tokens": [10, 11, 12, 13],
+            "rollout": {"prompt_length": 2, "completion_length": 2},
+        }
+    )
+    generation = {"tokens": [10, 11, 12, 13], "prompt_length": 2}
+
+    rollout = eng._build_rollout_submission(
+        generation, {"prompt": "p"}, "randomness", env=eng.env
+    )
+
+    assert rollout.reward == 0.0
+    assert rollout.env_name == "opencodeinstruct"
+    eng.env.compute_reward.assert_not_called()

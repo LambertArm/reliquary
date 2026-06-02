@@ -13,6 +13,8 @@ Filters in order:
      mismatch.
   5. Push the resulting private subset to HF Hub as
      reliquadotai/opencodeinstruct-structured-subset.
+  6. Optionally publish a public prompt-only mirror with the same row order
+     for miners. The mirror contains `input` and `id` only.
 
 Designed so the per-row filter functions are pure-Python and
 testable without HuggingFace, network, or subprocess.
@@ -281,20 +283,38 @@ def process_row(row: dict, *, include_reference_output: bool = False) -> Optiona
     return out
 
 
+def prompt_only_rows(rows: list[dict]) -> list[dict]:
+    """Return the public miner-facing mirror rows.
+
+    The prompt-only dataset must preserve row order with the private
+    structured dataset so prompt_idx maps to the same text on miners and
+    validators, while omitting hidden cases and reference solutions.
+    """
+    return [{"input": row["input"], "id": row.get("id", "")} for row in rows]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", default="nvidia/OpenCodeInstruct")
     parser.add_argument("--target-repo", default="reliquadotai/opencodeinstruct-structured-subset")
+    parser.add_argument("--prompt-target-repo", default="reliquadotai/opencodeinstruct-prompts",
+                        help="Public prompt-only mirror repo for miners.")
     parser.add_argument("--max-rows", type=int, default=None,
                         help="Cap on rows to process — for dry-runs.")
     parser.add_argument("--target-kept", type=int, default=None,
                         help="Stop once this many filtered rows have been kept.")
     parser.add_argument("--output-dir", default="./opencodeinstruct-subset",
                         help="Local save_to_disk path when --push is not used.")
+    parser.add_argument("--prompt-output-dir", default=None,
+                        help="Optional local save_to_disk path for the prompt-only mirror.")
     parser.add_argument("--push", action="store_true",
                         help="Push to HF Hub (requires HF_TOKEN).")
+    parser.add_argument("--push-prompt-repo", action="store_true",
+                        help="Push the prompt-only mirror to HF Hub (requires HF_TOKEN).")
     parser.add_argument("--public", action="store_true",
                         help="Make the pushed dataset public. Default is private.")
+    parser.add_argument("--private-prompt-repo", action="store_true",
+                        help="Make the prompt-only mirror private. Default is public.")
     parser.add_argument("--include-reference-output", action="store_true",
                         help="Include reference solutions. Do not use for production.")
     args = parser.parse_args()
@@ -326,6 +346,11 @@ def main() -> None:
         out_ds.save_to_disk(args.output_dir)
         logger.info("saved locally to %s", args.output_dir)
 
+    prompt_ds = hf.Dataset.from_list(prompt_only_rows(kept))
+    if args.prompt_output_dir:
+        prompt_ds.save_to_disk(args.prompt_output_dir)
+        logger.info("saved prompt-only mirror locally to %s", args.prompt_output_dir)
+
     if args.push:
         token = os.environ.get("HF_TOKEN")
         if not token:
@@ -334,6 +359,20 @@ def main() -> None:
         logger.info(
             "pushed %d rows to %s private=%s",
             len(kept), args.target_repo, not args.public,
+        )
+
+    if args.push_prompt_repo:
+        token = os.environ.get("HF_TOKEN")
+        if not token:
+            raise RuntimeError("HF_TOKEN env var is required to push.")
+        prompt_ds.push_to_hub(
+            args.prompt_target_repo,
+            token=token,
+            private=args.private_prompt_repo,
+        )
+        logger.info(
+            "pushed %d prompt rows to %s private=%s",
+            len(kept), args.prompt_target_repo, args.private_prompt_repo,
         )
 
 

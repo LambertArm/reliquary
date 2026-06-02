@@ -213,7 +213,11 @@ def _proof_free_submission_reject(
                 return RejectReason.HASH_DUPLICATE, "dedup"
             local_seen.add(rollout_hash)
 
-    if not _is_mock_like(batcher):
+    env = getattr(batcher, "env", None)
+    validator_scored_reward = bool(
+        getattr(env, "validator_authoritative_reward", False)
+    )
+    if not _is_mock_like(batcher) and not validator_scored_reward:
         rewards = [float(rollout.reward) for rollout in request.rollouts]
         if not is_in_zone(
             rewards_std(rewards),
