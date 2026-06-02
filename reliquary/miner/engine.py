@@ -68,12 +68,13 @@ async def _hf_download(repo_id: str, revision: str) -> str:
     """Download a snapshot into the local HF cache and return the model folder path."""
     import asyncio
     from huggingface_hub import snapshot_download
+    from reliquary.shared.modeling import MODEL_SNAPSHOT_ALLOW_PATTERNS
 
     return await asyncio.to_thread(
         snapshot_download,
         repo_id=repo_id,
         revision=revision,
-        allow_patterns=["model.safetensors", "config.json", "tokenizer*"],
+        allow_patterns=MODEL_SNAPSHOT_ALLOW_PATTERNS,
     )
 
 
@@ -105,6 +106,42 @@ def pick_prompt_idx(
     if not eligible:
         raise RuntimeError("no eligible prompt — env fully in cooldown")
     return rng.choice(eligible)
+
+
+def pick_env_and_prompt(
+    envs: dict,
+    mix: list[tuple[str, int]],
+    cooldown_per_env: dict[str, set[int]],
+    *,
+    rng: _random.Random | None = None,
+    max_attempts: int = 1000,
+) -> tuple[str, int]:
+    """Sample env per `mix` weights, then a prompt within that env.
+
+    Falls through to the next env (by re-sampling with that env masked)
+    if the chosen env is fully in cooldown.
+    """
+    rng = rng or _random
+    names = [n for n, _ in mix]
+    weights = [w for _, w in mix]
+    if not names:
+        raise RuntimeError("pick_env_and_prompt: empty mix")
+
+    available = list(names)
+    while available:
+        avail_weights = [weights[names.index(n)] for n in available]
+        env_name = rng.choices(available, weights=avail_weights)[0]
+        env = envs[env_name]
+        try:
+            idx = pick_prompt_idx(
+                env, cooldown_per_env.get(env_name, set()),
+                rng=rng, max_attempts=max_attempts,
+            )
+            return env_name, idx
+        except RuntimeError:
+            available.remove(env_name)
+
+    raise RuntimeError("pick_env_and_prompt: all envs fully in cooldown")
 
 
 def _compute_merkle_root(rollouts) -> str:
@@ -161,8 +198,10 @@ class MiningEngine:
         hf_model,
         tokenizer,
         wallet,
-        env: "Environment",
+        env: "Environment | None" = None,
         *,
+        envs: "dict[str, Environment] | None" = None,
+        mix: "list[tuple[str, int]] | None" = None,
         vllm_gpu: int = 0,
         proof_gpu: int = 1,
         max_new_tokens: int = MAX_NEW_TOKENS_PROTOCOL_CAP,
@@ -172,11 +211,21 @@ class MiningEngine:
         self.hf_model = hf_model
         self.tokenizer = tokenizer
         self.wallet = wallet
-        self.env = env
         self.vllm_gpu = vllm_gpu
         self.proof_gpu = proof_gpu
         self.max_new_tokens = max_new_tokens
         self.validator_url_override = validator_url_override
+
+        if envs is not None and mix is not None:
+            self.envs = envs
+            self.mix = mix
+            self.env = next(iter(envs.values()))  # legacy fallback
+        else:
+            assert env is not None, "must pass either env or envs+mix"
+            self.envs = {env.name: env}
+            self.mix = [(env.name, 1)]
+            self.env = env
+        self._cooldown_per_env: dict[str, set[int]] = {n: set() for n in self.envs}
 
         # Lazy imports for heavy deps — keep module import cheap.
         from reliquary.shared.hf_compat import resolve_hidden_size
@@ -268,14 +317,19 @@ class MiningEngine:
 
                 # Pick prompt, generate, submit.
                 cooldown_set = set(state.cooldown_prompts)
+                for env_name in self._cooldown_per_env:
+                    self._cooldown_per_env[env_name] = cooldown_set
                 try:
-                    prompt_idx = pick_prompt_idx(self.env, cooldown_set, rng=rng)
+                    env_name, prompt_idx = pick_env_and_prompt(
+                        self.envs, self.mix, self._cooldown_per_env, rng=rng,
+                    )
                 except RuntimeError:
-                    logger.info("env fully in cooldown; sleeping")
+                    logger.info("all envs fully in cooldown; sleeping")
                     await asyncio.sleep(5)
                     continue
 
-                problem = self.env.get_problem(prompt_idx)
+                env = self.envs[env_name]
+                problem = env.get_problem(prompt_idx)
                 generations = self._generate_m_rollouts(problem, randomness)
                 if len(generations) < M_ROLLOUTS:
                     logger.warning(
@@ -285,7 +339,7 @@ class MiningEngine:
                     continue
 
                 rollout_submissions = [
-                    self._build_rollout_submission(gen, problem, randomness)
+                    self._build_rollout_submission(gen, problem, randomness, env=env)
                     for gen in generations
                 ]
                 merkle_root = _compute_merkle_root(rollout_submissions)
@@ -343,15 +397,15 @@ class MiningEngine:
     def _load_checkpoint(self, local_path: str):
         """Reload both hf_model and vllm_model from *local_path*.
 
-        Both attributes are ``AutoModelForCausalLM`` instances despite the
-        historical ``vllm_model`` naming — vllm_model is the fast-generation
-        copy on ``self.vllm_gpu``, hf_model is the GRAIL-proof copy on
-        ``self.proof_gpu``.
+        vllm_model is the fast-generation copy on ``self.vllm_gpu``;
+        hf_model is the GRAIL-proof copy on ``self.proof_gpu``. The shared
+        loader picks CausalLM for legacy text checkpoints and conditional
+        text-only loading for Qwen3.5.
         """
         import torch
-        from transformers import AutoModelForCausalLM
 
         from reliquary.constants import ATTN_IMPLEMENTATION
+        from reliquary.shared.modeling import load_text_generation_model
 
         if getattr(self, "_loaded_checkpoint_path", None) == local_path:
             logger.debug("_load_checkpoint: already loaded from %s", local_path)
@@ -361,7 +415,7 @@ class MiningEngine:
 
         # 1. Reload hf_model (for GRAIL proofs) on the proof GPU.
         try:
-            new_hf = AutoModelForCausalLM.from_pretrained(
+            new_hf = load_text_generation_model(
                 local_path,
                 torch_dtype=torch.bfloat16,
                 attn_implementation=ATTN_IMPLEMENTATION,
@@ -383,7 +437,7 @@ class MiningEngine:
 
         # 2. Reload vllm_model on the generation GPU.
         try:
-            new_gen = AutoModelForCausalLM.from_pretrained(
+            new_gen = load_text_generation_model(
                 local_path,
                 torch_dtype=torch.bfloat16,
                 attn_implementation=ATTN_IMPLEMENTATION,
@@ -426,54 +480,65 @@ class MiningEngine:
         """
         import torch
 
-        prompt_tokens = self.tokenizer.encode(
-            problem["prompt"], add_special_tokens=False
-        )
+        from reliquary.protocol.tokens import encode_prompt
+        from reliquary.shared.modeling import first_eos_index, resolve_eos_token_ids
+
+        prompt_tokens = encode_prompt(self.tokenizer, problem["prompt"])
         prompt_length = len(prompt_tokens)
+        eos_ids = resolve_eos_token_ids(self.vllm_model, self.tokenizer)
+        pad_token_id = getattr(self.tokenizer, "pad_token_id", None)
+        if pad_token_id is None and eos_ids:
+            pad_token_id = min(eos_ids)
 
         with torch.no_grad():
             input_tensor = torch.tensor(
                 [prompt_tokens] * M_ROLLOUTS,
                 device=getattr(self.vllm_model, "device", "cpu"),
             )
-            outputs = self.vllm_model.generate(
-                input_tensor,
-                max_new_tokens=self.max_new_tokens,
-                do_sample=True,
-                temperature=T_PROTO,
-                top_p=TOP_P_PROTO,
-                top_k=TOP_K_PROTO,
-                pad_token_id=self.tokenizer.pad_token_id,
-            )
-        eos = self.tokenizer.eos_token_id
+            attention_mask = torch.ones_like(input_tensor)
+            generate_kwargs = {
+                "max_new_tokens": self.max_new_tokens,
+                "do_sample": True,
+                "temperature": T_PROTO,
+                "top_p": TOP_P_PROTO,
+                "top_k": TOP_K_PROTO,
+                "pad_token_id": pad_token_id,
+                "attention_mask": attention_mask,
+            }
+            if eos_ids:
+                generate_kwargs["eos_token_id"] = sorted(eos_ids)
+            outputs = self.vllm_model.generate(input_tensor, **generate_kwargs)
         rollouts = []
         for i in range(M_ROLLOUTS):
             seq = outputs[i].tolist()
             gen = seq[prompt_length:]
-            try:
-                first_eos = gen.index(eos)
+            first_eos = first_eos_index(gen, eos_ids)
+            if first_eos is not None:
                 gen = gen[: first_eos + 1]
-            except ValueError:
-                pass
             rollouts.append({
                 "tokens": prompt_tokens + gen,
                 "prompt_length": prompt_length,
             })
         return rollouts
 
-    def _build_rollout_submission(self, generation, problem, randomness):
+    def _build_rollout_submission(self, generation, problem, randomness, *, env=None):
         """Build a RolloutSubmission: completion + claimed reward + GRAIL commit."""
+        active_env = env if env is not None else self.env
         all_tokens = generation["tokens"]
         prompt_length = generation["prompt_length"]
         completion_tokens = all_tokens[prompt_length:]
         completion_text = self.tokenizer.decode(completion_tokens)
-        reward = self.env.compute_reward(problem, completion_text)
+        if getattr(active_env, "validator_authoritative_reward", False):
+            reward = 0.0
+        else:
+            reward = active_env.compute_reward(problem, completion_text)
 
         commit = self._build_grail_commit(generation, randomness)
         return RolloutSubmission(
             tokens=all_tokens,
             reward=reward,
             commit=commit,
+            env_name=active_env.name,
         )
 
     # ------------------------------------------------------------------

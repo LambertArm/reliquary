@@ -33,7 +33,9 @@ def forward_single_layer(
     intermediate layers.
 
     Args:
-        model: HuggingFace CausalLM (e.g. AutoModelForCausalLM).
+        model: HuggingFace text-generation model. Legacy checkpoints are
+            CausalLM; Qwen3.5 uses a conditional generation wrapper for
+            text-only calls.
         input_ids: [batch, seq_len] token ids.
         attention_mask: [batch, seq_len] mask (1 = real, 0 = pad).
         layer_index: Which hidden layer to return. -1 for last.
@@ -53,7 +55,9 @@ def forward_single_layer(
             attention_mask=attention_mask,
             use_cache=False,
         )
-        h = base_out.last_hidden_state
+        h = getattr(base_out, "last_hidden_state", None)
+        if h is None:
+            h = base_out[0]
         logits = lm_head(h)
         logger.debug(
             "forward_single_layer: efficient path | batch=%d seq_len=%d",

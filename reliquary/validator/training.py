@@ -137,8 +137,8 @@ def _compute_advantages(rewards: list[float]) -> list[float]:
 # Per-rollout loss (forward-pass heavy — uses the model)
 # ---------------------------------------------------------------------------
 
-# Row-chunk for selected-logprob streaming. With Qwen3 vocab=152064:
-#   chunk × vocab × 4 bytes = 64 × 152064 × 4 ≈ 39 MiB peak fp32 alloc per chunk.
+# Row-chunk for selected-logprob streaming. With Qwen3.5 vocab=248320:
+#   chunk × vocab × 4 bytes = 64 × 248320 × 4 ≈ 61 MiB peak fp32 alloc per chunk.
 _LOGPROB_CHUNK = 64
 
 
@@ -182,18 +182,98 @@ def _selected_logprobs(
     return torch.cat(parts, dim=0)
 
 
+def _hidden_logprob_block(
+    hidden_slice: torch.Tensor,
+    indices_slice: torch.Tensor,
+    lm_head,
+) -> torch.Tensor:
+    return _logprob_block(lm_head(hidden_slice), indices_slice)
+
+
+def _selected_logprobs_from_hidden(
+    hidden_rows: torch.Tensor,
+    indices: torch.Tensor,
+    lm_head,
+    chunk: int = _LOGPROB_CHUNK,
+) -> torch.Tensor:
+    """Compute selected token logprobs from hidden states in row chunks.
+
+    This avoids materialising the full ``sequence × vocab`` logits tensor that
+    HF ``model(...).logits`` returns. Qwen3.5 has a 248k-token vocab, so the
+    full-logits path is the difference between fitting long rollouts and
+    getting killed by memory pressure. Checkpointing keeps backward memory at
+    one chunk by recomputing the LM-head/logsumexp block as needed.
+    """
+    n = hidden_rows.shape[0]
+    use_ckpt = hidden_rows.requires_grad
+    parts = []
+    for i in range(0, n, chunk):
+        end = i + chunk
+
+        def _block(h, idx):
+            return _hidden_logprob_block(h, idx, lm_head)
+
+        if use_ckpt:
+            part = torch.utils.checkpoint.checkpoint(
+                _block, hidden_rows[i:end], indices[i:end],
+                use_reentrant=False,
+            )
+        else:
+            part = _block(hidden_rows[i:end], indices[i:end])
+        parts.append(part)
+    return torch.cat(parts, dim=0)
+
+
+def _base_model_and_lm_head(model):
+    base = getattr(model, "model", None)
+    lm_head = getattr(model, "lm_head", None)
+    if base is None or lm_head is None or not callable(lm_head):
+        return None, None
+    return base, lm_head
+
+
+def _last_hidden_state(outputs):
+    hidden = getattr(outputs, "last_hidden_state", None)
+    if hidden is not None:
+        return hidden
+    try:
+        return outputs[0]
+    except (TypeError, IndexError):
+        return None
+
+
+def _selected_logprobs_for_tokens(model, tokens: torch.Tensor, next_tokens: torch.Tensor) -> torch.Tensor:
+    """Selected next-token logprobs without full-sequence logits when possible."""
+    base, lm_head = _base_model_and_lm_head(model)
+    if base is not None and lm_head is not None:
+        try:
+            base_out = base(tokens, use_cache=False)
+            hidden = _last_hidden_state(base_out)
+            if hidden is not None:
+                return _selected_logprobs_from_hidden(hidden[0, :-1], next_tokens, lm_head)
+        except TypeError:
+            # Some tiny test doubles / legacy models don't expose a compatible
+            # base forward. Fall back to the standard HF logits contract below.
+            pass
+
+    logits = model(tokens, use_cache=False).logits[0]
+    return _selected_logprobs(logits[:-1], next_tokens)
+
+
 def _rollout_loss(
     model,
     ref_model,
     rollout,
     advantage: float,
     device,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute (ppo_loss, kl_term) for one rollout.
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Compute (ppo_loss, kl_term, n_completion_tokens) for one rollout.
 
-    Both scalars, averaged over completion tokens. Forward passes run in
-    bf16 autocast; softmax / log-softmax cast back to fp32 for numerical
-    stability.
+    ``ppo_loss`` and ``kl_term`` are scalars averaged over completion tokens;
+    ``n_completion_tokens`` is the count, which lets ``train_step`` apply DAPO
+    token-level normalisation (weigh every token equally) by recovering the
+    per-token sum as ``mean * n``. Forward passes run in bf16 autocast;
+    softmax / log-softmax cast back to fp32 for numerical stability.
 
     π_old comes from the miner's GRAIL commit (rollout.commit["rollout"]
     ["token_logprobs"]) — saves an extra forward pass.
@@ -212,13 +292,9 @@ def _rollout_loss(
     # use_cache=True which silently disables checkpointing under HF.
     dtype_ctx = torch.autocast(device_type=device.type, dtype=torch.bfloat16) \
         if device.type in ("cuda", "cpu") else torch.autocast(device_type="cpu", enabled=False)
-    with dtype_ctx:
-        logits = model(tokens, use_cache=False).logits[0]  # [T, vocab]
-
-    # log π_new(token_{t+1} | context_<=t) computed in fp32 but streamed
-    # over rows — see _selected_logprobs.
     next_tokens = tokens[0, 1:]  # [T-1]
-    new_logprobs = _selected_logprobs(logits[:-1], next_tokens)
+    with dtype_ctx:
+        new_logprobs = _selected_logprobs_for_tokens(model, tokens, next_tokens)
 
     # Slice to completion tokens only: logits[prompt_length-1] predicts
     # tokens[prompt_length] (first completion token).
@@ -227,8 +303,7 @@ def _rollout_loss(
     # Reference model forward pass (no grad)
     with torch.no_grad():
         with dtype_ctx:
-            ref_logits = ref_model(tokens, use_cache=False).logits[0]
-        ref_logprobs = _selected_logprobs(ref_logits[:-1], next_tokens)
+            ref_logprobs = _selected_logprobs_for_tokens(ref_model, tokens, next_tokens)
     ref_logprobs_c = ref_logprobs[prompt_length - 1:]
 
     # π_old from miner (same completion slice)
@@ -254,7 +329,7 @@ def _rollout_loss(
     kl_log_ratio = ref_logprobs_c - new_logprobs_c
     kl = (torch.exp(kl_log_ratio) - 1 - kl_log_ratio).mean()
 
-    return ppo_loss, kl
+    return ppo_loss, kl, int(new_logprobs_c.shape[0])
 
 
 # ---------------------------------------------------------------------------
@@ -263,12 +338,17 @@ def _rollout_loss(
 
 def train_step(
     model,
-    batch: list,
+    batches: list,
     *,
     ref_model,
     window_index: int | None = None,
 ) -> Any:
-    """Run one GRPO step on *batch* (list of ValidSubmission).
+    """Run one GRPO step over the union of *batches*.
+
+    All rollouts across every batch contribute backward calls before a
+    single optimizer.step(). *batches* is a list of batches, where each
+    batch is a list of group objects (ValidSubmission). Pass ``[batch]``
+    for the legacy mono-batch case.
 
     *ref_model* is the frozen reference policy for the KL penalty. The
     caller is responsible for keeping it up to date (in production:
@@ -278,7 +358,7 @@ def train_step(
     *window_index* is used as the wandb step when telemetry is enabled.
     Safe to omit in tests.
     """
-    if not batch:
+    if not batches or all(not b for b in batches):
         logger.info("train_step: empty batch, skipping")
         return model
 
@@ -292,30 +372,51 @@ def train_step(
 
     _optimizer.zero_grad()
 
-    n_total_rollouts = sum(len(g.rollouts) for g in batch)
+    n_total_rollouts = sum(len(g.rollouts) for batch in batches for g in batch)
     total_ppo = 0.0
     total_kl = 0.0
     n_processed = 0
     n_skipped = 0
 
-    for group in batch:
-        rewards = [r.reward for r in group.rollouts]
-        advantages = _compute_advantages(rewards)
-        if all(a == 0.0 for a in advantages):
-            n_skipped += 1
-            logger.debug("skipping degenerate group on prompt_idx=%d", group.prompt_idx)
-            continue
+    # Pass 1 (metadata only, no forward): group advantages + total completion-
+    # token budget. DAPO token-level normalisation weighs every completion
+    # token equally, vs the old sample-level mean which averaged per rollout
+    # and so under-weighted (and under-penalised) tokens in long responses.
+    # Completion length is known from the miner-committed token_logprobs, so
+    # this pre-pass costs no extra forward.
+    plan: list[tuple[Any, list[float]]] = []
+    n_total_tokens = 0
+    for batch in batches:
+        for group in batch:
+            advantages = _compute_advantages([r.reward for r in group.rollouts])
+            if all(a == 0.0 for a in advantages):
+                n_skipped += 1
+                logger.debug("skipping degenerate group on prompt_idx=%d", group.prompt_idx)
+                continue
+            plan.append((group, advantages))
+            for rollout in group.rollouts:
+                meta = (rollout.commit or {}).get("rollout", {}) or {}
+                n_total_tokens += len(meta.get("token_logprobs", []) or [])
 
+    if n_total_tokens == 0:
+        logger.info("train_step: no trainable completion tokens")
+        return model
+
+    # Pass 2: forward/backward one rollout at a time (peak memory = one
+    # sequence) and accumulate the token-level-normalised loss.
+    for group, advantages in plan:
         for rollout, adv in zip(group.rollouts, advantages):
             try:
-                ppo_loss, kl = _rollout_loss(
+                ppo_loss, kl, n_tok = _rollout_loss(
                     model=model, ref_model=ref_model,
                     rollout=rollout, advantage=adv, device=device,
                 )
             except ValueError as e:
                 logger.warning("rollout skipped: %s", e)
                 continue
-            loss = (ppo_loss + KL_BETA * kl) / n_total_rollouts
+            # ppo_loss / kl are per-token means; ``* n_tok`` recovers the token
+            # sum and ``/ n_total_tokens`` applies equal per-token weight.
+            loss = (ppo_loss + KL_BETA * kl) * n_tok / n_total_tokens
             loss.backward()
             total_ppo += ppo_loss.item()
             total_kl += kl.item()
@@ -337,12 +438,12 @@ def train_step(
     )
 
     # Emit structured metrics to wandb (no-op if telemetry disabled).
-    all_rewards = [r.reward for g in batch for r in g.rollouts]
+    all_rewards = [r.reward for batch in batches for g in batch for r in g.rollouts]
     n_rewards = len(all_rewards)
     reward_mean = sum(all_rewards) / n_rewards
     reward_var = sum((r - reward_mean) ** 2 for r in all_rewards) / n_rewards
     reward_std = reward_var ** 0.5
-    n_groups = len(batch)
+    n_groups = sum(len(batch) for batch in batches)
     metrics = {
         "train/lr": lr,
         "train/ppo_loss": total_ppo / n_processed,

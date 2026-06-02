@@ -16,11 +16,12 @@ except Exception:
     pytest.skip("tiny-gpt2 not available", allow_module_level=True)
 
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from reliquary.validator.training import (
     _rollout_loss, _compute_advantages, train_step, reset_training_state,
-    _selected_logprobs,
+    _selected_logprobs, _selected_logprobs_for_tokens,
 )
 
 
@@ -69,6 +70,39 @@ def test_selected_logprobs_backward_matches_reference():
     _selected_logprobs(logits_b, indices).sum().backward()
 
     torch.testing.assert_close(logits_a.grad, logits_b.grad, rtol=1e-5, atol=1e-5)
+
+
+def test_qwen_like_selected_logprobs_uses_hidden_lm_head_path():
+    class _Base(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.emb = torch.nn.Embedding(16, 8)
+            self.called = False
+
+        def forward(self, input_ids, use_cache=False):
+            self.called = True
+            return SimpleNamespace(last_hidden_state=self.emb(input_ids))
+
+    class _QwenLike(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = _Base()
+            self.lm_head = torch.nn.Linear(8, 16, bias=False)
+
+        def forward(self, *args, **kwargs):
+            raise AssertionError("full logits forward should not be used")
+
+    model = _QwenLike()
+    tokens = torch.tensor([[1, 2, 3, 4, 5]])
+    next_tokens = tokens[0, 1:]
+
+    logprobs = _selected_logprobs_for_tokens(model, tokens, next_tokens)
+    assert model.model.called
+    assert logprobs.shape == (4,)
+
+    logprobs.sum().backward()
+    assert model.model.emb.weight.grad is not None
+    assert model.lm_head.weight.grad is not None
 
 
 @pytest.fixture(scope="module")
@@ -120,7 +154,7 @@ def test_rollout_loss_zero_advantage_gives_zero_ppo_loss(tiny_model_and_tokenize
         prompt_length=2,
     )
     device = next(model.parameters()).device
-    ppo_loss, kl = _rollout_loss(model, ref, rollout, advantage=0.0, device=device)
+    ppo_loss, kl, _ = _rollout_loss(model, ref, rollout, advantage=0.0, device=device)
     assert abs(ppo_loss.item()) < 1e-6
     # KL is advantage-independent; just check it's non-negative (by construction)
     assert kl.item() >= -1e-6
@@ -137,9 +171,26 @@ def test_rollout_loss_produces_finite_values(tiny_model_and_tokenizer):
         prompt_length=3,
     )
     device = next(model.parameters()).device
-    ppo_loss, kl = _rollout_loss(model, ref, rollout, advantage=1.0, device=device)
+    ppo_loss, kl, _ = _rollout_loss(model, ref, rollout, advantage=1.0, device=device)
     assert torch.isfinite(ppo_loss)
     assert torch.isfinite(kl)
+
+
+def test_rollout_loss_returns_completion_token_count(tiny_model_and_tokenizer):
+    """The 3rd return value is the completion-token count (= len - prompt),
+    used by train_step for DAPO token-level loss normalisation."""
+    reset_training_state()
+    model, _ = tiny_model_and_tokenizer
+    ref = _make_ref(model)
+
+    rollout = _build_rollout(
+        tokens=[1, 2, 3, 4, 5, 6, 7, 8],  # 8 tokens
+        reward=1.0,
+        prompt_length=3,  # → 5 completion tokens
+    )
+    device = next(model.parameters()).device
+    _ppo, _kl, n_tok = _rollout_loss(model, ref, rollout, advantage=1.0, device=device)
+    assert n_tok == 5
 
 
 def test_rollout_loss_uses_commit_tokens_as_source_of_truth(tiny_model_and_tokenizer):
@@ -155,7 +206,7 @@ def test_rollout_loss_uses_commit_tokens_as_source_of_truth(tiny_model_and_token
     rollout.tokens = [1, 2]
 
     device = next(model.parameters()).device
-    ppo_loss, kl = _rollout_loss(model, ref, rollout, advantage=1.0, device=device)
+    ppo_loss, kl, _ = _rollout_loss(model, ref, rollout, advantage=1.0, device=device)
 
     assert torch.isfinite(ppo_loss)
     assert torch.isfinite(kl)
@@ -172,7 +223,7 @@ def test_train_step_updates_optimizer(tiny_model_and_tokenizer):
     sample_param = next(model.parameters())
     before = sample_param.detach().clone()
 
-    result = train_step(model, [group], ref_model=_make_ref(model))
+    result = train_step(model, [[group]], ref_model=_make_ref(model))
     assert result is model
 
     # Parameter should have changed (tiny-gpt2 is tiny, but non-zero grad)
@@ -181,10 +232,32 @@ def test_train_step_updates_optimizer(tiny_model_and_tokenizer):
     assert diff > 0.0, "expected some parameter change after optimizer step"
 
 
+def test_train_step_token_level_handles_unequal_lengths(tiny_model_and_tokenizer):
+    """Token-level normalisation must produce a finite update when rollouts
+    have different completion lengths (the case where it diverges from the
+    old per-sample mean)."""
+    reset_training_state()
+    model, _ = tiny_model_and_tokenizer
+    # Mixed completion lengths: 4, 4, 10, 10 tokens (prompt_length=2).
+    rollouts = [
+        _build_rollout([1, 2, 3, 4, 5, 6], 1.0, 2),
+        _build_rollout([1, 2, 3, 4, 5, 6], 1.0, 2),
+        _build_rollout(list(range(1, 13)), 0.0, 2),
+        _build_rollout(list(range(1, 13)), 0.0, 2),
+    ]
+    group = _FakeGroup(rollouts=rollouts, prompt_idx=0)
+
+    before = next(model.parameters()).detach().clone()
+    train_step(model, [[group]], ref_model=_make_ref(model))
+    after = next(model.parameters()).detach().clone()
+    assert torch.isfinite(after).all()
+    assert (before - after).abs().max().item() > 0.0
+
+
 def test_train_step_empty_batch_noop(tiny_model_and_tokenizer):
     reset_training_state()
     model, _ = tiny_model_and_tokenizer
-    result = train_step(model, [], ref_model=_make_ref(model))
+    result = train_step(model, [[]], ref_model=_make_ref(model))
     assert result is model
 
 
@@ -197,7 +270,7 @@ def test_train_step_degenerate_groups_skipped(tiny_model_and_tokenizer):
     group = _FakeGroup(rollouts=rollouts)
 
     before = next(model.parameters()).detach().clone()
-    train_step(model, [group], ref_model=_make_ref(model))
+    train_step(model, [[group]], ref_model=_make_ref(model))
     after = next(model.parameters()).detach().clone()
     # No update should happen
     assert torch.equal(before, after)
@@ -222,6 +295,6 @@ def test_train_step_uses_caller_provided_ref(tiny_model_and_tokenizer):
     rollouts = [_build_rollout([1, 2, 3, 4, 5, 6], r, 2) for r in [1, 1, 0, 0]]
     group = _FakeGroup(rollouts=rollouts, prompt_idx=0)
     before = next(model.parameters()).detach().clone()
-    train_step(model, [group], ref_model=ref)
+    train_step(model, [[group]], ref_model=ref)
     after = next(model.parameters()).detach().clone()
     assert (before - after).abs().max().item() > 0.0

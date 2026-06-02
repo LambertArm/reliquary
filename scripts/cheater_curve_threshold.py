@@ -2,7 +2,7 @@
 """Cheater-curve threshold calibration.
 
 For each run (independent fresh training trajectory):
-  - Load base Qwen3-4B as the "validator_model" (will be trained).
+  - Load base Qwen3.5-4B as the "validator_model" (will be trained).
   - Keep a frozen second copy as the "miner_model" (= the lazy cheater
     who never updates).
   - At step 1..N:
@@ -39,7 +39,6 @@ from statistics import median
 from typing import Any
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from reliquary.constants import (
     ATTN_IMPLEMENTATION,
@@ -56,8 +55,15 @@ from reliquary.environment.openmathinstruct import OpenMathInstructEnvironment
 from reliquary.protocol.crypto import indices_from_root
 from reliquary.protocol.grail_verifier import GRAILVerifier
 from reliquary.protocol.submission import RolloutSubmission
+from reliquary.protocol.tokens import encode_prompt
 from reliquary.shared.forward import forward_single_layer
 from reliquary.shared.hf_compat import resolve_hidden_size
+from reliquary.shared.modeling import (
+    first_eos_index,
+    load_text_generation_model,
+    load_tokenizer,
+    resolve_eos_token_ids,
+)
 from reliquary.validator import training as reliquary_training
 from reliquary.validator.batcher import ValidSubmission
 from reliquary.validator.verifier import (
@@ -70,7 +76,7 @@ logger = logging.getLogger("cheater_curve")
 
 
 def _load_base(repo: str, device: torch.device, *, frozen: bool = False):
-    m = AutoModelForCausalLM.from_pretrained(
+    m = load_text_generation_model(
         repo,
         torch_dtype=torch.bfloat16,
         attn_implementation=ATTN_IMPLEMENTATION,
@@ -88,32 +94,34 @@ def _generate_rollouts(
 ):
     """Return list of dicts {tokens, prompt_length, completion_length,
     optional token_logprobs}."""
-    prompt_tokens = tokenizer.encode(prompt, add_special_tokens=False)
+    prompt_tokens = encode_prompt(tokenizer, prompt)
     prompt_length = len(prompt_tokens)
+    eos_ids = resolve_eos_token_ids(model, tokenizer)
     inp = torch.tensor([prompt_tokens] * m, device=device)
+    attention_mask = torch.ones_like(inp)
     with torch.no_grad():
-        gen = model.generate(
-            inp,
-            max_new_tokens=max_tokens,
-            do_sample=True,
-            temperature=T_PROTO,
-            top_p=TOP_P_PROTO,
-            top_k=TOP_K_PROTO,
-            pad_token_id=tokenizer.pad_token_id,
-            return_dict_in_generate=True,
-            output_scores=with_logprobs,
-        )
-    eos = tokenizer.eos_token_id
+        kwargs = {
+            "max_new_tokens": max_tokens,
+            "do_sample": True,
+            "temperature": T_PROTO,
+            "top_p": TOP_P_PROTO,
+            "top_k": TOP_K_PROTO,
+            "pad_token_id": tokenizer.pad_token_id,
+            "attention_mask": attention_mask,
+            "return_dict_in_generate": True,
+            "output_scores": with_logprobs,
+        }
+        if eos_ids:
+            kwargs["eos_token_id"] = sorted(eos_ids)
+        gen = model.generate(inp, **kwargs)
     rollouts = []
     sequences = gen.sequences
     for i in range(m):
         full = sequences[i].tolist()
         comp = full[prompt_length:]
-        try:
-            first_eos = comp.index(eos)
+        first_eos = first_eos_index(comp, eos_ids)
+        if first_eos is not None:
             comp = comp[: first_eos + 1]
-        except ValueError:
-            pass
         if len(comp) == 0:
             continue
         rec = {
@@ -230,11 +238,13 @@ def _build_training_batch_from_rollouts(
                 tokens=r["tokens"],
                 reward=r["reward"],
                 commit={
+                    "tokens": r["tokens"],
                     "rollout": {
                         "prompt_length": r["prompt_length"],
                         "token_logprobs": r["token_logprobs"],
                     }
                 },
+                env_name="openmathinstruct",
             )
             for r in g["rollouts"]
         ]
@@ -258,34 +268,36 @@ def _generate_training_pool(
     pool = []
     for g_idx in range(n_groups):
         problem = env.get_problem(prompt_offset + g_idx)
-        prompt_tokens = tokenizer.encode(problem["prompt"], add_special_tokens=False)
+        prompt_tokens = encode_prompt(tokenizer, problem["prompt"])
         prompt_length = len(prompt_tokens)
+        eos_ids = resolve_eos_token_ids(model, tokenizer)
         inp = torch.tensor([prompt_tokens] * m_rollouts, device=device)
+        attention_mask = torch.ones_like(inp)
         with torch.no_grad():
-            out = model.generate(
-                inp,
-                max_new_tokens=max_tokens,
-                do_sample=True,
-                temperature=T_PROTO,
-                top_p=TOP_P_PROTO,
-                top_k=TOP_K_PROTO,
-                pad_token_id=tokenizer.pad_token_id,
-                return_dict_in_generate=True,
-                output_scores=True,
-            )
+            kwargs = {
+                "max_new_tokens": max_tokens,
+                "do_sample": True,
+                "temperature": T_PROTO,
+                "top_p": TOP_P_PROTO,
+                "top_k": TOP_K_PROTO,
+                "pad_token_id": tokenizer.pad_token_id,
+                "attention_mask": attention_mask,
+                "return_dict_in_generate": True,
+                "output_scores": True,
+            }
+            if eos_ids:
+                kwargs["eos_token_id"] = sorted(eos_ids)
+            out = model.generate(inp, **kwargs)
         sequences = out.sequences
         scores = out.scores
-        eos = tokenizer.eos_token_id
 
         rollouts = []
         for i in range(m_rollouts):
             full = sequences[i].tolist()
             comp = full[prompt_length:]
-            try:
-                first_eos = comp.index(eos)
+            first_eos = first_eos_index(comp, eos_ids)
+            if first_eos is not None:
                 comp = comp[: first_eos + 1]
-            except ValueError:
-                pass
             if len(comp) == 0:
                 continue
             lps = []
@@ -356,7 +368,7 @@ def _run_one(
     for step in range(1, n_steps + 1):
         idxs = rng.sample(range(len(pool)), train_b_batch)
         batch = _build_training_batch_from_rollouts(pool, idxs)
-        reliquary_training.train_step(validator_model, batch)
+        reliquary_training.train_step(validator_model, [batch], ref_model=miner_model)
 
         rows.extend(_measure(
             run_idx=run_idx, step=step, miner_model=miner_model,
@@ -444,7 +456,7 @@ def _summarize(rows: list[dict]) -> None:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--base-model", default="Qwen/Qwen3-4B-Instruct-2507")
+    ap.add_argument("--base-model", default="Qwen/Qwen3.5-4B")
     ap.add_argument("--n-runs", type=int, default=10)
     ap.add_argument("--n-steps", type=int, default=30)
     ap.add_argument("--measurements-per-step", type=int, default=2)
@@ -464,9 +476,7 @@ def main():
 
     device = torch.device("cuda:0")
     logger.info("Loading tokenizer + env")
-    tokenizer = AutoTokenizer.from_pretrained(args.base_model)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id
+    tokenizer = load_tokenizer(args.base_model)
     env = OpenMathInstructEnvironment()
 
     all_rows = []

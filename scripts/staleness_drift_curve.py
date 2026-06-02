@@ -32,7 +32,6 @@ from statistics import median
 
 import torch
 from huggingface_hub import HfApi, snapshot_download
-from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from reliquary.constants import (
     ATTN_IMPLEMENTATION,
@@ -50,8 +49,15 @@ from reliquary.constants import (
 from reliquary.environment.openmathinstruct import OpenMathInstructEnvironment
 from reliquary.protocol.crypto import indices_from_root
 from reliquary.protocol.grail_verifier import GRAILVerifier, adaptive_sketch_tolerance
+from reliquary.protocol.tokens import encode_prompt
 from reliquary.shared.forward import forward_single_layer
 from reliquary.shared.hf_compat import resolve_hidden_size
+from reliquary.shared.modeling import (
+    first_eos_index,
+    load_text_generation_model,
+    load_tokenizer,
+    resolve_eos_token_ids,
+)
 from reliquary.validator.verifier import (
     evaluate_token_distribution,
     verify_logprobs_claim,
@@ -60,7 +66,7 @@ from reliquary.validator.verifier import (
 
 def _load(repo_id: str, revision: str, device: torch.device):
     path = snapshot_download(repo_id=repo_id, revision=revision)
-    model = AutoModelForCausalLM.from_pretrained(
+    model = load_text_generation_model(
         path,
         torch_dtype=torch.bfloat16,
         attn_implementation=ATTN_IMPLEMENTATION,
@@ -70,29 +76,31 @@ def _load(repo_id: str, revision: str, device: torch.device):
 
 def _generate_rollouts(model, tokenizer, prompt: str, m: int,
                       max_tokens: int, device: torch.device) -> list[dict]:
-    prompt_tokens = tokenizer.encode(prompt, add_special_tokens=False)
+    prompt_tokens = encode_prompt(tokenizer, prompt)
     prompt_length = len(prompt_tokens)
+    eos_ids = resolve_eos_token_ids(model, tokenizer)
     inp = torch.tensor([prompt_tokens] * m, device=device)
+    attention_mask = torch.ones_like(inp)
     with torch.no_grad():
-        out = model.generate(
-            inp,
-            max_new_tokens=max_tokens,
-            do_sample=True,
-            temperature=T_PROTO,
-            top_p=TOP_P_PROTO,
-            top_k=TOP_K_PROTO,
-            pad_token_id=tokenizer.pad_token_id,
-        )
-    eos = tokenizer.eos_token_id
+        kwargs = {
+            "max_new_tokens": max_tokens,
+            "do_sample": True,
+            "temperature": T_PROTO,
+            "top_p": TOP_P_PROTO,
+            "top_k": TOP_K_PROTO,
+            "pad_token_id": tokenizer.pad_token_id,
+            "attention_mask": attention_mask,
+        }
+        if eos_ids:
+            kwargs["eos_token_id"] = sorted(eos_ids)
+        out = model.generate(inp, **kwargs)
     rollouts = []
     for i in range(m):
         seq = out[i].tolist()
         gen = seq[prompt_length:]
-        try:
-            first_eos = gen.index(eos)
+        first_eos = first_eos_index(gen, eos_ids)
+        if first_eos is not None:
             gen = gen[: first_eos + 1]
-        except ValueError:
-            pass
         rollouts.append({
             "tokens": prompt_tokens + gen,
             "prompt_length": prompt_length,
@@ -236,9 +244,7 @@ def main():
 
     log.info("Loading validator ckpt %s", revs[0][:8])
     validator_model, val_path = _load(args.repo_id, revs[0], val_dev)
-    tokenizer = AutoTokenizer.from_pretrained(val_path)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id
+    tokenizer = load_tokenizer(val_path)
 
     env = OpenMathInstructEnvironment()
 

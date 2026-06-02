@@ -6,7 +6,7 @@ No os.getenv() overrides. Changes require coordinated deployment.
 
 # ────────────────  GRAIL PROOF VERSION  ────────────────
 
-GRAIL_PROOF_VERSION = "v5"
+GRAIL_PROOF_VERSION = "v6"
 
 # ────────────────  CRYPTOGRAPHIC CONSTANTS  ────────────────
 
@@ -170,9 +170,6 @@ SPARSE_VALID_IDLE_SEAL_SECONDS = 180.0
 SPARSE_VALID_IDLE_MIN_DISTINCT_PROMPTS = 4
 SPARSE_VALID_MAX_WINDOW_SECONDS = 600.0
 
-# Active environment name (resolved by reliquary.environment.load_environment).
-ENVIRONMENT_NAME = "openmathinstruct"
-
 # UID that receives unused slot emission budget (the burn address).
 UID_BURN = 0
 
@@ -251,6 +248,24 @@ M_ROLLOUTS = 8
 # Training batch size — the first B valid in-zone submissions (FIFO by
 # TCP arrival, distinct prompts, not in cooldown) feed the GRPO step.
 B_BATCH = 8
+
+# (env_name, prompts_per_batch). Sum across entries = total prompts
+# processed per optimizer step. With 2 envs at B_BATCH each, we train
+# on 16 prompts × M_ROLLOUTS = 128 sequences per step.
+ENVIRONMENT_MIX: list[tuple[str, int]] = [
+    ("openmathinstruct", B_BATCH),
+    ("opencodeinstruct", B_BATCH),
+]
+
+# Runtime default for CLI/Docker operators. OpenCode remains available through
+# ENVIRONMENT_MIX, but code execution is opt-in until the runsc canary and
+# miner rollout are coordinated.
+DEFAULT_ENVIRONMENTS: str = "openmathinstruct"
+
+# Number of micro-batches accumulated before an optimizer step. Derived
+# from the mix — one micro-batch per active env. Not separately tunable
+# to keep semantics simple.
+GRAD_ACCUM_STEPS: int = len(ENVIRONMENT_MIX)
 
 # Sampling temperature fixed at protocol level. Miners who use a different
 # T would produce samples from a different distribution → biased GRPO
@@ -458,7 +473,7 @@ LR_COSINE_MAX_WINDOWS = 10_000
 
 # Default base model (HF repo id). Served as the reference for KL and the
 # cold-start checkpoint.
-DEFAULT_BASE_MODEL = "Qwen/Qwen3-4B-Instruct-2507"
+DEFAULT_BASE_MODEL = "Qwen/Qwen3.5-4B"
 
 # ────────────────  WANDB TELEMETRY (opt-in, validator-only)  ────────────────
 
@@ -480,7 +495,7 @@ WANDB_TRAINING_VERSION = "v1"
 # that produced it. Below this threshold, the rollout is presumed to be
 # artificially truncated (a miner truncating mid-reasoning to lock in a
 # favourable partial output). Upstream grail uses 0.02; we lowered to 0.01
-# after Qwen3-4B + T_PROTO=0.9 prod logs showed honest EOS clustering just
+# after Qwen-family + T_PROTO=0.9 prod logs showed honest EOS clustering just
 # below 0.02. Mid-reasoning forgery still fails (p_stop typically < 0.001).
 MIN_EOS_PROBABILITY = 0.01
 
@@ -511,6 +526,27 @@ SAMPLING_LOW_Q10_MAX = 0.025    # 10th-percentile must be above
 # under the validator's forward; honest low-confidence answer tokens stay
 # above ~10⁻³. Threshold sits in the gap.
 BOXED_ANSWER_MIN_PROB = 0.001
+
+# ────────────────  CODE EXECUTION GRADER  ────────────────
+
+# Path to the Unix domain socket the grader server listens on.
+# Default lives in /tmp so both validator and grader processes can reach it.
+GRADER_SOCKET_PATH = "/tmp/reliquary-grader.sock"
+
+# Number of warm gVisor workers in the grader pool. Sized to handle
+# M_ROLLOUTS in parallel for a single submission with headroom for
+# concurrent submissions. Increase for high-throughput validators.
+GRADER_POOL_SIZE = M_ROLLOUTS
+
+# Wall-clock timeout (seconds) for one structured OpenCode evaluation.
+# Subprocess inside the sandbox is killed if it exceeds this. Tuned
+# so that pathological miner code (infinite loops, slow algorithms)
+# fails fast without blocking the queue.
+GRADER_EVAL_TIMEOUT_SECONDS = 5
+
+# How often (seconds) the server pings each worker via a no-op eval
+# to detect zombies. Triggers respawn if a worker fails to respond.
+GRADER_HEALTH_CHECK_INTERVAL_SECONDS = 30
 
 # Token authenticity: a completion token whose chosen probability collapses
 # below this while the model's argmax sits at >= TOKEN_AUTH_ARGMAX_CONF was not

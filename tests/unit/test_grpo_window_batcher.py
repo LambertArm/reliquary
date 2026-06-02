@@ -25,6 +25,11 @@ class FakeEnv:
         return 1.0 if "CORRECT" in completion else 0.0
 
 
+class PrivateRewardFakeEnv(FakeEnv):
+    name = "opencodeinstruct"
+    validator_authoritative_reward = True
+
+
 def _always_true_grail(commit, model, randomness):
     import torch
     from reliquary.validator.verifier import ProofResult
@@ -60,7 +65,7 @@ def _make_commit(
     return {
         "tokens": tokens,
         "commitments": [{"sketch": 0} for _ in range(seq_len)],
-        "proof_version": "v5",
+        "proof_version": "v6",
         "model": {"name": "test-model", "layer_index": 6},
         "signature": "ab" * 32,
         "beacon": {"randomness": "cd" * 16},
@@ -92,6 +97,7 @@ def _request(
                 tokens=commit["tokens"],
                 reward=r,
                 commit=commit,
+                env_name="openmathinstruct",
             )
         )
     return BatchSubmissionRequest(
@@ -296,6 +302,7 @@ def test_reject_reward_mismatch():
                 tokens=commit["tokens"],
                 reward=claimed_reward,
                 commit=commit,
+                env_name="openmathinstruct",
             )
         )
     req = BatchSubmissionRequest(
@@ -309,6 +316,32 @@ def test_reject_reward_mismatch():
     resp = b.accept_submission(req)
     assert resp.accepted is False
     assert resp.reason == RejectReason.REWARD_MISMATCH
+
+
+def test_validator_authoritative_reward_overwrites_placeholder_claims():
+    """Private-reward envs cannot require miners to know hidden cases."""
+    req = _request(rewards=[0.0] * M_ROLLOUTS)
+    for rollout in req.rollouts:
+        rollout.env_name = "opencodeinstruct"
+
+    b = _make_batcher(
+        env=PrivateRewardFakeEnv(),
+        completion_text_fn=lambda rollout: (
+            "CORRECT" if int(rollout.tokens[0]) < 4 else "wrong"
+        ),
+    )
+
+    resp = b.accept_submission(req)
+
+    assert resp.accepted is True, resp.reason
+    expected = [1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
+    assert [r.reward for r in b._valid[0].rollouts] == expected
+    assert [
+        r.commit["rollout"]["total_reward"] for r in b._valid[0].rollouts
+    ] == expected
+    assert [
+        r.commit["rollout"]["success"] for r in b._valid[0].rollouts
+    ] == [True, True, True, True, False, False, False, False]
 
 
 def test_reject_outer_inner_token_split_even_if_constructed():
@@ -428,6 +461,7 @@ def _request_v21(prompt_idx=42, window_start=500,
             RolloutSubmission(
                 tokens=commit["tokens"], reward=r,
                 commit=commit,
+                env_name="openmathinstruct",
             )
         )
     return BatchSubmissionRequest(
@@ -563,6 +597,7 @@ def _request_with_prompt_tokens(
             RolloutSubmission(
                 tokens=full_tokens, reward=r,
                 commit=commit,
+                env_name="openmathinstruct",
             )
         )
     return BatchSubmissionRequest(
@@ -1163,7 +1198,10 @@ def test_accept_cap_path_truncations_at_budget():
     assert resp.reason != RejectReason.BAD_TERMINATION
 
 
-def test_reject_repeated_zero_tail_reward_shape_even_with_eos():
+def test_reward_shape_no_longer_rejects_repeated_zero_tail():
+    """The reward-shape filter was removed: it was trivially bypassed
+    (reorder rollouts / vary loser lengths) yet false-rejected honest
+    miners. A same-length zero tail is no longer grounds for rejection."""
     b = _make_batcher(
         model=_ModelStubWithVocab(),
         verify_commitment_proofs_fn=_grail_with_logits(220),
@@ -1173,8 +1211,7 @@ def test_reject_repeated_zero_tail_reward_shape_even_with_eos():
 
     resp = b.accept_submission(req)
 
-    assert resp.accepted is False
-    assert resp.reason == RejectReason.REWARD_SHAPE_SUSPICIOUS
+    assert resp.accepted is True
 
 
 def test_accept_ordered_rewards_with_varied_zero_lengths():
@@ -1368,6 +1405,7 @@ def test_hash_dup_intra_submission_collision_rejects():
             RolloutSubmission(
                 tokens=commit["tokens"], reward=(1.0 if i < 4 else 0.0),
                 commit=commit,
+                env_name="openmathinstruct",
             )
         )
     req = BatchSubmissionRequest(

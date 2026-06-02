@@ -41,9 +41,9 @@ class CheckpointStore:
 
     Production wiring (defaults):
       * ``save_fn(model, tokenizer, dir)`` → ``model.save_pretrained(dir, safe_serialization=True)``
-        + ``tokenizer.save_pretrained(dir)`` — produces ``model.safetensors``,
+        + ``tokenizer.save_pretrained(dir)`` — produces safetensors shards,
         ``config.json``, and tokenizer files in one directory so the miner's
-        ``AutoModelForCausalLM.from_pretrained`` can reload them.
+        shared text-generation loader can reload them.
       * ``upload_fn(folder_path, repo_id, commit_message)`` → HuggingFace
         ``HfApi.upload_folder`` — one commit covers the whole snapshot.
     Tests inject both as mocks to avoid torch + HF deps.
@@ -152,10 +152,10 @@ async def _default_upload(
 
 
 def _default_save_hf_format(model: Any, tokenizer: Any, path: Path) -> None:
-    """Save HF-format snapshot: model.safetensors + config.json + tokenizer files.
+    """Save HF-format snapshot: safetensors + config.json + tokenizer files.
 
-    This is what miners expect — ``AutoModelForCausalLM.from_pretrained(path)``
-    needs ``config.json`` to know the architecture. Without it, load fails with
+    This is what miners expect — the shared text-generation loader needs
+    ``config.json`` to choose the architecture. Without it, load fails with
     "Unrecognized model. Should have a `model_type` key in its config.json".
     """
     # safe_serialization=True writes a real safetensors file, not a torch pickle.

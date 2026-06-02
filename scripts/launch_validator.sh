@@ -12,6 +12,11 @@ LOG_FILE="${RELIQUARY_LOG:-/root/validator.log}"
 PID_FILE="${RELIQUARY_PID:-/root/validator.pid}"
 HTTP_HOST="${RELIQUARY_HTTP_HOST:-0.0.0.0}"
 HTTP_PORT="${RELIQUARY_HTTP_PORT:-8888}"
+ENVIRONMENTS="${RELIQUARY_ENVIRONMENTS:-openmathinstruct}"
+WALLET_PATH_ARG=""
+if [ -n "${BT_WALLET_PATH:-}" ]; then
+  WALLET_PATH_ARG="--wallet-path ${BT_WALLET_PATH}"
+fi
 
 : "${BT_WALLET_NAME?BT_WALLET_NAME not set; source scripts/.env}"
 : "${BT_HOTKEY?BT_HOTKEY not set; source scripts/.env}"
@@ -41,11 +46,12 @@ nohup .venv/bin/python -m reliquary.cli.main validate \
     --netuid "$NETUID" \
     --wallet-name "$BT_WALLET_NAME" \
     --hotkey "$BT_HOTKEY" \
-    --checkpoint "${RELIQUARY_CHECKPOINT:-gpt2}" \
+    --checkpoint "${RELIQUARY_CHECKPOINT:-Qwen/Qwen3.5-4B}" \
+    --environments "$ENVIRONMENTS" \
     --http-host "$HTTP_HOST" \
     --http-port "$HTTP_PORT" \
     --log-level INFO \
-    $drand_flag $axon_args \
+    $drand_flag $axon_args $WALLET_PATH_ARG \
     > "$LOG_FILE" 2>&1 &
 
 echo $! > "$PID_FILE"

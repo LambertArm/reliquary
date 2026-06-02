@@ -71,6 +71,9 @@ class RejectReason(str, Enum):
     BOXED_ANSWER_TAMPERED = "boxed_answer_tampered"
     TOKEN_TAMPERED = "token_tampered"
     MALFORMED_FINAL_ANSWER = "malformed_final_answer"
+    # Deprecated: the reward-shape filter no longer rejects submissions
+    # (trivially bypassable + false-positive-prone). Kept in the enum so
+    # historical archives in R2 that carry the string still deserialize.
     REWARD_SHAPE_SUSPICIOUS = "reward_shape_suspicious"
     WRONG_CHECKPOINT = "wrong_checkpoint"
     WRONG_RANDOMNESS = "wrong_randomness"
@@ -96,6 +99,7 @@ class RolloutSubmission(BaseModel):
     tokens: list[int] = Field(..., min_length=1)
     reward: float  # miner's local env.compute_reward value; validator re-checks
     commit: dict[str, Any]
+    env_name: str  # environment that generated this rollout (e.g. "openmathinstruct")
 
     @model_validator(mode="after")
     def _tokens_match_commit_tokens(self):
@@ -278,7 +282,7 @@ class CommitModel(BaseModel):
 
     tokens: list[int] = Field(..., min_length=CHALLENGE_K)
     commitments: list[dict]
-    proof_version: Literal["v5"]
+    proof_version: Literal["v6"]
     model: ModelInfo
     signature: str = Field(..., pattern=r"^[0-9a-fA-F]+$")
     beacon: BeaconInfo

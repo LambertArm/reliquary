@@ -34,7 +34,7 @@ def _submission(prompt_idx: int = 42, checkpoint_hash: str = "sha256:current",
     commit = {
         "tokens": list(range(36)),
         "commitments": [{"sketch": 0} for _ in range(36)],
-        "proof_version": "v5",
+        "proof_version": "v6",
         "model": {"name": "test", "layer_index": 6},
         "signature": "ab" * 32,
         "beacon": {"randomness": "cd" * 16},
@@ -49,7 +49,7 @@ def _submission(prompt_idx: int = 42, checkpoint_hash: str = "sha256:current",
         "prompt_idx": prompt_idx,
         "window_start": window_start,
         "merkle_root": "00" * 32,
-        "rollouts": [{"tokens": list(range(36)), "reward": 1.0, "commit": commit}] * 8,
+        "rollouts": [{"tokens": list(range(36)), "reward": 1.0, "commit": commit, "env_name": "openmathinstruct"}] * 8,
         "checkpoint_hash": checkpoint_hash,
         "drand_round": drand_round,
     }
@@ -76,6 +76,7 @@ def _submission_with_completion_tokens(
             "tokens": list(tokens),
             "reward": reward_values[idx],
             "commit": commit,
+            "env_name": rollout.get("env_name", "openmathinstruct"),
         })
     payload["rollouts"] = rollouts
     return payload
@@ -423,6 +424,33 @@ def test_claimed_out_of_zone_rejected_before_proof_admission():
     assert batcher.proof_admission_count == 0
     verdicts = list(s._verdicts.get("hkA", []))
     assert verdicts[-1]["reject_stage"] == "zone"
+
+
+def test_private_reward_env_skips_claimed_reward_zone_preflight():
+    """Private-reward envs score after hidden reward recomputation.
+
+    Miners may submit placeholder rewards for OpenCode; the HTTP preflight
+    must not reject those placeholders before the batcher can overwrite them.
+    """
+    s = ValidatorServer()
+    s.set_current_state(WindowState.OPEN)
+    batcher = _PreflightAdmissionBatcher(eos_token_id=99)
+    batcher.env.validator_authoritative_reward = True
+    s.set_active_batcher(batcher)
+    payload = _submission_with_completion_tokens(
+        list(range(4, 35)) + [99],
+        rewards=[0.0] * 8,
+    )
+    for rollout in payload["rollouts"]:
+        rollout["env_name"] = "opencodeinstruct"
+
+    with TestClient(s.app) as client:
+        r = client.post("/submit", json=payload)
+
+    body = r.json()
+    assert body["accepted"] is True, body
+    assert body["reason"] == RejectReason.ACCEPTED.value
+    assert batcher.proof_admission_count == 1
 
 
 def test_prompt_mismatch_rejected_before_proof_admission():

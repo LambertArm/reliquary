@@ -5,6 +5,20 @@ services:
     image: ghcr.io/reliquadotai/reliquary-validator:latest
     container_name: reliquary-trainer
     restart: unless-stopped
+    # Required for the OpenCodeInstruct grader's gVisor (runsc) sandbox to
+    # start: an unprivileged container fails ("cannot create gofer process /
+    # cannot create sandbox"). Verified on the prod host — only --privileged
+    # worked (seccomp=unconfined + SYS_PTRACE + SYS_ADMIN was not enough).
+    # NOTE: Watchtower clones the LIVE container's config, NOT this file, so
+    # this only takes effect after a manual `docker compose up -d` here; do
+    # that once before the grader image rolls out. Watchtower preserves it
+    # afterwards. The miner-code isolation boundary is gVisor, not the
+    # container privilege.
+    privileged: true
+    # runsc needs write access to the host cgroup namespace on cgroup v2
+    # hosts. Without this the grader workers can fail at startup with
+    # "cannot set up cgroup for root".
+    cgroup: host
     env_file: .env
     # NVIDIA Container Toolkit required on the host.
     deploy:
@@ -17,10 +31,10 @@ services:
     ports:
       - "${RELIQUARY_HTTP_PORT:-8080}:8080"
     volumes:
-      # Hotkey (readonly, needed to sign submissions + weights)
+      # Validator signing credentials (readonly)
       - type: bind
         source: ${BT_WALLETS_DIR:?set BT_WALLETS_DIR to the host path of your wallets/}
-        target: /root/.bittensor/wallets
+        target: ${BT_WALLET_PATH:-/opt/reliquary/wallets}
         read_only: true
       # Persistent state (staging checkpoints, HF cache)
       - reliquary-state:/root/reliquary/state

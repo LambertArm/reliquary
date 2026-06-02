@@ -64,11 +64,19 @@ from reliquary.validator.verifier import (
     is_in_zone,
     rewards_std,
     verify_logprobs_claim,
-    verify_reward_claim,
     verify_termination,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _uses_validator_authoritative_reward(env: Any) -> bool:
+    return bool(getattr(env, "validator_authoritative_reward", False))
+
+
+def _reward_matches_claim(actual: float, claimed: float, *, tolerance: float = 1e-6) -> bool:
+    return abs(float(actual) - float(claimed)) <= tolerance
+
 
 _PROOF_FAILURE_DEBT_STAGES = frozenset(
     {
@@ -701,11 +709,22 @@ class GrpoWindowBatcher:
                 rollout_hashes.append(h)
 
         problem = self.env.get_problem(request.prompt_idx)
+        validator_scored_reward = _uses_validator_authoritative_reward(self.env)
         completion_texts = []
         for rollout in request.rollouts:
             text = self._completion_text(rollout)
             completion_texts.append(text)
-            if not verify_reward_claim(self.env, problem, text, rollout.reward):
+            try:
+                computed_reward = float(self.env.compute_reward(problem, text))
+            except Exception:
+                return reject(RejectReason.REWARD_MISMATCH, "reward")
+            if validator_scored_reward:
+                rollout.reward = computed_reward
+                rollout_meta = rollout.commit.get("rollout")
+                if isinstance(rollout_meta, dict):
+                    rollout_meta["success"] = computed_reward > 0.5
+                    rollout_meta["total_reward"] = computed_reward
+            elif not _reward_matches_claim(computed_reward, rollout.reward):
                 return reject(RejectReason.REWARD_MISMATCH, "reward")
 
         rewards = [float(r.reward) for r in request.rollouts]
@@ -935,24 +954,20 @@ class GrpoWindowBatcher:
                         dist_q10_min=dist_q10_min,
                     )
 
+        # Reward-shape metrics are still computed (they feed the softer
+        # training-quarantine signal + archive telemetry) but no longer
+        # REJECT a submission: the ordered-prefix heuristic was trivially
+        # bypassed by reordering rollouts (10101010) and varying loser
+        # lengths, while false-positive-rejecting honest miners whose losers
+        # happened to share a length. The real defense is structural
+        # (zone/emission economics + rollout token authenticity), not this
+        # shape heuristic. See RejectReason.REWARD_SHAPE_SUSPICIOUS (kept for
+        # historical archive deserialization only).
         reward_shape = detect_reward_shape_manipulation(
             rewards,
             completion_lengths,
             truncated_flags,
         )
-        if reward_shape.suspicious:
-            logger.info(
-                "reject reason=reward_shape_suspicious hotkey=%s %s",
-                request.miner_hotkey,
-                reward_shape.to_log_dict(),
-            )
-            return reject(
-                RejectReason.REWARD_SHAPE_SUSPICIOUS,
-                "reward_shape",
-                sketch_diff_max=sketch_diff_max,
-                lp_dev_max=lp_dev_max,
-                dist_q10_min=dist_q10_min,
-            )
 
         # All checks passed — append to both the flat list and the per-prompt
         # bucket. The bucket is what seal_batch groups over.

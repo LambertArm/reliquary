@@ -1,9 +1,12 @@
 """Miner prompt-picking strategy: pull random in-range, skip cooldown."""
 
 import random
+from unittest.mock import MagicMock
+
 import pytest
 
 from reliquary.miner.engine import pick_prompt_idx
+from reliquary.shared.modeling import MODEL_SNAPSHOT_ALLOW_PATTERNS
 
 
 class FakeEnv:
@@ -51,3 +54,94 @@ def test_engine_default_max_new_tokens_is_protocol_cap():
     # `int(os.environ.get("RELIQUARY_MAX_NEW_TOKENS", ...))` default.
     src = inspect.getsource(MiningEngine.__init__)
     assert "RELIQUARY_MAX_NEW_TOKENS" not in src
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_download_allows_qwen35_shards(monkeypatch):
+    from reliquary.miner import engine as engine_mod
+
+    captured = {}
+
+    def fake_snapshot_download(**kwargs):
+        captured.update(kwargs)
+        return "/tmp/snapshot"
+
+    monkeypatch.setattr("huggingface_hub.snapshot_download", fake_snapshot_download)
+
+    result = await engine_mod._hf_download("repo/id", "abc123")
+
+    assert result == "/tmp/snapshot"
+    assert captured["allow_patterns"] == MODEL_SNAPSHOT_ALLOW_PATTERNS
+    assert "model*.safetensors" in captured["allow_patterns"]
+    assert "model.safetensors.index.json" in captured["allow_patterns"]
+
+
+def test_build_rollout_submission_uses_placeholder_for_authoritative_reward_env():
+    from reliquary.miner.engine import MiningEngine
+
+    class _PrivateRewardEnv:
+        name = "opencodeinstruct"
+        validator_authoritative_reward = True
+        compute_reward = MagicMock(side_effect=AssertionError("must not score locally"))
+
+    eng = object.__new__(MiningEngine)
+    eng.env = _PrivateRewardEnv()
+    eng.tokenizer = MagicMock()
+    eng.tokenizer.decode.return_value = "```python\ndef add(a, b): return a + b\n```"
+    eng._build_grail_commit = MagicMock(
+        return_value={
+            "tokens": [10, 11, 12, 13],
+            "rollout": {"prompt_length": 2, "completion_length": 2},
+        }
+    )
+    generation = {"tokens": [10, 11, 12, 13], "prompt_length": 2}
+
+    rollout = eng._build_rollout_submission(
+        generation, {"prompt": "p"}, "randomness", env=eng.env
+    )
+
+    assert rollout.reward == 0.0
+    assert rollout.env_name == "opencodeinstruct"
+    eng.env.compute_reward.assert_not_called()
+
+
+def test_generate_rollouts_passes_full_eos_set_and_trims_first_eos():
+    import torch
+    from types import SimpleNamespace
+
+    from reliquary.constants import M_ROLLOUTS
+    from reliquary.miner.engine import MiningEngine
+
+    class _Tok:
+        chat_template = None
+        eos_token_id = 248046
+        pad_token_id = 248044
+
+        def encode(self, text, *, add_special_tokens):
+            assert add_special_tokens is False
+            return [10, 11]
+
+    class _Model:
+        device = "cpu"
+
+        generation_config = SimpleNamespace(eos_token_id=248044)
+        config = SimpleNamespace(text_config=SimpleNamespace(eos_token_id=248044))
+
+        def __init__(self):
+            self.kwargs = None
+
+        def generate(self, input_tensor, **kwargs):
+            self.kwargs = kwargs
+            row = [10, 11, 1, 248046, 99]
+            return torch.tensor([row] * input_tensor.shape[0])
+
+    eng = object.__new__(MiningEngine)
+    eng.tokenizer = _Tok()
+    eng.vllm_model = _Model()
+    eng.max_new_tokens = 32
+
+    rollouts = eng._generate_m_rollouts({"prompt": "p"}, "00")
+
+    assert eng.vllm_model.kwargs["eos_token_id"] == [248044, 248046]
+    assert len(rollouts) == M_ROLLOUTS
+    assert all(r["tokens"] == [10, 11, 1, 248046] for r in rollouts)

@@ -79,4 +79,15 @@ def resolve_max_context_length(model_config: PretrainedConfig | Any) -> int:
         except Exception:
             pass
 
+    try:
+        text_cfg = getattr(model_config, "text_config", None)
+        if text_cfg is not None:
+            for name in candidates:
+                if hasattr(text_cfg, name):
+                    val = getattr(text_cfg, name)
+                    if isinstance(val, int) and val > 0:
+                        return val
+    except Exception:
+        pass
+
     return 16384
