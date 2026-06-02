@@ -257,6 +257,11 @@ ENVIRONMENT_MIX: list[tuple[str, int]] = [
     ("opencodeinstruct", B_BATCH),
 ]
 
+# Runtime default for CLI/Docker operators. OpenCode remains available through
+# ENVIRONMENT_MIX, but code execution is opt-in until the runsc canary and
+# miner rollout are coordinated.
+DEFAULT_ENVIRONMENTS: str = "openmathinstruct"
+
 # Number of micro-batches accumulated before an optimizer step. Derived
 # from the mix — one micro-batch per active env. Not separately tunable
 # to keep semantics simple.

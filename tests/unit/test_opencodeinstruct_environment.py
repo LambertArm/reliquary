@@ -84,8 +84,8 @@ def test_load_subset_dataset_uses_load_from_disk_for_saved_dataset(tmp_path):
         def load_from_disk(self, path):
             self.calls.append(("disk", path))
             return ["disk"]
-        def load_dataset(self, repo, split):
-            self.calls.append(("hub", repo, split))
+        def load_dataset(self, repo, split, revision=None):
+            self.calls.append(("hub", repo, split, revision))
             return ["hub"]
 
     hf = _FakeHF()
@@ -102,13 +102,31 @@ def test_load_subset_dataset_uses_hub_for_repo_id():
         def load_from_disk(self, path):
             self.calls.append(("disk", path))
             return ["disk"]
-        def load_dataset(self, repo, split):
-            self.calls.append(("hub", repo, split))
+        def load_dataset(self, repo, split, revision=None):
+            self.calls.append(("hub", repo, split, revision))
             return ["hub"]
 
     hf = _FakeHF()
     assert _load_subset_dataset("owner/repo", hf_module=hf) == ["hub"]
-    assert hf.calls == [("hub", "owner/repo", "train")]
+    assert hf.calls == [("hub", "owner/repo", "train", None)]
+
+
+def test_load_subset_dataset_passes_revision_for_hub_repo():
+    from reliquary.environment.opencodeinstruct import _load_subset_dataset
+
+    class _FakeHF:
+        def __init__(self):
+            self.calls = []
+        def load_from_disk(self, path):
+            self.calls.append(("disk", path))
+            return ["disk"]
+        def load_dataset(self, repo, split, revision=None):
+            self.calls.append(("hub", repo, split, revision))
+            return ["hub"]
+
+    hf = _FakeHF()
+    assert _load_subset_dataset("owner/repo", revision="abc123", hf_module=hf) == ["hub"]
+    assert hf.calls == [("hub", "owner/repo", "train", "abc123")]
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +205,55 @@ def test_init_allows_prompt_only_dataset_with_explicit_flag(monkeypatch):
 
     assert len(env) == 1
     assert env.get_problem(0)["prompt"] == "prompt only"
+
+
+def test_init_prompt_only_uses_public_prompt_repo_by_default(monkeypatch):
+    from reliquary.environment import opencodeinstruct as mod
+    from reliquary.environment.opencodeinstruct import OpenCodeInstructEnvironment
+
+    calls = []
+    monkeypatch.setattr(OpenCodeInstructEnvironment, "_dataset_cache", {})
+    monkeypatch.setenv("RELIQUARY_OCI_PROMPT_ONLY", "1")
+    monkeypatch.delenv("RELIQUARY_OCI_SUBSET_REPO", raising=False)
+    monkeypatch.delenv("RELIQUARY_OCI_SUBSET_REVISION", raising=False)
+    monkeypatch.setattr(
+        mod,
+        "_load_subset_dataset",
+        lambda repo, revision=None: calls.append((repo, revision)) or _FakeDataset([{"input": "prompt only"}]),
+    )
+
+    OpenCodeInstructEnvironment()
+
+    assert calls == [(
+        OpenCodeInstructEnvironment._DEFAULT_PROMPT_REPO,
+        OpenCodeInstructEnvironment._DEFAULT_PROMPT_REVISION,
+    )]
+
+
+def test_init_validator_uses_private_structured_repo_by_default(monkeypatch):
+    from reliquary.environment import opencodeinstruct as mod
+    from reliquary.environment.opencodeinstruct import OpenCodeInstructEnvironment
+
+    calls = []
+    monkeypatch.setattr(OpenCodeInstructEnvironment, "_dataset_cache", {})
+    monkeypatch.delenv("RELIQUARY_OCI_PROMPT_ONLY", raising=False)
+    monkeypatch.delenv("RELIQUARY_OCI_SUBSET_REPO", raising=False)
+    monkeypatch.delenv("RELIQUARY_OCI_SUBSET_REVISION", raising=False)
+    monkeypatch.setattr(
+        mod,
+        "_load_subset_dataset",
+        lambda repo, revision=None: calls.append((repo, revision)) or _FakeDataset([{
+            "input": "prompt",
+            "structured_cases": [_case()],
+        }]),
+    )
+
+    OpenCodeInstructEnvironment()
+
+    assert calls == [(
+        OpenCodeInstructEnvironment._DEFAULT_SUBSET_REPO,
+        OpenCodeInstructEnvironment._DEFAULT_SUBSET_REVISION,
+    )]
 
 
 def test_get_problem_shape():

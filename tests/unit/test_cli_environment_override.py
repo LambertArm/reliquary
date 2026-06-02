@@ -2,9 +2,9 @@
 ``mine`` / ``validate`` CLI commands.
 
 The ``--environments`` option accepts a comma-separated list of environment
-names. The default is derived from ``ENVIRONMENT_MIX`` in constants. Setting
-``RELIQUARY_ENVIRONMENTS`` lets operators flip or restrict environments with
-just a restart, no code push.
+names. The default is OpenMath-only so OpenCode code execution is explicit
+opt-in. Setting ``RELIQUARY_ENVIRONMENTS`` lets operators flip or restrict
+environments with just a restart, no code push.
 """
 
 from __future__ import annotations
@@ -41,22 +41,22 @@ def _get_environments_option_default(cli_module, command_name: str) -> str:
     raise AssertionError(f"command {command_name!r} not found in app")
 
 
-def test_mine_environments_defaults_to_mix_when_unset(monkeypatch):
-    """When ``RELIQUARY_ENVIRONMENTS`` is not set, the ``--environments``
-    default is derived from ``ENVIRONMENT_MIX`` (comma-joined names)."""
+def test_mine_environments_defaults_to_safe_default_when_unset(monkeypatch):
+    """When ``RELIQUARY_ENVIRONMENTS`` is not set, the miner stays on the
+    safe OpenMath-only default."""
     monkeypatch.delenv("RELIQUARY_ENVIRONMENTS", raising=False)
     cli = _reload_cli_main()
-    from reliquary.constants import ENVIRONMENT_MIX
-    expected = ",".join(name for name, _ in ENVIRONMENT_MIX)
+    from reliquary.constants import DEFAULT_ENVIRONMENTS
+    expected = DEFAULT_ENVIRONMENTS
     assert _get_environments_option_default(cli, "mine") == expected
 
 
-def test_validate_environments_defaults_to_mix_when_unset(monkeypatch):
+def test_validate_environments_defaults_to_safe_default_when_unset(monkeypatch):
     """Same fallback on the trainer/validator subcommand."""
     monkeypatch.delenv("RELIQUARY_ENVIRONMENTS", raising=False)
     cli = _reload_cli_main()
-    from reliquary.constants import ENVIRONMENT_MIX
-    expected = ",".join(name for name, _ in ENVIRONMENT_MIX)
+    from reliquary.constants import DEFAULT_ENVIRONMENTS
+    expected = DEFAULT_ENVIRONMENTS
     assert _get_environments_option_default(cli, "validate") == expected
 
 
@@ -75,7 +75,7 @@ def test_validate_environments_picks_up_env_var(monkeypatch):
     assert _get_environments_option_default(cli, "validate") == "openmathinstruct"
 
 
-def test_env_var_takes_precedence_over_mix_default(monkeypatch):
+def test_env_var_takes_precedence_over_safe_default(monkeypatch):
     """If the operator provides a custom value it wins over the computed
     default — otherwise the override would be useless."""
     monkeypatch.setenv("RELIQUARY_ENVIRONMENTS", "openmathinstruct,opencodeinstruct")

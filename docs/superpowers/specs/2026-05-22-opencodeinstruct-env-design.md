@@ -17,17 +17,23 @@ Current normative behavior:
 - The validator uses a private structured dataset with hidden cases.
 - Miners use the public prompt-only mirror:
   `R0mAI/opencodeinstruct-prompts`.
+- Default dataset revisions are pinned in
+  `reliquary/environment/opencodeinstruct.py`. Override both repo and
+  revision together for any custom dataset rollout.
 - Miner prompt-only mode requires:
 
 ```bash
-export RELIQUARY_OCI_SUBSET_REPO=R0mAI/opencodeinstruct-prompts
 export RELIQUARY_OCI_PROMPT_ONLY=1
+# Optional only if overriding the pinned default:
+# export RELIQUARY_OCI_SUBSET_REPO=R0mAI/opencodeinstruct-prompts
+# export RELIQUARY_OCI_SUBSET_REVISION=<prompt-dataset-commit-sha>
 ```
 
 - Validator private mode requires:
 
 ```bash
 export RELIQUARY_OCI_SUBSET_REPO=<private-structured-dataset>
+export RELIQUARY_OCI_SUBSET_REVISION=<structured-dataset-commit-sha>
 unset RELIQUARY_OCI_PROMPT_ONLY
 ```
 
@@ -101,7 +107,7 @@ untrusted code.
   both envs in the same optimizer step via two-batcher orchestration
   and cross-batch gradient accumulation.
 - No support for languages other than Python. OpenCodeInstruct is
-  Python-only, and the sandbox rootfs ships only a Python 3.11
+  Python-only, and the sandbox rootfs ships only a pinned Python 3.12
   interpreter.
 - No code linting / regex-based pre-filtering of miner submissions. The
   defense is the sandbox, not a deny-list. A regex filter would create
@@ -177,8 +183,8 @@ filtering, but they are not protocol reward authority.
 | `reliquary/environment/grader/server.py` | Long-running trusted process. Owns hidden expected values, worker pool, Unix-socket listener, dispatcher, watchdog, and Prometheus `/metrics`. |
 | `reliquary/environment/grader/worker.py` | Runs *inside* each gVisor sandbox. stdin → `exec(code)` + call one entrypoint with args/kwargs → JSON-safe output. It never receives hidden assertions or expected values. |
 | `reliquary/environment/grader/bundle/config.json` | OCI runtime config for `runsc`: rootfs path, args, `--network=none`, mount config, resource limits. |
-| `reliquary/environment/grader/bundle/rootfs/` | Minimal rootfs (~300 MB): `python3.12` (matches the host image's interpreter, see `Dockerfile`), stdlib, `worker.py`. Built once at image-build time, not committed to git. |
-| `scripts/build_grader_bundle.sh` | One-shot script that materializes the OCI rootfs (debootstrap or `python:3.12-slim` extracted + `worker.py` copied in). Run during Docker image build (`RUN scripts/build_grader_bundle.sh` in `Dockerfile`). |
+| `reliquary/environment/grader/bundle/rootfs/` | Minimal rootfs (~300 MB): pinned `python3.12-slim` rootfs + stdlib + `worker.py`. Built into the Docker image by a multi-stage build, not committed to git. |
+| `scripts/build_grader_bundle.sh` | Manual/local helper that materializes the same OCI rootfs by exporting the pinned Python image. The production Docker image does not depend on Docker-in-Docker at container startup. |
 | `scripts/build_opencodeinstruct_subset.py` | Offline dataset preparation (see Dataset prep section). |
 | `tests/unit/test_opencodeinstruct_environment.py` | Pure-Python tests with mocked grader client. |
 | `tests/unit/test_grader_client.py` | Serialization, retry, never-raise. |
@@ -192,8 +198,8 @@ filtering, but they are not protocol reward authority.
 |---|---|
 | `reliquary/environment/__init__.py` | Add `OpenCodeInstructEnvironment` import + `"opencodeinstruct"` case in `load_environment`. |
 | `reliquary/constants.py` | Add `GRADER_SOCKET_PATH`, `GRADER_POOL_SIZE` (default 8), `GRADER_EVAL_TIMEOUT_SECONDS` (default 5), and include OpenCode in `ENVIRONMENT_MIX` when enabled. |
-| `Dockerfile` | Install `gvisor-runsc`, run `build_grader_bundle.sh`, and create separate unprivileged service identities for the validator and grader. |
-| `docker/entrypoint.sh` | Launch the grader under a separate low-privilege identity with a scrubbed environment, then start the validator under its own service identity. Credential mounts stay readable only by the validator identity. |
+| `Dockerfile` | Install pinned `runsc`, build the pinned Python rootfs into the image, and create the optional validator service user. |
+| `docker/entrypoint.sh` | Launch the trusted grader supervisor with a scrubbed environment so it can start `runsc`; the untrusted worker runs as UID/GID 65534 inside the OCI config. The validator can optionally drop to its service user once wallet permissions are prepared. |
 | `reliquary/validator/batcher.py` | For validator-authoritative envs, recompute and overwrite rollout rewards before zone/archive/training. |
 | `reliquary/miner/engine.py` | For validator-authoritative envs, submit placeholder rewards instead of trying local hidden-case scoring. |
 
@@ -445,7 +451,7 @@ beside OpenMath instead of replacing it.
 | 0 | Current state: OMI only | — |
 | 1 | Land PR #70: env class + structured grader + sandbox + private/public datasets + validator-authoritative rewards. | Dormant if `RELIQUARY_ENVIRONMENTS=openmathinstruct` |
 | 2 | Deploy validator math-only first. Verify no behavior change. | Low |
-| 3 | Announce miner upgrade. Miners set `RELIQUARY_OCI_SUBSET_REPO=R0mAI/opencodeinstruct-prompts` and `RELIQUARY_OCI_PROMPT_ONLY=1`. | Misconfigured miners may fail to load OpenCode prompts |
+| 3 | Announce miner upgrade. Miners set `RELIQUARY_OCI_PROMPT_ONLY=1`; custom prompt repos must also set `RELIQUARY_OCI_SUBSET_REPO` and `RELIQUARY_OCI_SUBSET_REVISION`. | Misconfigured miners may fail to load OpenCode prompts |
 | 4 | Canary mixed env on live validator with the private structured dataset. Monitor per-env health. | Grader latency / OpenCode out-of-zone rate |
 | 5 | Expand after 24–72 h stable telemetry. | Rollback to `RELIQUARY_ENVIRONMENTS=openmathinstruct` if needed |
 
@@ -494,9 +500,10 @@ ENVIRONMENT_MIX: list[tuple[str, int]] = [
 GRAD_ACCUM_STEPS: int = len(ENVIRONMENT_MIX)  # 2 — derived, not separately tunable
 ```
 
-The single `ENVIRONMENT_NAME` constant is **removed**. CLI default is
-the names from `ENVIRONMENT_MIX`. No backward-compat alias — the
-hardfork is the cleanup moment.
+The single `ENVIRONMENT_NAME` constant is **removed**. `ENVIRONMENT_MIX`
+keeps the available production mix, but CLI/Docker defaults are
+OpenMath-only through `DEFAULT_ENVIRONMENTS`. OpenCode is activated only
+when `RELIQUARY_ENVIRONMENTS` explicitly includes `opencodeinstruct`.
 
 ### Batcher orchestration
 
@@ -550,8 +557,10 @@ The miner loads active envs at startup. For OpenCode it must use the
 public prompt-only mirror, not the private structured dataset:
 
 ```bash
-export RELIQUARY_OCI_SUBSET_REPO=R0mAI/opencodeinstruct-prompts
 export RELIQUARY_OCI_PROMPT_ONLY=1
+# Optional only when using a custom prompt mirror:
+# export RELIQUARY_OCI_SUBSET_REPO=R0mAI/opencodeinstruct-prompts
+# export RELIQUARY_OCI_SUBSET_REVISION=<prompt-dataset-commit-sha>
 ```
 
 In this mode the miner does not launch a local grader and does not know

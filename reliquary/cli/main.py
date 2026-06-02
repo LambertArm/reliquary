@@ -14,9 +14,15 @@ from pathlib import Path
 
 import typer
 
-from reliquary.constants import DEFAULT_BASE_MODEL, DEFAULT_HF_REPO_ID, ENVIRONMENT_MIX, VALIDATOR_HTTP_PORT
+from reliquary.constants import (
+    DEFAULT_BASE_MODEL,
+    DEFAULT_ENVIRONMENTS,
+    DEFAULT_HF_REPO_ID,
+    ENVIRONMENT_MIX,
+    VALIDATOR_HTTP_PORT,
+)
 
-_DEFAULT_ENVS = ",".join(name for name, _ in ENVIRONMENT_MIX)
+_DEFAULT_ENVS = DEFAULT_ENVIRONMENTS
 
 app = typer.Typer(name="reliquary", help="Reliquary — Verifiable Inference Subnet")
 

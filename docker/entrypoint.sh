@@ -39,22 +39,25 @@ fi
 ENVIRONMENTS="${RELIQUARY_ENVIRONMENTS:-openmathinstruct}"
 
 if [[ "${RELIQUARY_TRAIN:-0}" == "1" && ",${ENVIRONMENTS}," == *",opencodeinstruct,"* ]]; then
-  # ── If grader bundle wasn't built at image-build time, build it now ────
+  # The published image must contain the runsc bundle. Building it at
+  # container start would require a Docker socket in the validator container.
   BUNDLE_ROOTFS="/opt/reliquary/reliquary/environment/grader/bundle/rootfs"
   if [[ ! -x "${BUNDLE_ROOTFS}/usr/local/bin/python3" ]]; then
-    echo "[entrypoint] Building grader bundle (deferred from image build)..."
-    bash /opt/build_grader_bundle.sh
+    echo "[entrypoint] FATAL: grader bundle rootfs is missing from the image" >&2
+    exit 1
   fi
 
   # ── Launch grader server ───────────────────────────────────────────────
   echo "[entrypoint] Starting grader server..."
+  # runsc needs root inside this privileged container to create its state and
+  # cgroups. The trusted supervisor gets a scrubbed env; untrusted miner code
+  # still runs inside the runsc worker as the UID/GID from config.json.
   env -i \
       PATH="/opt/reliquary-venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
       HOME="/tmp" \
       GRADER_SOCKET_PATH="/tmp/reliquary-grader.sock" \
       GRADER_BUNDLE_PATH="/opt/reliquary/reliquary/environment/grader/bundle" \
-    setpriv --reuid=1001 --regid=1001 --clear-groups --inh-caps=-all \
-      python -m reliquary.environment.grader.server --use-runsc &
+    python -m reliquary.environment.grader.server --use-runsc &
   GRADER_PID=$!
   trap 'kill ${GRADER_PID} 2>/dev/null || true' EXIT
 
@@ -67,7 +70,7 @@ if [[ "${RELIQUARY_TRAIN:-0}" == "1" && ",${ENVIRONMENTS}," == *",opencodeinstru
     echo "[entrypoint] FATAL: grader socket /tmp/reliquary-grader.sock never appeared within 15s" >&2
     exit 1
   fi
-  chown 1001:1000 /tmp/reliquary-grader.sock
+  chown 0:1000 /tmp/reliquary-grader.sock
   chmod 660 /tmp/reliquary-grader.sock
 fi
 

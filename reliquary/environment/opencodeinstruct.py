@@ -52,14 +52,17 @@ def _extract_python(completion: str) -> str:
     return completion
 
 
-def _load_subset_dataset(repo: str, hf_module=None):
+def _load_subset_dataset(repo: str, revision: str | None = None, hf_module=None):
     """Load either a HF dataset repo or a local ``save_to_disk`` dataset."""
     if hf_module is None:
         import datasets as hf_module
     path = Path(repo).expanduser()
     if path.exists() and (path / "dataset_info.json").exists() and (path / "state.json").exists():
         return hf_module.load_from_disk(str(path))
-    return hf_module.load_dataset(repo, split="train")
+    kwargs = {"split": "train"}
+    if revision:
+        kwargs["revision"] = revision
+    return hf_module.load_dataset(repo, **kwargs)
 
 
 def _env_flag(name: str) -> bool:
@@ -97,15 +100,33 @@ class OpenCodeInstructEnvironment:
     name: str = "opencodeinstruct"
     validator_authoritative_reward: ClassVar[bool] = True
 
-    _dataset_cache: ClassVar = None
+    _dataset_cache: ClassVar = {}
     _DEFAULT_SUBSET_REPO: ClassVar[str] = "R0mAI/opencodeinstruct-structured-subset"
+    _DEFAULT_SUBSET_REVISION: ClassVar[str] = "6e400051a0f1e972bc1a33c8e5058c20917ecc8d"
+    _DEFAULT_PROMPT_REPO: ClassVar[str] = "R0mAI/opencodeinstruct-prompts"
+    _DEFAULT_PROMPT_REVISION: ClassVar[str] = "f50bef12e244f5d51a7ae3f55ee8d31fdf33365f"
 
     def __init__(self) -> None:
-        if OpenCodeInstructEnvironment._dataset_cache is None:
-            repo = os.environ.get("RELIQUARY_OCI_SUBSET_REPO", self._DEFAULT_SUBSET_REPO)
-            OpenCodeInstructEnvironment._dataset_cache = _load_subset_dataset(repo)
-        self._dataset = OpenCodeInstructEnvironment._dataset_cache
         self._prompt_only = _env_flag("RELIQUARY_OCI_PROMPT_ONLY")
+        default_repo = self._DEFAULT_PROMPT_REPO if self._prompt_only else self._DEFAULT_SUBSET_REPO
+        repo = os.environ.get("RELIQUARY_OCI_SUBSET_REPO", default_repo)
+        default_revision = None
+        if repo == self._DEFAULT_PROMPT_REPO:
+            default_revision = self._DEFAULT_PROMPT_REVISION
+        elif repo == self._DEFAULT_SUBSET_REPO:
+            default_revision = self._DEFAULT_SUBSET_REVISION
+        revision = os.environ.get("RELIQUARY_OCI_SUBSET_REVISION", default_revision or "")
+        revision = revision or None
+
+        cache = OpenCodeInstructEnvironment._dataset_cache
+        if isinstance(cache, dict):
+            key = (repo, revision)
+            if key not in cache:
+                cache[key] = _load_subset_dataset(repo, revision)
+            self._dataset = cache[key]
+        else:
+            # Tests may monkeypatch _dataset_cache directly with a fake dataset.
+            self._dataset = cache
         if not self._prompt_only and not _has_structured_cases_column(self._dataset):
             raise RuntimeError(
                 "OpenCodeInstruct validator dataset must include structured_cases. "

@@ -106,6 +106,20 @@ RELIQUARY_EXTERNAL_PORT=8080
 # RELIQUARY_RESUME_FROM=sha:<40-hex-hf-commit>
 ```
 
+By default the trainer runs `openmathinstruct` only. OpenCode execution is
+an explicit canary switch, not a default:
+
+```bash
+RELIQUARY_ENVIRONMENTS=openmathinstruct,opencodeinstruct
+RELIQUARY_OCI_SUBSET_REPO=<private-structured-dataset>
+RELIQUARY_OCI_SUBSET_REVISION=<structured-dataset-commit-sha>
+```
+
+The public miner prompt mirror is pinned separately by the miner-side
+OpenCode environment. Do not enable `opencodeinstruct` on the trainer until
+the Docker image contains the grader rootfs, `runsc` starts successfully, and
+the loopback grader canaries pass.
+
 
 ## Sanity checks (both modes)
 
