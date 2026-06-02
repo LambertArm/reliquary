@@ -37,7 +37,6 @@ from typing import Any
 
 import numpy as np
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from reliquary.constants import (
     ATTN_IMPLEMENTATION,
@@ -53,8 +52,15 @@ from reliquary.constants import (
 from reliquary.environment import load_environment
 from reliquary.protocol.crypto import indices_from_root, indices_from_root_in_range
 from reliquary.protocol.grail_verifier import GRAILVerifier, adaptive_sketch_tolerance
+from reliquary.protocol.tokens import encode_prompt
 from reliquary.shared.forward import forward_single_layer
 from reliquary.shared.hf_compat import resolve_hidden_size
+from reliquary.shared.modeling import (
+    first_eos_index,
+    load_text_generation_model,
+    load_tokenizer,
+    resolve_eos_token_ids,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +76,7 @@ def load_model(source: str, revision: str | None = None) -> Any:
     }
     if revision:
         kwargs["revision"] = revision
-    return AutoModelForCausalLM.from_pretrained(source, **kwargs).to("cuda:0").eval()
+    return load_text_generation_model(source, **kwargs).to("cuda:0").eval()
 
 
 def find_in_zone_rollout(
@@ -86,37 +92,39 @@ def find_in_zone_rollout(
 
     Returns (problem_dict, prompt_tokens, rollout_tokens, reward_of_chosen).
     """
-    eos = tokenizer.eos_token_id
+    eos_ids = resolve_eos_token_ids(base_model, tokenizer)
     rng = np.random.default_rng()
 
     for attempt in range(n_attempts):
         idx = int(rng.integers(0, len(env)))
         problem = env.get_problem(idx)
-        prompt_tokens = tokenizer.encode(problem["prompt"], add_special_tokens=False)
+        prompt_tokens = encode_prompt(tokenizer, problem["prompt"])
         input_ids = torch.tensor(
             [prompt_tokens] * M_ROLLOUTS, device="cuda:0",
         )
+        attention_mask = torch.ones_like(input_ids)
         with torch.no_grad():
-            out = base_model.generate(
-                input_ids,
-                max_new_tokens=max_new_tokens,
-                do_sample=True,
-                temperature=T_PROTO,
-                top_p=TOP_P_PROTO,
-                top_k=TOP_K_PROTO,
-                pad_token_id=tokenizer.pad_token_id,
-            )
+            generate_kwargs = {
+                "max_new_tokens": max_new_tokens,
+                "do_sample": True,
+                "temperature": T_PROTO,
+                "top_p": TOP_P_PROTO,
+                "top_k": TOP_K_PROTO,
+                "pad_token_id": tokenizer.pad_token_id,
+                "attention_mask": attention_mask,
+            }
+            if eos_ids:
+                generate_kwargs["eos_token_id"] = sorted(eos_ids)
+            out = base_model.generate(input_ids, **generate_kwargs)
 
         rewards: list[float] = []
         rollouts_tokens: list[list[int]] = []
         for i in range(M_ROLLOUTS):
             seq = out[i].tolist()
             gen = seq[len(prompt_tokens):]
-            try:
-                first_eos = gen.index(eos)
+            first_eos = first_eos_index(gen, eos_ids)
+            if first_eos is not None:
                 gen = gen[: first_eos + 1]
-            except ValueError:
-                pass
             full = prompt_tokens + gen
             rollouts_tokens.append(full)
             rewards.append(env.compute_reward(problem, tokenizer.decode(gen)))
@@ -164,6 +172,7 @@ def compute_model_data(model: Any, tokens: list[int], randomness_hex: str) -> di
         token_lps.append(float(log_probs_tensor[i - 1, tokens[i]].item()))
 
     return {
+        "model": model,
         "sketches": sketches,
         "logits": logits.detach().to("cpu"),
         "token_logprobs": token_lps,
@@ -258,13 +267,14 @@ def check_termination(
     if completion_len == max_completion_length:
         return True, {"reason": "max_length_natural"}
 
-    eos = getattr(tokenizer, "eos_token_id", None)
-    if eos is None or tokens[-1] != eos:
+    eos_ids = resolve_eos_token_ids(validator.get("model"), tokenizer)
+    if not eos_ids or int(tokens[-1]) not in eos_ids:
         return False, {"reason": "not_eos"}
 
     logits = validator["logits"]
     probs = logits[-2].float().softmax(dim=-1)
-    p_eos = float(probs[eos].item())
+    eos_idx = torch.tensor(sorted(eos_ids), device=probs.device, dtype=torch.long)
+    p_eos = float(probs[eos_idx].sum().item())
     return p_eos >= MIN_EOS_PROBABILITY, {
         "p_eos": round(p_eos, 4),
         "threshold": MIN_EOS_PROBABILITY,
@@ -277,7 +287,7 @@ def check_termination(
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--base-model", default="Qwen/Qwen3-4B-Instruct-2507")
+    p.add_argument("--base-model", default="Qwen/Qwen3.5-4B")
     p.add_argument("--validator-repo", default="R0mAI/reliquary-math")
     p.add_argument("--validator-revision", required=True,
                    help="HF commit SHA of the validator's current published ckpt")
@@ -299,9 +309,7 @@ def main():
         C.MIN_EOS_PROBABILITY = 0.02
 
     logger.info("Loading tokenizer + env")
-    tokenizer = AutoTokenizer.from_pretrained(args.base_model)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id
+    tokenizer = load_tokenizer(args.base_model)
     env = load_environment(args.env)
 
     logger.info("Loading BASE model (cheater) ...")

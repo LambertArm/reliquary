@@ -198,9 +198,10 @@ def _default_load_model(local_path: str):
     """Default: load a HF checkpoint onto cuda:0 in bfloat16 with the
     configured attention implementation."""
     import torch
-    from transformers import AutoModelForCausalLM
     from reliquary.constants import ATTN_IMPLEMENTATION
-    return AutoModelForCausalLM.from_pretrained(
+    from reliquary.shared.modeling import load_text_generation_model
+
+    return load_text_generation_model(
         local_path,
         torch_dtype=torch.bfloat16,
         attn_implementation=ATTN_IMPLEMENTATION,
@@ -1087,10 +1088,9 @@ class ValidationService:
         # Use the first batcher for window-level fields (they're shared).
         first_batcher = next(iter(batcher_dict.values()))
         window_opened_at = getattr(first_batcher, "window_opened_at", None)
-        eos_id = (
-            getattr(self.tokenizer, "eos_token_id", None)
-            if self.tokenizer is not None else None
-        )
+        from reliquary.shared.modeling import resolve_eos_token_ids
+
+        eos_ids = resolve_eos_token_ids(self.verify_model, self.tokenizer)
 
         def _resp_time(arrived_at: float) -> float | None:
             if window_opened_at is None or not arrived_at:
@@ -1144,9 +1144,7 @@ class ValidationService:
                 completion_length = int(rollout_dict.get(
                     "completion_length", max(0, len(tokens) - prompt_length),
                 ))
-                eos_terminated = (
-                    bool(tokens) and eos_id is not None and tokens[-1] == eos_id
-                )
+                eos_terminated = bool(tokens) and int(tokens[-1]) in eos_ids
                 entry = {
                     "tokens": tokens,
                     "reward": r.reward,

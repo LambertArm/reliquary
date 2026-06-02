@@ -12,7 +12,7 @@ check — which is the weakness the live-testnet cheater test surfaced.
 Usage on a GPU box with ``reliquary`` installed:
     python scripts/measure_sketch_drift.py \
         --hf-repo R0mAI/reliquary-math \
-        --base-model Qwen/Qwen3-4B-Instruct-2507 \
+        --base-model Qwen/Qwen3.5-4B \
         --revisions de8490f58de7d256ea9d35e0d7715... 1e81f2751fc4... \
         --output /tmp/sketch_drift.json
 
@@ -29,7 +29,6 @@ import logging
 from typing import Any
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from reliquary.constants import (
     ATTN_IMPLEMENTATION,
@@ -47,6 +46,7 @@ from reliquary.protocol.grail_verifier import (
 )
 from reliquary.shared.forward import forward_single_layer
 from reliquary.shared.hf_compat import resolve_hidden_size
+from reliquary.shared.modeling import load_text_generation_model, load_tokenizer
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +60,7 @@ def load_model(source: str, revision: str | None = None):
     if revision:
         kwargs["revision"] = revision
     return (
-        AutoModelForCausalLM.from_pretrained(source, **kwargs)
+        load_text_generation_model(source, **kwargs)
         .to("cuda:0")
         .eval()
     )
@@ -124,7 +124,7 @@ def pairwise_stats(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--base-model", default="Qwen/Qwen3-4B-Instruct-2507")
+    parser.add_argument("--base-model", default="Qwen/Qwen3.5-4B")
     parser.add_argument("--hf-repo", required=True, help="Published validator repo")
     parser.add_argument(
         "--revisions",
@@ -152,9 +152,7 @@ def main():
     )
 
     # Tokenize prompt once (tokenizer doesn't change across checkpoints).
-    tok = AutoTokenizer.from_pretrained(args.base_model)
-    if tok.pad_token_id is None:
-        tok.pad_token_id = tok.eos_token_id
+    tok = load_tokenizer(args.base_model)
     tokens = tok.encode(args.prompt, add_special_tokens=False)
     seq_len = len(tokens)
     input_ids = torch.tensor([tokens], dtype=torch.long, device="cuda:0")

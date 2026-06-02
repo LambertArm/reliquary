@@ -78,6 +78,23 @@ class _ChatTokenizerIgnoresReturnDict:
         raise AssertionError("chat-template path expected, not encode()")
 
 
+class _ThinkingTokenizer:
+    chat_template = "{% if enable_thinking %}<think>{% endif %}"
+
+    def __init__(self):
+        self.enable_thinking_seen = None
+
+    def apply_chat_template(
+        self, messages, *, add_generation_prompt, tokenize, return_dict=False,
+        enable_thinking=None,
+    ):
+        self.enable_thinking_seen = enable_thinking
+        return [3] + list(messages[0]["content"].encode("utf-8"))
+
+    def encode(self, text, *, add_special_tokens):
+        raise AssertionError("chat-template path expected, not encode()")
+
+
 class _BareTokenizer:
     chat_template = None
 
@@ -100,6 +117,12 @@ class TestEncodePrompt:
         out = encode_prompt(tok, "hi")
         assert out == [2] + list(b"hi")
         assert all(isinstance(t, int) for t in out)
+
+    def test_enables_thinking_when_template_supports_it(self):
+        tok = _ThinkingTokenizer()
+        out = encode_prompt(tok, "hi")
+        assert out == [3] + list(b"hi")
+        assert tok.enable_thinking_seen is True
 
     def test_falls_back_when_no_chat_template(self):
         tok = _BareTokenizer()
@@ -133,14 +156,15 @@ class TestEncodePrompt:
 # transformers pin in pyproject.toml in lockstep). Any drift here means
 # miners and the validator would disagree -> mass PROMPT_MISMATCH.
 _GOLDEN_PROMPT = "What is the capital of France? Answer in one word."
-_GOLDEN_TOKENS_QWEN3_4B = [
-    151644, 872, 198, 3838, 374, 279, 6722, 315, 9625, 30,
-    21806, 304, 825, 3409, 13, 151645, 198, 151644, 77091, 198,
+_GOLDEN_TOKENS_QWEN35_4B = [
+    248045, 846, 198, 3710, 369, 279, 6511, 314, 9338, 30,
+    21134, 303, 799, 3299, 13, 248046, 198, 248045, 74455, 198,
+    248068, 198,
 ]
 
 
 def test_golden_encoding_matches_production_tokenizer():
-    """Pin the exact canonical encoding for Qwen3-4B-Instruct-2507.
+    """Pin the exact canonical encoding for Qwen3.5-4B.
 
     Network-gated: skips if the tokenizer can't be fetched. Where it runs
     (validators, CI with the tokenizer cached), it locks the encoding so a
@@ -157,4 +181,4 @@ def test_golden_encoding_matches_production_tokenizer():
     except Exception as e:  # offline / model gated / network down
         pytest.skip(f"production tokenizer unavailable: {e}")
 
-    assert encode_prompt(tok, _GOLDEN_PROMPT) == _GOLDEN_TOKENS_QWEN3_4B
+    assert encode_prompt(tok, _GOLDEN_PROMPT) == _GOLDEN_TOKENS_QWEN35_4B

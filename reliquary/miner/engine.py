@@ -68,12 +68,13 @@ async def _hf_download(repo_id: str, revision: str) -> str:
     """Download a snapshot into the local HF cache and return the model folder path."""
     import asyncio
     from huggingface_hub import snapshot_download
+    from reliquary.shared.modeling import MODEL_SNAPSHOT_ALLOW_PATTERNS
 
     return await asyncio.to_thread(
         snapshot_download,
         repo_id=repo_id,
         revision=revision,
-        allow_patterns=["model.safetensors", "config.json", "tokenizer*"],
+        allow_patterns=MODEL_SNAPSHOT_ALLOW_PATTERNS,
     )
 
 
@@ -396,15 +397,15 @@ class MiningEngine:
     def _load_checkpoint(self, local_path: str):
         """Reload both hf_model and vllm_model from *local_path*.
 
-        Both attributes are ``AutoModelForCausalLM`` instances despite the
-        historical ``vllm_model`` naming — vllm_model is the fast-generation
-        copy on ``self.vllm_gpu``, hf_model is the GRAIL-proof copy on
-        ``self.proof_gpu``.
+        vllm_model is the fast-generation copy on ``self.vllm_gpu``;
+        hf_model is the GRAIL-proof copy on ``self.proof_gpu``. The shared
+        loader picks CausalLM for legacy text checkpoints and conditional
+        text-only loading for Qwen3.5.
         """
         import torch
-        from transformers import AutoModelForCausalLM
 
         from reliquary.constants import ATTN_IMPLEMENTATION
+        from reliquary.shared.modeling import load_text_generation_model
 
         if getattr(self, "_loaded_checkpoint_path", None) == local_path:
             logger.debug("_load_checkpoint: already loaded from %s", local_path)
@@ -414,7 +415,7 @@ class MiningEngine:
 
         # 1. Reload hf_model (for GRAIL proofs) on the proof GPU.
         try:
-            new_hf = AutoModelForCausalLM.from_pretrained(
+            new_hf = load_text_generation_model(
                 local_path,
                 torch_dtype=torch.bfloat16,
                 attn_implementation=ATTN_IMPLEMENTATION,
@@ -436,7 +437,7 @@ class MiningEngine:
 
         # 2. Reload vllm_model on the generation GPU.
         try:
-            new_gen = AutoModelForCausalLM.from_pretrained(
+            new_gen = load_text_generation_model(
                 local_path,
                 torch_dtype=torch.bfloat16,
                 attn_implementation=ATTN_IMPLEMENTATION,
@@ -480,34 +481,40 @@ class MiningEngine:
         import torch
 
         from reliquary.protocol.tokens import encode_prompt
+        from reliquary.shared.modeling import first_eos_index, resolve_eos_token_ids
 
         prompt_tokens = encode_prompt(self.tokenizer, problem["prompt"])
         prompt_length = len(prompt_tokens)
+        eos_ids = resolve_eos_token_ids(self.vllm_model, self.tokenizer)
+        pad_token_id = getattr(self.tokenizer, "pad_token_id", None)
+        if pad_token_id is None and eos_ids:
+            pad_token_id = min(eos_ids)
 
         with torch.no_grad():
             input_tensor = torch.tensor(
                 [prompt_tokens] * M_ROLLOUTS,
                 device=getattr(self.vllm_model, "device", "cpu"),
             )
-            outputs = self.vllm_model.generate(
-                input_tensor,
-                max_new_tokens=self.max_new_tokens,
-                do_sample=True,
-                temperature=T_PROTO,
-                top_p=TOP_P_PROTO,
-                top_k=TOP_K_PROTO,
-                pad_token_id=self.tokenizer.pad_token_id,
-            )
-        eos = self.tokenizer.eos_token_id
+            attention_mask = torch.ones_like(input_tensor)
+            generate_kwargs = {
+                "max_new_tokens": self.max_new_tokens,
+                "do_sample": True,
+                "temperature": T_PROTO,
+                "top_p": TOP_P_PROTO,
+                "top_k": TOP_K_PROTO,
+                "pad_token_id": pad_token_id,
+                "attention_mask": attention_mask,
+            }
+            if eos_ids:
+                generate_kwargs["eos_token_id"] = sorted(eos_ids)
+            outputs = self.vllm_model.generate(input_tensor, **generate_kwargs)
         rollouts = []
         for i in range(M_ROLLOUTS):
             seq = outputs[i].tolist()
             gen = seq[prompt_length:]
-            try:
-                first_eos = gen.index(eos)
+            first_eos = first_eos_index(gen, eos_ids)
+            if first_eos is not None:
                 gen = gen[: first_eos + 1]
-            except ValueError:
-                pass
             rollouts.append({
                 "tokens": prompt_tokens + gen,
                 "prompt_length": prompt_length,

@@ -9,14 +9,14 @@ completion PASSES. Run on the GPU box with the exact window checkpoint
 import json
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from reliquary.constants import T_PROTO
+from reliquary.shared.modeling import load_text_generation_model, load_tokenizer
 from reliquary.validator.verifier import ProofResult, evaluate_token_authenticity
 
 CKPT = "/root/.cache/huggingface/hub/models--R0mAI--reliquary-sn-v23/snapshots/306c4af855889b3136765f7f7d589f4d7c133089"
-tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-4B-Instruct-2507")
-model = AutoModelForCausalLM.from_pretrained(CKPT, dtype=torch.bfloat16, device_map="cuda").eval()
+tok = load_tokenizer(CKPT)
+model = load_text_generation_model(CKPT, dtype=torch.bfloat16, device_map="cuda").eval()
 dev = next(model.parameters()).device
 
 

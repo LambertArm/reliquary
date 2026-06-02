@@ -96,7 +96,7 @@ async def test_bootstrap_checkpoint_n_from_hf_commits():
         _ckpt_commit(3),
         _ckpt_commit(2),
         _ckpt_commit(1),
-        MagicMock(title="seed from Qwen/Qwen3-4B"),  # not a checkpoint commit
+        MagicMock(title="seed from Qwen/Qwen3.5-4B"),  # not a checkpoint commit
     ]
 
     # Mock _apply_resume_from so we can isolate the counting / discovery logic
@@ -320,7 +320,7 @@ async def test_bootstrap_no_op_when_hf_has_no_checkpoint_commits():
     svc = _make_service()
 
     fake_commits = [
-        MagicMock(title="seed from Qwen/Qwen3-4B"),
+        MagicMock(title="seed from Qwen/Qwen3.5-4B"),
         MagicMock(title="initial commit"),
     ]
     apply_calls: list[str] = []

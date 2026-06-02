@@ -11,7 +11,7 @@ Usage (on the H100 box, inside the validator Docker image):
 
     python scripts/smoke_train_vram.py
     python scripts/smoke_train_vram.py --completion-len 4096
-    python scripts/smoke_train_vram.py --model Qwen/Qwen3-4B-Instruct-2507
+    python scripts/smoke_train_vram.py --model Qwen/Qwen3.5-4B
 
 Exits non-zero on OOM. Use ``CUDA_VISIBLE_DEVICES=0`` to pin a GPU.
 """
@@ -61,10 +61,12 @@ def _build_batch(prompt_len: int, completion_len: int, n_groups: int, m_rollouts
         # Spread rewards so advantages aren't all-zero (otherwise the group
         # is skipped and we'd never exercise the loss path).
         for i in range(m_rollouts):
+            tokens = [1] * seq_len
             rollouts.append(_Rollout(
-                tokens=[1] * seq_len,
+                tokens=tokens,
                 reward=float(i),
                 commit={
+                    "tokens": tokens,
                     "rollout": {
                         "prompt_length": prompt_len,
                         # arbitrary but length-correct — train_step doesn't validate values
@@ -121,9 +123,10 @@ def main() -> int:
     torch.cuda.reset_peak_memory_stats()
     _print_mem("startup")
 
-    logger.info("Loading model in bf16 with attn=%s …", ATTN_IMPLEMENTATION)
-    from transformers import AutoModelForCausalLM
-    model = AutoModelForCausalLM.from_pretrained(
+    logger.info("Loading train model in bf16 with attn=%s …", ATTN_IMPLEMENTATION)
+    from reliquary.shared.modeling import load_text_generation_model
+
+    model = load_text_generation_model(
         args.model,
         torch_dtype=torch.bfloat16,
         attn_implementation=ATTN_IMPLEMENTATION,
@@ -133,7 +136,16 @@ def main() -> int:
         logger.info("gradient_checkpointing enabled")
     except (AttributeError, NotImplementedError):
         logger.warning("model does not support gradient_checkpointing_enable")
-    _print_mem("after model load")
+    _print_mem("after train model load")
+
+    logger.info("Loading frozen reference model in bf16 with attn=%s …", ATTN_IMPLEMENTATION)
+    ref_model = load_text_generation_model(
+        args.model,
+        torch_dtype=torch.bfloat16,
+        attn_implementation=ATTN_IMPLEMENTATION,
+    ).to("cuda:0").eval()
+    ref_model.requires_grad_(False)
+    _print_mem("after ref model load")
 
     batch = _build_batch(
         prompt_len=args.prompt_len,
@@ -147,7 +159,7 @@ def main() -> int:
     logger.info("=== COLD train_step (initialises optimiser + ref model) ===")
     torch.cuda.reset_peak_memory_stats()
     try:
-        train_step(model, batch, window_index=0)
+        train_step(model, [batch], ref_model=ref_model, window_index=0)
     except torch.cuda.OutOfMemoryError as e:
         _print_mem("OOM (cold)")
         logger.error("OOM during cold train_step: %s", e)
@@ -160,7 +172,7 @@ def main() -> int:
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
     try:
-        train_step(model, batch, window_index=1)
+        train_step(model, [batch], ref_model=ref_model, window_index=1)
     except torch.cuda.OutOfMemoryError as e:
         _print_mem("OOM (warm)")
         logger.error("OOM during warm train_step: %s", e)

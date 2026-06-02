@@ -92,6 +92,7 @@ class Worker:
     proc: subprocess.Popen
     slot: int
     in_use: bool = False
+    retired: bool = False
     eval_count: int = 0
     lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -105,7 +106,7 @@ class GraderServer:
         pool_size: int = GRADER_POOL_SIZE,
         worker_argv: Optional[list[str]] = None,
         eval_timeout_s: float = GRADER_EVAL_TIMEOUT_SECONDS,
-        recycle_after_evals: int = 1,
+        recycle_after_evals: int = 64,
         metrics_port: int = 9876,
     ) -> None:
         self.socket_path = socket_path
@@ -233,6 +234,12 @@ class GraderServer:
         logger.info("grader: spawned worker slot=%d pid=%d", slot, proc.pid)
         return w
 
+    def _respawn_async(self, w: Worker, reason: str) -> None:
+        w.retired = True
+        if self._stop_event.is_set():
+            return
+        threading.Thread(target=self._respawn, args=(w, reason), daemon=True).start()
+
     def _accept_loop(self) -> None:
         assert self._listen_sock is not None
         while not self._stop_event.is_set():
@@ -268,12 +275,33 @@ class GraderServer:
                 req_id = req.get("req_id", "")
                 conn.sendall(self._error_response(req_id, "grader_error") + b"\n")
                 return
-            conn.sendall(json.dumps(resp).encode() + b"\n")
+            try:
+                conn.sendall(json.dumps(resp).encode() + b"\n")
+            except BrokenPipeError:
+                logger.debug("grader: client closed before response req_id=%s", req.get("req_id", ""))
         finally:
             try:
                 conn.close()
             except Exception:
                 pass
+
+    def _acquire_worker(self, timeout: float = 30.0) -> Worker | None:
+        deadline = time.time() + timeout
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return None
+            try:
+                w = self._idle.get(timeout=remaining)
+            except queue.Empty:
+                return None
+            if w.proc.poll() is None:
+                return w
+            logger.warning(
+                "grader: idle worker slot=%d was already dead; respawning before dispatch",
+                w.slot,
+            )
+            self._respawn(w, reason="death")
 
     def _dispatch(self, req: dict) -> dict:
         cases = req.get("cases")
@@ -288,15 +316,15 @@ class GraderServer:
             }
 
         # Acquire a worker (blocks if all busy).
-        try:
-            w = self._idle.get(timeout=30.0)
-        except queue.Empty:
+        w = self._acquire_worker(timeout=30.0)
+        if w is None:
             return {
                 "req_id": req_id,
                 "passed": 0, "total": len(cases), "status": "grader_error",
             }
         try:
             passed = 0
+            w.in_use = True
             for i, case in enumerate(cases):
                 if not self._valid_case(case):
                     self._metrics.inc("grader_case_total", {"status": "bad_case"})
@@ -341,7 +369,8 @@ class GraderServer:
         finally:
             # If worker was respawned (timeout/crash), the new one is already in
             # the idle queue. Otherwise return this one.
-            if w.proc.poll() is None and not self._needs_recycle(w):
+            w.in_use = False
+            if not w.retired and w.proc.poll() is None and not self._needs_recycle(w):
                 self._idle.put(w)
 
     def _evaluate_on_worker(self, w: Worker, req: dict) -> dict:
@@ -354,7 +383,7 @@ class GraderServer:
             w.proc.stdin.flush()
         except BrokenPipeError:
             # Worker died between checks. Respawn and return failure for this req.
-            self._respawn(w, reason="death")
+            self._respawn_async(w, reason="death")
             self._metrics.inc("grader_eval_total", {"status": "crash"})
             return {
                 "req_id": req.get("req_id", ""),
@@ -376,7 +405,7 @@ class GraderServer:
 
         if t.is_alive():
             # Timeout: kill and respawn worker; return timeout status.
-            self._respawn(w, reason="timeout")
+            self._respawn_async(w, reason="timeout")
             self._metrics.inc("grader_eval_total", {"status": "timeout"})
             return {
                 "req_id": req.get("req_id", ""),
@@ -385,7 +414,7 @@ class GraderServer:
 
         line = line_holder.get("line", "")
         if not line:
-            self._respawn(w, reason="death")
+            self._respawn_async(w, reason="death")
             self._metrics.inc("grader_eval_total", {"status": "crash"})
             return {
                 "req_id": req.get("req_id", ""),
@@ -435,6 +464,8 @@ class GraderServer:
     def _respawn(self, w: Worker, reason: str = "death") -> None:
         self._terminate_worker(w)
         self._metrics.inc("grader_worker_restarts_total", {"reason": reason})
+        if self._stop_event.is_set():
+            return
         try:
             self._spawn_worker(w.slot)
         except Exception:
@@ -448,7 +479,7 @@ class GraderServer:
     def _needs_recycle(self, w: Worker) -> bool:
         if w.eval_count >= self.recycle_after_evals:
             logger.info("grader: recycling worker slot=%d after %d evals", w.slot, w.eval_count)
-            self._respawn(w, reason="recycle")
+            self._respawn_async(w, reason="recycle")
             return True
         return False
 

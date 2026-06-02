@@ -137,8 +137,8 @@ def _compute_advantages(rewards: list[float]) -> list[float]:
 # Per-rollout loss (forward-pass heavy — uses the model)
 # ---------------------------------------------------------------------------
 
-# Row-chunk for selected-logprob streaming. With Qwen3 vocab=152064:
-#   chunk × vocab × 4 bytes = 64 × 152064 × 4 ≈ 39 MiB peak fp32 alloc per chunk.
+# Row-chunk for selected-logprob streaming. With Qwen3.5 vocab=248320:
+#   chunk × vocab × 4 bytes = 64 × 248320 × 4 ≈ 61 MiB peak fp32 alloc per chunk.
 _LOGPROB_CHUNK = 64
 
 
@@ -182,6 +182,84 @@ def _selected_logprobs(
     return torch.cat(parts, dim=0)
 
 
+def _hidden_logprob_block(
+    hidden_slice: torch.Tensor,
+    indices_slice: torch.Tensor,
+    lm_head,
+) -> torch.Tensor:
+    return _logprob_block(lm_head(hidden_slice), indices_slice)
+
+
+def _selected_logprobs_from_hidden(
+    hidden_rows: torch.Tensor,
+    indices: torch.Tensor,
+    lm_head,
+    chunk: int = _LOGPROB_CHUNK,
+) -> torch.Tensor:
+    """Compute selected token logprobs from hidden states in row chunks.
+
+    This avoids materialising the full ``sequence × vocab`` logits tensor that
+    HF ``model(...).logits`` returns. Qwen3.5 has a 248k-token vocab, so the
+    full-logits path is the difference between fitting long rollouts and
+    getting killed by memory pressure. Checkpointing keeps backward memory at
+    one chunk by recomputing the LM-head/logsumexp block as needed.
+    """
+    n = hidden_rows.shape[0]
+    use_ckpt = hidden_rows.requires_grad
+    parts = []
+    for i in range(0, n, chunk):
+        end = i + chunk
+
+        def _block(h, idx):
+            return _hidden_logprob_block(h, idx, lm_head)
+
+        if use_ckpt:
+            part = torch.utils.checkpoint.checkpoint(
+                _block, hidden_rows[i:end], indices[i:end],
+                use_reentrant=False,
+            )
+        else:
+            part = _block(hidden_rows[i:end], indices[i:end])
+        parts.append(part)
+    return torch.cat(parts, dim=0)
+
+
+def _base_model_and_lm_head(model):
+    base = getattr(model, "model", None)
+    lm_head = getattr(model, "lm_head", None)
+    if base is None or lm_head is None or not callable(lm_head):
+        return None, None
+    return base, lm_head
+
+
+def _last_hidden_state(outputs):
+    hidden = getattr(outputs, "last_hidden_state", None)
+    if hidden is not None:
+        return hidden
+    try:
+        return outputs[0]
+    except (TypeError, IndexError):
+        return None
+
+
+def _selected_logprobs_for_tokens(model, tokens: torch.Tensor, next_tokens: torch.Tensor) -> torch.Tensor:
+    """Selected next-token logprobs without full-sequence logits when possible."""
+    base, lm_head = _base_model_and_lm_head(model)
+    if base is not None and lm_head is not None:
+        try:
+            base_out = base(tokens, use_cache=False)
+            hidden = _last_hidden_state(base_out)
+            if hidden is not None:
+                return _selected_logprobs_from_hidden(hidden[0, :-1], next_tokens, lm_head)
+        except TypeError:
+            # Some tiny test doubles / legacy models don't expose a compatible
+            # base forward. Fall back to the standard HF logits contract below.
+            pass
+
+    logits = model(tokens, use_cache=False).logits[0]
+    return _selected_logprobs(logits[:-1], next_tokens)
+
+
 def _rollout_loss(
     model,
     ref_model,
@@ -214,13 +292,9 @@ def _rollout_loss(
     # use_cache=True which silently disables checkpointing under HF.
     dtype_ctx = torch.autocast(device_type=device.type, dtype=torch.bfloat16) \
         if device.type in ("cuda", "cpu") else torch.autocast(device_type="cpu", enabled=False)
-    with dtype_ctx:
-        logits = model(tokens, use_cache=False).logits[0]  # [T, vocab]
-
-    # log π_new(token_{t+1} | context_<=t) computed in fp32 but streamed
-    # over rows — see _selected_logprobs.
     next_tokens = tokens[0, 1:]  # [T-1]
-    new_logprobs = _selected_logprobs(logits[:-1], next_tokens)
+    with dtype_ctx:
+        new_logprobs = _selected_logprobs_for_tokens(model, tokens, next_tokens)
 
     # Slice to completion tokens only: logits[prompt_length-1] predicts
     # tokens[prompt_length] (first completion token).
@@ -229,8 +303,7 @@ def _rollout_loss(
     # Reference model forward pass (no grad)
     with torch.no_grad():
         with dtype_ctx:
-            ref_logits = ref_model(tokens, use_cache=False).logits[0]
-        ref_logprobs = _selected_logprobs(ref_logits[:-1], next_tokens)
+            ref_logprobs = _selected_logprobs_for_tokens(ref_model, tokens, next_tokens)
     ref_logprobs_c = ref_logprobs[prompt_length - 1:]
 
     # π_old from miner (same completion slice)

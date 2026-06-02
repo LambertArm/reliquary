@@ -55,6 +55,7 @@ from reliquary.protocol.submission import (
     VerdictsResponse,
 )
 from reliquary.protocol.tokens import verify_tokens
+from reliquary.shared.modeling import resolve_eos_token_ids
 from reliquary.validator.batcher import GrpoWindowBatcher
 from reliquary.validator.dedup import compute_rollout_hash
 from reliquary.validator.observability import (
@@ -121,14 +122,8 @@ def _proof_free_eos_set(batcher: Any) -> set[int] | None:
     if tokenizer is not None and _is_mock_like(tokenizer):
         tokenizer = None
 
-    eos_ids = None
-    if model is not None:
-        gen_cfg = getattr(model, "generation_config", None)
-        if gen_cfg is not None and not _is_mock_like(gen_cfg):
-            eos_ids = getattr(gen_cfg, "eos_token_id", None)
-    if eos_ids is None and tokenizer is not None:
-        eos_ids = getattr(tokenizer, "eos_token_id", None)
-    return _coerce_eos_set(eos_ids)
+    eos = resolve_eos_token_ids(model, tokenizer)
+    return eos or None
 
 
 def _proof_free_bootstrap(batcher: Any) -> bool:

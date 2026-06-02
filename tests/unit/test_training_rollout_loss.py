@@ -16,11 +16,12 @@ except Exception:
     pytest.skip("tiny-gpt2 not available", allow_module_level=True)
 
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from reliquary.validator.training import (
     _rollout_loss, _compute_advantages, train_step, reset_training_state,
-    _selected_logprobs,
+    _selected_logprobs, _selected_logprobs_for_tokens,
 )
 
 
@@ -69,6 +70,39 @@ def test_selected_logprobs_backward_matches_reference():
     _selected_logprobs(logits_b, indices).sum().backward()
 
     torch.testing.assert_close(logits_a.grad, logits_b.grad, rtol=1e-5, atol=1e-5)
+
+
+def test_qwen_like_selected_logprobs_uses_hidden_lm_head_path():
+    class _Base(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.emb = torch.nn.Embedding(16, 8)
+            self.called = False
+
+        def forward(self, input_ids, use_cache=False):
+            self.called = True
+            return SimpleNamespace(last_hidden_state=self.emb(input_ids))
+
+    class _QwenLike(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = _Base()
+            self.lm_head = torch.nn.Linear(8, 16, bias=False)
+
+        def forward(self, *args, **kwargs):
+            raise AssertionError("full logits forward should not be used")
+
+    model = _QwenLike()
+    tokens = torch.tensor([[1, 2, 3, 4, 5]])
+    next_tokens = tokens[0, 1:]
+
+    logprobs = _selected_logprobs_for_tokens(model, tokens, next_tokens)
+    assert model.model.called
+    assert logprobs.shape == (4,)
+
+    logprobs.sum().backward()
+    assert model.model.emb.weight.grad is not None
+    assert model.lm_head.weight.grad is not None
 
 
 @pytest.fixture(scope="module")

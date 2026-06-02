@@ -8,7 +8,7 @@ Operational guide for running a miner on Bittensor subnet 81. For conceptual bac
 2. Discovers the validator's HTTP URL via the Bittensor metagraph (or uses `--validator-url` override).
 3. Calls `GET /state` to read `checkpoint_repo_id` and `checkpoint_revision`.
 4. If the validator has a published checkpoint, downloads it from Hugging Face and loads those weights.
-5. Falls back to `--checkpoint` (default: `Qwen/Qwen3-4B-Instruct-2507`) if no checkpoint is published yet.
+5. Falls back to `--checkpoint` (default: `Qwen/Qwen3.5-4B`) if no checkpoint is published yet.
 6. Enters the main loop in `MiningEngine.mine_window()`:
    - Poll `/state` every tick.
    - If `state.checkpoint_n > local_n`, download the new HF revision and reload both model copies.
@@ -328,7 +328,7 @@ reliquary mine \
     --netuid 81 \
     --wallet-name my_miner \
     --hotkey default \
-    --checkpoint Qwen/Qwen3-4B-Instruct-2507 \
+    --checkpoint Qwen/Qwen3.5-4B \
     --validator-url http://<owner-validator-ip>:8888 \
     --log-level INFO
 ```
@@ -336,6 +336,16 @@ reliquary mine \
 Once the owner validator earns `validator_permit`, you can drop `--validator-url` and the miner will auto-discover it from the metagraph.
 
 The miner queries the validator at boot and downloads the current HF checkpoint automatically. You do not need to find or pin the checkpoint hash manually.
+
+### Qwen3.5 model reset
+
+The live model family is `Qwen/Qwen3.5-4B`. This is a hard tokenizer/model reset from earlier Qwen3 checkpoints:
+
+- Always use the shared chat-template prompt encoding; do not tokenize raw prompt text directly.
+- The model is a thinking model, so canonical prompts enter the assistant turn with `<think>`.
+- Treat both `<|endoftext|>` and `<|im_end|>` as valid stop tokens; current tooling passes the full EOS set into generation and trims at the first stop token.
+- Checkpoint downloads are sharded safetensors. Custom miners must download `model*.safetensors`, `model.safetensors.index.json`, `config.json`, tokenizer files, `vocab.json`, `merges.txt`, and `chat_template.jinja`.
+- Expect longer completions than the old non-thinking checkpoint and recalibrate local EOS/truncation filters from validator verdicts.
 
 Additional flags:
 
@@ -382,7 +392,7 @@ grep -E "submitted|rejected|accepted" ~/miner.log | tail -50
 ## Troubleshooting
 
 - **`no validator with permit and routable axon`**: no active validator has published an HTTP endpoint on the metagraph. During the subnet-launch phase this is expected — the owner validator (`5CXzFHfeiJ4Xkiirq4ej1MrRVCd789wEJXhpf2ZKRW6MNFJF`) does not yet hold `validator_permit`. Pass `--validator-url http://<owner-validator-ip>:8888` to pin it explicitly (see [Launch](#launch)). After launch, wait for a validator to come back online or point at a known one.
-- **CUDA out of memory**: two copies of Qwen3-4B-Instruct require ~16 GB bfloat16 total. If you have a single GPU with less than 24 GB you may hit OOM. Use a GPU with more VRAM or reduce precision.
+- **CUDA out of memory**: two copies of Qwen3.5-4B require roughly 18-20 GB bfloat16 before activations and KV/cache overhead. If you have a single GPU with less than 48 GB you may hit OOM under proofs plus generation. Use a larger GPU or split generation/proofs across devices.
 - **`GRAIL_FAIL` / `LOGPROB_MISMATCH`**: your local proof compute diverged from the validator's. Most often caused by a different `attn_implementation` build, CUDA/torch version mismatch, or wrong checkpoint. Re-install on a clean environment and confirm you are on the same HF revision as the validator (check `/state`).
 - **`REWARD_MISMATCH`**: validator-side reward computation disagreed with the miner's claimed `rollout.reward`, or reward computation failed. Recheck completion decoding, answer parsing, prompt indexing, and env version.
 - **All submissions land `OUT_OF_ZONE`**: the prompts you are selecting are too easy (σ ≈ 0) or too hard (σ ≈ 0) for the current checkpoint. The reference engine samples uniformly; if you have overridden prompt selection, broaden the range.

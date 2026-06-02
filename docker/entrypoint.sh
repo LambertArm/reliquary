@@ -88,7 +88,7 @@ if [[ "${RELIQUARY_TRAIN:-0}" == "1" ]]; then
   : "${RELIQUARY_HF_REPO_ID:?RELIQUARY_HF_REPO_ID required in trainer mode}"
   args+=(
     --train
-    --checkpoint   "${RELIQUARY_CHECKPOINT:-Qwen/Qwen3-4B-Instruct-2507}"
+    --checkpoint   "${RELIQUARY_CHECKPOINT:-Qwen/Qwen3.5-4B}"
     --hf-repo-id   "${RELIQUARY_HF_REPO_ID}"
     --http-host    "${RELIQUARY_HTTP_HOST:-0.0.0.0}"
     --http-port    "${RELIQUARY_HTTP_PORT:-8080}"

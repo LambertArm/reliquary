@@ -34,7 +34,7 @@ def hash_tokens(tokens: list[int]) -> bytes:
 def encode_prompt(tokenizer: Any, prompt_text: str) -> list[int]:
     """Canonical prompt → token encoder shared by miner and validator.
 
-    Instruct models (Qwen3-4B-Instruct-2507, etc.) ship a chat template
+    Instruct/thinking models (Qwen3.5, etc.) ship a chat template
     that wraps the user message in role markers; feeding them the bare
     string never reaches the assistant turn so the model just continues
     the prompt instead of answering. Apply the chat template when one is
@@ -54,12 +54,14 @@ def encode_prompt(tokenizer: Any, prompt_text: str) -> list[int]:
         # even with tokenize=True; request return_dict=False for a flat list
         # and still defensively unwrap input_ids if a version ignores it.
         # Without this, list(...) iterates the dict keys ('input_ids', ...).
-        encoded = tokenizer.apply_chat_template(
-            messages,
-            add_generation_prompt=True,
-            tokenize=True,
-            return_dict=False,
-        )
+        kwargs = {
+            "add_generation_prompt": True,
+            "tokenize": True,
+            "return_dict": False,
+        }
+        if "enable_thinking" in chat_template:
+            kwargs["enable_thinking"] = True
+        encoded = tokenizer.apply_chat_template(messages, **kwargs)
         if isinstance(encoded, dict) or hasattr(encoded, "input_ids"):
             encoded = encoded["input_ids"]
         return list(encoded)

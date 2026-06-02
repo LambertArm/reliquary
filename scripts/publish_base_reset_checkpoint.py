@@ -19,7 +19,7 @@ import tempfile
 from pathlib import Path
 
 
-DEFAULT_BASE_MODEL = "Qwen/Qwen3-4B-Instruct-2507"
+DEFAULT_BASE_MODEL = "Qwen/Qwen3.5-4B"
 CHECKPOINT_TITLE = re.compile(r"^checkpoint\s+(\d+)\s*$", re.IGNORECASE)
 
 
@@ -109,7 +109,7 @@ def main() -> None:
         return
 
     import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from reliquary.shared.modeling import load_text_generation_model, load_tokenizer
 
     parent = Path(args.work_dir) if args.work_dir else Path(tempfile.gettempdir())
     snapshot_dir = parent / f"reliquary_base_reset_ckpt_{next_n}"
@@ -118,9 +118,9 @@ def main() -> None:
 
     try:
         print("Loading tokenizer...")
-        tokenizer = AutoTokenizer.from_pretrained(base_model, token=token)
+        tokenizer = load_tokenizer(base_model, token=token)
         print("Loading base model...")
-        model = AutoModelForCausalLM.from_pretrained(
+        model = load_text_generation_model(
             base_model,
             torch_dtype=torch.bfloat16,
             token=token,
