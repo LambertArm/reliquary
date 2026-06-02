@@ -15,6 +15,10 @@ services:
     # afterwards. The miner-code isolation boundary is gVisor, not the
     # container privilege.
     privileged: true
+    # runsc needs write access to the host cgroup namespace on cgroup v2
+    # hosts. Without this the grader workers can fail at startup with
+    # "cannot set up cgroup for root".
+    cgroup: host
     env_file: .env
     # NVIDIA Container Toolkit required on the host.
     deploy:

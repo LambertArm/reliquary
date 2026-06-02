@@ -200,13 +200,16 @@ def mine(
     async def _run():
         import bittensor as bt
         import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-
         from reliquary.constants import ATTN_IMPLEMENTATION
         from reliquary.environment import load_environments
         from reliquary.infrastructure.chain import get_subtensor, get_metagraph, NETUID
         from reliquary.miner.engine import MiningEngine
         from reliquary.miner.submitter import discover_validator_url, get_window_state_v2
+        from reliquary.shared.modeling import (
+            MODEL_SNAPSHOT_ALLOW_PATTERNS,
+            load_text_generation_model,
+            load_tokenizer,
+        )
 
         wallet_kwargs = {"name": wallet_name, "hotkey": hotkey}
         if wallet_path:
@@ -237,6 +240,7 @@ def mine(
                 initial_path = snapshot_download(
                     repo_id=state.checkpoint_repo_id,
                     revision=state.checkpoint_revision,
+                    allow_patterns=MODEL_SNAPSHOT_ALLOW_PATTERNS,
                 )
                 logger.info("Using initial checkpoint path: %s", initial_path)
             else:
@@ -253,21 +257,19 @@ def mine(
 
         # --- Load models from resolved path ---
         logger.info("Loading models from %s...", initial_path)
-        tokenizer = AutoTokenizer.from_pretrained(initial_path)
-        if tokenizer.pad_token_id is None:
-            tokenizer.pad_token_id = tokenizer.eos_token_id
+        tokenizer = load_tokenizer(initial_path)
 
         # Use 2 GPUs when available (vllm on 0, HF proof on 1). Fall back to
         # sharing GPU 0 for test boxes that only expose one device.
         proof_device = "cuda:1" if torch.cuda.device_count() >= 2 else "cuda:0"
 
-        vllm_model = AutoModelForCausalLM.from_pretrained(
+        vllm_model = load_text_generation_model(
             initial_path,
             torch_dtype=torch.bfloat16,
             attn_implementation=ATTN_IMPLEMENTATION,
         ).to("cuda:0").eval()
 
-        hf_model = AutoModelForCausalLM.from_pretrained(
+        hf_model = load_text_generation_model(
             initial_path,
             torch_dtype=torch.bfloat16,
             attn_implementation=ATTN_IMPLEMENTATION,
@@ -391,17 +393,14 @@ def validate(
 
         if train:
             import torch
-            from transformers import AutoModelForCausalLM, AutoTokenizer
-
             from reliquary.constants import ATTN_IMPLEMENTATION
+            from reliquary.shared.modeling import load_text_generation_model, load_tokenizer
             from reliquary.validator.service import ValidationService
 
             logger.info("Loading model from %s...", checkpoint)
-            tokenizer = AutoTokenizer.from_pretrained(checkpoint)
-            if tokenizer.pad_token_id is None:
-                tokenizer.pad_token_id = tokenizer.eos_token_id
+            tokenizer = load_tokenizer(checkpoint)
 
-            model = AutoModelForCausalLM.from_pretrained(
+            model = load_text_generation_model(
                 checkpoint,
                 torch_dtype=torch.bfloat16,
                 attn_implementation=ATTN_IMPLEMENTATION,

@@ -16,6 +16,7 @@ from reliquary.constants import (
     MIN_EOS_PROBABILITY,
     T_PROTO,
 )
+from reliquary.shared.modeling import resolve_eos_token_ids
 
 logger = logging.getLogger(__name__)
 
@@ -81,24 +82,8 @@ def verify_signature(commit: dict, hotkey: str) -> bool:
 
 
 def _eos_set_from_model(model: Any, tokenizer: Any) -> set[int]:
-    """Resolve the EOS token set the way termination/p_stop both expect.
-
-    Tries ``model.generation_config.eos_token_id`` first (production
-    Qwen3 ships [151645, 151643] there), then falls back to the
-    tokenizer's ``eos_token_id``. Returns an empty set when nothing is
-    declared — callers should treat that as "no EOS gate available".
-    """
-    eos_ids: Any = None
-    gen_cfg = getattr(model, "generation_config", None) if model is not None else None
-    if gen_cfg is not None:
-        eos_ids = getattr(gen_cfg, "eos_token_id", None)
-    if eos_ids is None:
-        eos_ids = getattr(tokenizer, "eos_token_id", None)
-    if eos_ids is None:
-        return set()
-    if isinstance(eos_ids, int):
-        eos_ids = [eos_ids]
-    return {int(e) for e in eos_ids if e is not None}
+    """Resolve all stop tokens used by termination and p_stop checks."""
+    return resolve_eos_token_ids(model, tokenizer)
 
 
 def verify_termination(

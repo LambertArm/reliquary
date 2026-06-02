@@ -473,7 +473,7 @@ LR_COSINE_MAX_WINDOWS = 10_000
 
 # Default base model (HF repo id). Served as the reference for KL and the
 # cold-start checkpoint.
-DEFAULT_BASE_MODEL = "Qwen/Qwen3-4B-Instruct-2507"
+DEFAULT_BASE_MODEL = "Qwen/Qwen3.5-4B"
 
 # ────────────────  WANDB TELEMETRY (opt-in, validator-only)  ────────────────
 
@@ -495,7 +495,7 @@ WANDB_TRAINING_VERSION = "v1"
 # that produced it. Below this threshold, the rollout is presumed to be
 # artificially truncated (a miner truncating mid-reasoning to lock in a
 # favourable partial output). Upstream grail uses 0.02; we lowered to 0.01
-# after Qwen3-4B + T_PROTO=0.9 prod logs showed honest EOS clustering just
+# after Qwen-family + T_PROTO=0.9 prod logs showed honest EOS clustering just
 # below 0.02. Mid-reasoning forgery still fails (p_stop typically < 0.001).
 MIN_EOS_PROBABILITY = 0.01
 

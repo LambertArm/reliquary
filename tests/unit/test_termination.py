@@ -14,6 +14,7 @@ recompute the softmax inside the verifier.
 
 import pytest
 import torch
+from types import SimpleNamespace
 
 from reliquary.constants import MIN_EOS_PROBABILITY
 from reliquary.validator.verifier import (
@@ -100,6 +101,20 @@ def test_uses_p_stop_at_second_to_last_position():
     logits[-2, 99] = 5.0  # p(EOS|context-at-pos-2) ~ 0.97
     proof = _proof_from_logits(logits, eos_token_id=99)
     assert verify_termination(_commit(tokens), _FakeTokenizer(), proof) is True
+
+
+def test_accepts_tokenizer_eos_even_when_model_generation_eos_differs():
+    """Qwen3.5 advertises <|endoftext|> on generation config while the chat
+    tokenizer ends turns with <|im_end|>; the validator must accept both."""
+    model = SimpleNamespace(
+        generation_config=SimpleNamespace(eos_token_id=98),
+        config=SimpleNamespace(text_config=SimpleNamespace(eos_token_id=98)),
+    )
+    tokenizer = SimpleNamespace(eos_token_id=99)
+    tokens = [1, 2, 99]
+    proof = ProofResult(all_passed=True, passed=1, checked=1, p_stop=0.99)
+
+    assert verify_termination(_commit(tokens), tokenizer, proof, model=model) is True
 
 
 # ---------------------------------------------------------------------
