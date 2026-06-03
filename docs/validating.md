@@ -106,8 +106,9 @@ RELIQUARY_EXTERNAL_PORT=8080
 # RELIQUARY_RESUME_FROM=sha:<40-hex-hf-commit>
 ```
 
-By default the trainer runs `openmathinstruct` only. OpenCode execution is
-an explicit canary switch, not a default:
+By default the Docker/CLI trainer starts with `openmathinstruct` only. The live
+trainer may explicitly opt in to mixed training once the private grader and
+dataset are configured:
 
 ```bash
 RELIQUARY_ENVIRONMENTS=openmathinstruct,opencodeinstruct
@@ -119,6 +120,10 @@ The public miner prompt mirror is pinned separately by the miner-side
 OpenCode environment. Do not enable `opencodeinstruct` on the trainer until
 the Docker image contains the grader rootfs, `runsc` starts successfully, and
 the loopback grader canaries pass.
+
+Miners must use the public prompt-only OpenCode mirror. Validators must use the
+private structured dataset that contains hidden `structured_cases`; do not set
+`RELIQUARY_OCI_PROMPT_ONLY=1` on a validator.
 
 
 ## Sanity checks (both modes)
@@ -179,7 +184,7 @@ These are the live thresholds the trainer applies on every submission. The same 
 
 | Constant | Value | Effect |
 |---|---|---|
-| `B_BATCH` | 8 | Number of valid distinct-prompt submissions that seal a window |
+| `B_BATCH` | 8 | Number of valid distinct-prompt submissions targeted per active environment |
 | `M_ROLLOUTS` | 8 | Required rollout count per submission |
 | `T_PROTO` | 0.9 | Protocol-fixed sampling temperature (validator's recompute uses this) |
 | `SIGMA_MIN` (steady) | 0.43 | Zone filter: groups below this are rejected `OUT_OF_ZONE` (binary equivalent: k ∈ [2, 6] for M=8) |
@@ -190,12 +195,15 @@ These are the live thresholds the trainer applies on every submission. The same 
 | `PROOF_SKETCH_TOLERANCE_GROWTH` | 5.0 | Per-position sqrt growth |
 | `LOGPROB_IS_EPS` | 0.10 | Per-token log-prob deviation max — exceeding triggers `LOGPROB_MISMATCH` |
 | `MIN_EOS_PROBABILITY` | 0.01 | Required EOS token probability for proper termination |
-| `MAX_TRUNCATED_PER_SUBMISSION` | 5 | Steady-state cap/non-EOS truncation allowance; accepted cap hits still pass GRAIL/logprob/distribution/boxed checks |
-| `BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION` | 5 | Bootstrap truncation allowance |
+| `MAX_TRUNCATED_PER_SUBMISSION` | 1 | Steady-state cap/non-EOS truncation allowance; accepted cap hits still pass GRAIL/logprob/distribution/boxed checks |
+| `BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION` | 1 | Bootstrap truncation allowance |
 | `TRAINING_QUARANTINE_ENABLED` | true | Suspicious selected windows skip GRPO/publish but remain archived/credited |
 | `TRAINING_QUARANTINE_MAX_SINGLE_COMPLETION_LENGTH` | 7000 | Rollout length that counts as extreme-length telemetry |
 | `TRAINING_QUARANTINE_EXTREME_LENGTH_MIN_ROLLOUTS` | 4 | Minimum long/cap rollouts before length alone can quarantine a window |
 | `TRAINING_QUARANTINE_EXTREME_LENGTH_MIN_GROUPS` | 3 | Minimum groups with long/cap rollouts before length alone can quarantine a window |
+| `SPARSE_VALID_IDLE_MIN_DISTINCT_PROMPTS` | 4 | Partial-seal threshold for sparse windows with some valid work |
+| `SPARSE_VALID_IDLE_SEAL_SECONDS` | 180 | If at least 4 distinct prompts are valid and no new valid prompt arrives for this long, force-seal partial |
+| `SPARSE_VALID_MAX_WINDOW_SECONDS` | 600 | Force-seal sparse or zero-valid windows once queue/proofs are drained |
 | `WINDOW_TIMEOUT_SECONDS` | 7200 | Safety-net auto-seal if fewer than B submissions arrive in 2 h |
 | `EMA_ALPHA` | ≈0.0274 | Weight-update smoothing (`2/(72+1)` — ~25-window half-life) |
 | `REJECTED_LIST_CAP_PER_HOTKEY` | 5 | Max rejected samples retained per hotkey per window archive |

@@ -92,11 +92,13 @@ Expected symptoms:
 
 Initial hardening counted cap hits without natural EOS as truncations and made
 sure tolerated truncations still pass GRAIL/logprob/distribution/boxed checks.
-The current acceptance budget is intentionally loose
-(`MAX_TRUNCATED_PER_SUBMISSION = 5`,
-`BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION = 5`) while the team observes miner
-adaptation. Training quarantine separately tracks dense cap/extreme-length
-patterns so one bad long sample does not freeze checkpoint progress by itself.
+The live acceptance budget is now intentionally narrow:
+`MAX_TRUNCATED_PER_SUBMISSION = 1` and
+`BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION = 1`. A single missing-EOS rollout can
+still be an honest local cap accident, but repeated missing-EOS rollouts in one
+GRPO group are treated as a sampling policy rather than a rare exception.
+Training quarantine separately tracks dense cap/extreme-length patterns so one
+bad long sample does not freeze checkpoint progress by itself.
 
 Natural EOS at the cap is not counted as truncation if:
 
