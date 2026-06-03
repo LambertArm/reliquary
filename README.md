@@ -14,7 +14,7 @@ This converts DAPO's reactive Dynamic Sampling filter into an ex-ante prediction
 
 ## What it does
 
-Each training window is one possible GRPO step. The cadence is event-driven: a window seals once enough valid distinct-prompt rollout groups land, then final selection is ordered by drand/canonical rules rather than validator-side TCP latency. The validator recomputes rewards itself, quarantines suspicious selected windows from training, and runs a PPO-clipped surrogate loss with a KL penalty against the frozen reference on healthy full batches. Updated weights are published to a public HF repo on the configured publish cadence.
+Each training window is one possible GRPO step. The cadence is event-driven: a window seals once enough valid distinct-prompt rollout groups land, then final selection is ordered by drand/canonical rules rather than validator-side TCP latency. The live policy is `Qwen/Qwen3.5-4B`, and the current trainer can run a mixed OpenMath + OpenCode environment. The validator recomputes rewards itself, quarantines suspicious selected windows from training, and runs a PPO-clipped surrogate loss with a KL penalty against the frozen reference on healthy full batches. Updated weights are published to a public HF repo on the configured publish cadence.
 
 The network produces three artefacts: a continuously-trained model (published to HF every ten trained windows), a per-window rollout dataset (archived to R2), and a signed checkpoint manifest (served from `/checkpoint`) that lets anyone verify the chain of custody from a base model through every training step. The audit trail is cryptographic — each rollout carries a GRAIL sketch that lets the validator re-run the forward pass and confirm the generation came from the announced checkpoint.
 
@@ -58,8 +58,9 @@ Miners submit rollout groups to `/submit` and poll `/state` for checkpoint updat
 - **v1** — verifiable-inference dataset production (shipped, deprecated)
 - **v2** — GRPO market with in-subnet training (shipped)
 - **v2.1** — batch-driven windows, HF checkpoint distribution, EMA scoring (shipped)
-- **v2.3** — drand ordering, multi-miner-per-prompt, prompt emission split (current)
-- **v2.4 direction** — private/generated reward tasks and stronger anti-selection protocol design (planned)
+- **v2.3** — drand ordering, multi-miner-per-prompt, prompt emission split (shipped)
+- **v2.4** — Qwen3.5 reset, mixed OpenMath/OpenCode training, private validator-authoritative OpenCode grader (current rollout)
+- **v2.5 direction** — private/generated reward tasks and stronger anti-selection protocol design (planned)
 
 ## License
 

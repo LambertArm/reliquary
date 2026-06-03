@@ -35,13 +35,10 @@ PROOF_NUM_BUCKETS = 8
 # Bounded coefficient range for sketch robustness: r in [-127, 127].
 PROOF_COEFF_RANGE = 127
 
-# Sketch tolerance at position 0. Calibrated against a 10×30 cheater-curve
-# sweep (scripts/cheater_curve_threshold.py) where a frozen base miner
-# faces a freshly-trained validator: 1000 catches a 1-step-stale cheater
-# with 75 % probability and 95 %+ from step 10 onwards, with 0 % false
-# positives same-GPU. Subnet currently in test phase — miners are advised
-# to use the same card as the validator (H200) until cross-GPU honest
-# noise is measured. See docs/mining.md.
+# Sketch tolerance at position 0. Keep this synchronized with the current
+# production calibration and docs/mining.md. The value is deliberately higher
+# than the strict same-GPU cheater-curve threshold to leave room for honest
+# cross-kernel / cross-GPU numerical drift during the Qwen3.5 rollout.
 PROOF_SKETCH_TOLERANCE_BASE = 5000
 
 # Sketch tolerance sqrt growth factor per position.
@@ -245,8 +242,8 @@ BOOTSTRAP_SIGMA_MIN = 0.33
 # Number of rollouts per submission (= size of each GRPO group).
 M_ROLLOUTS = 8
 
-# Training batch size — the first B valid in-zone submissions (FIFO by
-# TCP arrival, distinct prompts, not in cooldown) feed the GRPO step.
+# Training batch size per active environment. Final selection is drand-round /
+# canonical ordered, not TCP FIFO; distinct prompt representatives feed GRPO.
 B_BATCH = 8
 
 # (env_name, prompts_per_batch). Sum across entries = total prompts

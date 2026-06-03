@@ -16,9 +16,21 @@ Operational guide for running a miner on Bittensor subnet 81. For conceptual bac
 
 The boot query ensures a miner joining an already-running subnet lands directly on the current model, skipping an initial reject cycle.
 
-## What a miner does (v2.3)
+## What a miner does (v2.4)
 
-Windows are event-driven, not time-based. A window seals the instant `B_BATCH = 8` valid distinct-prompt submissions land; there is no fixed 60-second cadence. A safety-net timeout (`WINDOW_TIMEOUT_SECONDS = 7200`) auto-seals the window if fewer than 8 valid submissions land in that window.
+Windows are event-driven, not time-based. A normal window seals when the active
+environment targets have enough valid distinct-prompt submissions. Each
+environment target is `B_BATCH = 8`; in the current mixed OpenMath/OpenCode
+rollout, a fully trained window is 8 OpenMath groups plus 8 OpenCode groups.
+If an environment remains sparse, the validator may force-seal partial once the
+queue and proof work are drained:
+
+- `SPARSE_VALID_IDLE_SEAL_SECONDS = 180` after at least 4 distinct valid prompts;
+- `SPARSE_VALID_MAX_WINDOW_SECONDS = 600` for sparse or zero-valid windows;
+- `WINDOW_TIMEOUT_SECONDS = 7200` remains the outer safety-net timeout.
+
+Partial windows are archived and credited, but they skip GRPO/publish unless
+every active environment reaches its target.
 
 > **v2.3 (May 2026)**: TCP-arrival FIFO is gone. Ordering is now anchored to the drand quicknet round each submission carries (`drand_round` field), and the per-prompt single-winner short-circuit (`SUPERSEDED`) is replaced by a per-prompt cap with **emission split among all submitters** for that prompt. Co-location with the validator no longer wins the race. Full design in [docs/superpowers/specs/2026-05-15-drand-ordering-and-prompt-split-design.md](superpowers/specs/2026-05-15-drand-ordering-and-prompt-split-design.md), implementation in [PR #28](https://github.com/reliquadotai/reliquary/pull/28).
 
@@ -28,11 +40,11 @@ Every miner runs a continuous poll-submit loop:
    - If `state != "open"`, the validator is in `TRAINING` or `PUBLISHING`. Sleep briefly (1 s) and re-poll. Do not submit while the window is not open.
    - If `checkpoint_n` advanced since the last poll, download the new HF revision and reload weights.
 
-2. **Picks a prompt.** Selects a `prompt_idx` from the **OpenMathInstruct-2** environment ([`nvidia/OpenMathInstruct-2`](https://huggingface.co/datasets/nvidia/OpenMathInstruct-2), ~14 million problems, math-reasoning style) that is not in `cooldown_prompts`. The reference engine uses uniform-random sampling with rejection against the cooldown set. (v2.3 switched from Hendrycks MATH because the 12 500-prompt env exhausted under one-shot cooldown — see "One-shot prompts" below.)
+2. **Picks a prompt.** Selects a `prompt_idx` from one active environment. OpenMath uses **OpenMathInstruct-2** ([`nvidia/OpenMathInstruct-2`](https://huggingface.co/datasets/nvidia/OpenMathInstruct-2), ~14 million problems, math-reasoning style) and local reward computation. OpenCode uses the public prompt-only mirror and validator-authoritative hidden tests. In both cases, skip prompts in `cooldown_prompts`. The reference engine uses uniform-random sampling with rejection against the cooldown set. (v2.3 switched OpenMath from Hendrycks MATH because the 12 500-prompt env exhausted under one-shot cooldown — see "One-shot prompts" below.)
 
 3. **Generates M=8 rollouts.** Runs exactly 8 completions at the protocol-fixed `T_PROTO = 0.9`, `top_p = 1.0`, `top_k = 0`. Generate cleanly, terminate at the first EOS, and do not pad or force max length.
 
-4. **Claims each rollout reward.** The miner computes `env.compute_reward(problem, completion_text)` locally and sends that value as `rollout.reward`. The validator recomputes the same reward and rejects with `REWARD_MISMATCH` if the claim differs. This restores miner-side frontier/prompt priors while still preventing reward lies.
+4. **Provides rollout rewards.** OpenMath miners compute `env.compute_reward(problem, completion_text)` locally and send that value as `rollout.reward`; the validator recomputes it and rejects mismatches. OpenCode miners must run in prompt-only mode and should send placeholder rewards if the client shape requires them; the validator owns hidden cases, recomputes the real code reward, and overwrites local claims before the zone filter. This keeps math frontier priors available while preventing code from becoming a public hidden-test oracle game.
 
 5. **Builds GRAIL sketches.** Runs the bit-identical HuggingFace forward pass on the proof GPU to construct sketch commitments that bind the completions to the model. The r_vec seed **must** come from `state.randomness` exactly — local re-derivation will diverge from the validator's seed and the binding check rejects with `WRONG_RANDOMNESS`.
 
@@ -170,7 +182,7 @@ The validator emits one of the following reasons on every failed submission. Eac
 | `PROMPT_IN_COOLDOWN` | `prompt_idx` was in the active cooldown set | v2.3: `BATCH_PROMPT_COOLDOWN_WINDOWS = 1_000_000` makes prompts effectively single-use. Read `cooldown_prompts[]` from `/state` **before each pick** and skip anything in the list. |
 | `SUPERSEDED` / `HASH_DUPLICATE` | (deprecated v2.3+) `SUPERSEDED` no longer emitted — multiple miners may submit on the same prompt. `HASH_DUPLICATE` still active: your rollout group is bit-identical to one already accepted in the recent hash retention window. | Generate fresh — don't replay tokens. |
 | `OUT_OF_ZONE` | σ of your 8 rewards is below threshold (`SIGMA_MIN = 0.43` steady, `0.33` during the first `BOOTSTRAP_WINDOWS = 100` windows) | Pick a prompt where your model gets 2–6 / 8 correct — not 0/8 or 8/8 |
-| `REWARD_MISMATCH` | Validator reward computation failed or produced a non-finite value. Miner reward claims are no longer trusted. | Treat as malformed completion/env failure; do not depend on local rewards |
+| `REWARD_MISMATCH` | OpenMath local reward claim disagreed with validator recompute, or validator reward computation failed. OpenCode rewards are validator-authoritative and local placeholders are ignored. | For OpenMath, recheck completion decoding, answer parsing, prompt indexing, and env version. For OpenCode, debug generated code validity and hidden-case score through returned verdict/archive data. |
 | `GRAIL_FAIL` | Sketch differs from the validator's forward pass by more than `PROOF_SKETCH_TOLERANCE_BASE + PROOF_SKETCH_TOLERANCE_GROWTH × √position` (currently `5000 + 5 × √P`) | Same checkpoint + `attn_implementation=flash_attention_2` + matching CUDA/torch + same GPU class as validator (H200 today) |
 | `LOGPROB_MISMATCH` | Per-token log-prob deviation from validator's recompute exceeds `LOGPROB_IS_EPS = 0.10` | Same root cause as `GRAIL_FAIL` — quantization, attention kernel, or precision drift |
 | `BAD_TERMINATION` | A rollout did not terminate naturally, hit the cap without EOS, or contains EOS padding/repeated stop-token tails | Confirm generation config matches protocol. Do not force `min_new_tokens`, suppress EOS, ride the 8192 cap, or append tokens after first EOS |
@@ -329,6 +341,7 @@ reliquary mine \
     --wallet-name my_miner \
     --hotkey default \
     --checkpoint Qwen/Qwen3.5-4B \
+    --environments openmathinstruct,opencodeinstruct \
     --validator-url http://<owner-validator-ip>:8888 \
     --log-level INFO
 ```
@@ -347,11 +360,35 @@ The live model family is `Qwen/Qwen3.5-4B`. This is a hard tokenizer/model reset
 - Checkpoint downloads are sharded safetensors. Custom miners must download `model*.safetensors`, `model.safetensors.index.json`, `config.json`, tokenizer files, `vocab.json`, `merges.txt`, and `chat_template.jinja`.
 - Expect longer completions than the old non-thinking checkpoint and recalibrate local EOS/truncation filters from validator verdicts.
 
+### OpenCode prompt-only mode
+
+The live mixed rollout enables `opencodeinstruct` next to `openmathinstruct`.
+OpenCode rewards are validator-authoritative: miners see prompts only, not the
+hidden structured cases. A miner that includes OpenCode must set:
+
+```bash
+export RELIQUARY_ENVIRONMENTS=openmathinstruct,opencodeinstruct
+export RELIQUARY_OCI_PROMPT_ONLY=1
+export RELIQUARY_OCI_SUBSET_REPO=R0mAI/opencodeinstruct-prompts
+export RELIQUARY_OCI_SUBSET_REVISION=f50bef12e244f5d51a7ae3f55ee8d31fdf33365f
+```
+
+With `RELIQUARY_OCI_PROMPT_ONLY=1`, the miner does not launch or require a
+local OpenCode grader. It should generate clean Python solutions, preserve the
+same GRAIL/logprob/termination rules as OpenMath, and let the validator score
+hidden cases. If your custom miner is not code-ready yet, keep:
+
+```bash
+export RELIQUARY_ENVIRONMENTS=openmathinstruct
+```
+
+Do not use the private structured OpenCode dataset on miners.
+
 Additional flags:
 
 | Flag | Default | When to use it |
 |---|---|---|
-| `--environment` | `math` | Pinned by the protocol; do not change unless the subnet announces a migration. |
+| `--environments` | `openmathinstruct` | Comma-separated active miner environments. Use `openmathinstruct,opencodeinstruct` only after configuring OpenCode prompt-only mode. |
 | `--use-drand` / `--no-use-drand` | `--use-drand` | Turn off only for offline testing. Mainnet always uses drand. |
 | `--validator-url` | *(auto-discovered)* | **Required during the subnet-launch phase** (see note above) and for local testing, e.g. `http://127.0.0.1:8888`. Once the owner validator (`5CXzFHfeiJ4Xkiirq4ej1MrRVCd789wEJXhpf2ZKRW6MNFJF`) holds `validator_permit`, leave empty and the miner will discover it from the metagraph. |
 
@@ -359,6 +396,10 @@ Environment variables:
 
 | Variable | Default | Purpose |
 |---|---|---|
+| `RELIQUARY_ENVIRONMENTS` | `openmathinstruct` | Comma-separated environment list. Set to `openmathinstruct,opencodeinstruct` for mixed mining. |
+| `RELIQUARY_OCI_PROMPT_ONLY` | unset | Miner-only OpenCode mode; set to `1` so the miner loads the public prompt mirror and skips local grading. |
+| `RELIQUARY_OCI_SUBSET_REPO` | env default | OpenCode dataset repo. Miners should use `R0mAI/opencodeinstruct-prompts`. |
+| `RELIQUARY_OCI_SUBSET_REVISION` | repo default | Pin the OpenCode prompt-only mirror revision when announced. |
 | `DRAND_CHAIN` | `quicknet` | Override only if drand announces a chain rotation. |
 | `GRAIL_ATTN_IMPL` | `flash_attention_2` | Override to `eager` or `sdpa` in test envs without flash-attn. Do not override on mainnet. |
 
@@ -367,7 +408,8 @@ Environment variables:
 On a healthy startup:
 
 ```
-... | Starting Reliquary miner (network=finney, netuid=81, env=openmathinstruct)
+... | Starting Reliquary miner (network=finney, netuid=81, envs=['openmathinstruct', 'opencodeinstruct'])
+... | OpenCode prompt-only miner mode enabled; skipping local grader launch.
 ... | Validator at http://x.x.x.x:8080 is on checkpoint 7 (your-org/reliquary-sn@abc123def...)
 ... | Downloading to seed the miner model.
 ... | Loading models from /home/.../.cache/huggingface/...
@@ -394,6 +436,6 @@ grep -E "submitted|rejected|accepted" ~/miner.log | tail -50
 - **`no validator with permit and routable axon`**: no active validator has published an HTTP endpoint on the metagraph. During the subnet-launch phase this is expected — the owner validator (`5CXzFHfeiJ4Xkiirq4ej1MrRVCd789wEJXhpf2ZKRW6MNFJF`) does not yet hold `validator_permit`. Pass `--validator-url http://<owner-validator-ip>:8888` to pin it explicitly (see [Launch](#launch)). After launch, wait for a validator to come back online or point at a known one.
 - **CUDA out of memory**: two copies of Qwen3.5-4B require roughly 18-20 GB bfloat16 before activations and KV/cache overhead. If you have a single GPU with less than 48 GB you may hit OOM under proofs plus generation. Use a larger GPU or split generation/proofs across devices.
 - **`GRAIL_FAIL` / `LOGPROB_MISMATCH`**: your local proof compute diverged from the validator's. Most often caused by a different `attn_implementation` build, CUDA/torch version mismatch, or wrong checkpoint. Re-install on a clean environment and confirm you are on the same HF revision as the validator (check `/state`).
-- **`REWARD_MISMATCH`**: validator-side reward computation disagreed with the miner's claimed `rollout.reward`, or reward computation failed. Recheck completion decoding, answer parsing, prompt indexing, and env version.
-- **All submissions land `OUT_OF_ZONE`**: the prompts you are selecting are too easy (σ ≈ 0) or too hard (σ ≈ 0) for the current checkpoint. The reference engine samples uniformly; if you have overridden prompt selection, broaden the range.
+- **`REWARD_MISMATCH`**: for OpenMath, validator-side reward computation disagreed with the miner's claimed `rollout.reward`, or reward computation failed. Recheck completion decoding, answer parsing, prompt indexing, and env version. For OpenCode, local reward claims are placeholders; focus on code validity and validator-scored hidden-case results.
+- **All submissions land `OUT_OF_ZONE`**: the prompts you are selecting are too easy (σ ≈ 0) or too hard (σ ≈ 0) for the current checkpoint. On OpenCode, this often means your code lane is producing all-zero or all-pass hidden-case vectors. Split metrics by environment before changing global filters.
 - **Persistent `WRONG_CHECKPOINT`**: the miner is not picking up the latest revision from `/state`. Ensure the poll loop reads `checkpoint_revision` before each submission.
