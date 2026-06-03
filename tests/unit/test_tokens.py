@@ -118,11 +118,11 @@ class TestEncodePrompt:
         assert out == [2] + list(b"hi")
         assert all(isinstance(t, int) for t in out)
 
-    def test_enables_thinking_when_template_supports_it(self):
+    def test_disables_thinking_when_template_supports_it(self):
         tok = _ThinkingTokenizer()
         out = encode_prompt(tok, "hi")
         assert out == [3] + list(b"hi")
-        assert tok.enable_thinking_seen is True
+        assert tok.enable_thinking_seen is False
 
     def test_falls_back_when_no_chat_template(self):
         tok = _BareTokenizer()
@@ -159,7 +159,7 @@ _GOLDEN_PROMPT = "What is the capital of France? Answer in one word."
 _GOLDEN_TOKENS_QWEN35_4B = [
     248045, 846, 198, 3710, 369, 279, 6511, 314, 9338, 30,
     21134, 303, 799, 3299, 13, 248046, 198, 248045, 74455, 198,
-    248068, 198,
+    248068, 271, 248069, 271,
 ]
 
 
