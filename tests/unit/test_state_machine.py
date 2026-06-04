@@ -125,6 +125,31 @@ def test_open_window_wires_checkpoint_hash_into_batcher():
 
 
 @pytest.mark.asyncio
+async def test_activate_window_binds_batcher_loop_for_delayed_seal():
+    """Regression: ``_activate_window`` must bind each batcher's event loop.
+
+    ``accept_submission`` runs in a worker thread (``asyncio.to_thread``)
+    with no running loop, so it cannot capture the loop itself — it reads
+    the pre-bound ``batcher._loop`` to schedule the delayed drand-boundary
+    seal via ``run_coroutine_threadsafe``. If ``_loop`` is left ``None``,
+    the B-th distinct prompt seals the window synchronously, dropping every
+    same-drand-round submission still in flight (BATCH_FILLED) and
+    collapsing the boundary fair split — i.e. only ~B miners per round can
+    ever earn emission.
+    """
+    import asyncio
+
+    svc = _make_service()
+    svc._open_window()
+    svc._activate_window()
+
+    running_loop = asyncio.get_running_loop()
+    assert svc._active_batchers
+    for batcher in svc._active_batchers.values():
+        assert batcher._loop is running_loop
+
+
+@pytest.mark.asyncio
 async def test_wait_for_window_seal_force_seals_drained_proof_cap():
     """A full proof cap with no queued/in-flight work cannot fill later."""
     from reliquary.validator.service import MAX_PROOF_CANDIDATES_PER_WINDOW

@@ -508,6 +508,17 @@ class ValidationService:
         """
         if not self._active_batchers:
             return
+        # Bind the main loop into each batcher BEFORE exposing them to the
+        # server, so the delayed drand-boundary seal scheduled from the
+        # worker thread targets this loop. No running loop (sync tests) →
+        # leave _loop None and fall back to the immediate-seal path.
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is not None:
+            for batcher in self._active_batchers.values():
+                batcher.bind_event_loop(loop)
         self.server.set_active_batchers(self._active_batchers)
         self._set_state(WindowState.OPEN)
 

@@ -368,6 +368,18 @@ class GrpoWindowBatcher:
                 self._seal_event.set()
         return self._seal_event
 
+    def bind_event_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Bind the validator's main event loop for the delayed seal.
+
+        ``accept_submission`` runs in a worker thread (``asyncio.to_thread``)
+        with no running loop, so it cannot capture the loop itself — it reads
+        this pre-bound reference to schedule ``_delayed_seal_at_drand_boundary``
+        via ``run_coroutine_threadsafe``. Without this, ``_loop`` stays ``None``
+        and the B-th distinct prompt seals synchronously, dropping same-round
+        in-flight submissions and collapsing the drand-boundary fair split.
+        """
+        self._loop = loop
+
     def is_sealed(self) -> bool:
         """True once B distinct non-cooldown valid submissions have been
         accepted. Thread-safe and loop-independent (reads the underlying
