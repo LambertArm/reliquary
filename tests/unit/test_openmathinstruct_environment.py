@@ -173,6 +173,26 @@ def test_reward_decimal_zero_normalization():
     assert _compute_omi_reward(problem, r"\boxed{3.0}") == 1.0
 
 
+def test_reward_trailing_zero_decimal_is_equal():
+    """A value asked for, not a string: '82.5' and '82.50' are the same number."""
+    from reliquary.environment.openmathinstruct import _compute_omi_reward
+    assert _compute_omi_reward({"ground_truth": "82.50"}, r"\boxed{82.5}") == 1.0
+    assert _compute_omi_reward({"ground_truth": "7.5"}, r"\boxed{7.50}") == 1.0
+
+
+def test_reward_fraction_and_decimal_equivalence():
+    from reliquary.environment.openmathinstruct import _compute_omi_reward
+    assert _compute_omi_reward({"ground_truth": "1/2"}, r"\boxed{0.5}") == 1.0
+    assert _compute_omi_reward({"ground_truth": "0.25"}, r"\boxed{1/4}") == 1.0
+
+
+def test_reward_numeric_close_but_unequal_still_wrong():
+    """Value-based equality must not let a different number pass."""
+    from reliquary.environment.openmathinstruct import _compute_omi_reward
+    assert _compute_omi_reward({"ground_truth": "82.5"}, r"\boxed{83}") == 0.0
+    assert _compute_omi_reward({"ground_truth": "1/2"}, r"\boxed{1/3}") == 0.0
+
+
 def test_reward_handles_malformed_completion():
     """Reward function must never raise on garbage input."""
     from reliquary.environment.openmathinstruct import _compute_omi_reward

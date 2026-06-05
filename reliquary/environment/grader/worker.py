@@ -8,8 +8,10 @@ the returned primitive value against the hidden expected value.
 
 from __future__ import annotations
 
+import ast
 import builtins
 import contextlib
+import inspect
 import io
 import json
 import math
@@ -84,6 +86,108 @@ def _json_safe(value: Any) -> Any:
     raise TypeError(f"unsupported output type: {type(value).__name__}")
 
 
+def _user_defined_names(code: str) -> set[str]:
+    """Top-level def/class names in the submitted source.
+
+    Used to resolve the entry point by structure when the requested name is
+    absent — and to never select an imported callable as the entry point.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return set()
+    return {
+        node.name
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    }
+
+
+def _accepts_arity(fn: Any, nargs: int) -> bool:
+    """True if *fn* can be called with *nargs* positional arguments."""
+    try:
+        params = list(inspect.signature(fn).parameters.values())
+    except (TypeError, ValueError):
+        return True
+    positional = [
+        p for p in params
+        if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+    ]
+    required = sum(1 for p in positional if p.default is p.empty)
+    has_varargs = any(p.kind == p.VAR_POSITIONAL for p in params)
+    upper = float("inf") if has_varargs else len(positional)
+    return required <= nargs <= upper
+
+
+def _defined_functions_in_order(code: str) -> list[str]:
+    """Top-level function names, in source order."""
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return []
+    return [
+        node.name for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+
+
+def _call_graph_roots(code: str, fn_names: set[str]) -> set[str]:
+    """Function names not called from inside a *different* top-level function.
+
+    These are the call-graph roots — the entry point of a "main + helpers"
+    solution. Self-recursion does not disqualify a root.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return set(fn_names)
+    called_by_others: set[str] = set()
+    for node in tree.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for sub in ast.walk(node):
+            if (
+                isinstance(sub, ast.Call)
+                and isinstance(sub.func, ast.Name)
+                and sub.func.id in fn_names
+                and sub.func.id != node.name
+            ):
+                called_by_others.add(sub.func.id)
+    return set(fn_names) - called_by_others
+
+
+def _resolve_function(ns: dict[str, Any], code: str, nargs: int) -> Any | None:
+    """Resolve the entry function when the requested name is absent.
+
+    The prompt asks for a behavior, not a name, so pick a single entry
+    deterministically: the only arity match; else the only call-graph root
+    (a function no *other* top-level function calls); else the last-defined
+    arity match. Exactly one function is then run against the hidden cases —
+    never several with "accept any pass" — so a wrong pick simply fails them.
+    """
+    order = [
+        name for name in _defined_functions_in_order(code)
+        if callable(ns.get(name)) and not isinstance(ns.get(name), type)
+    ]
+    candidates = [name for name in order if _accepts_arity(ns[name], nargs)]
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return ns[candidates[0]]
+    roots = _call_graph_roots(code, set(order))
+    root_candidates = [name for name in candidates if name in roots]
+    if len(root_candidates) == 1:
+        return ns[root_candidates[0]]
+    pool = root_candidates or candidates
+    return ns[pool[-1]]
+
+
+def _resolve_class(ns: dict[str, Any], defined: set[str]) -> Any | None:
+    """The submitted code's sole class, or None if ambiguous."""
+    classes = [ns[name] for name in defined if isinstance(ns.get(name), type)]
+    return classes[0] if len(classes) == 1 else None
+
+
 def evaluate_call(
     code: str,
     entry: dict[str, Any],
@@ -124,9 +228,19 @@ def evaluate_call(
         try:
             kind = entry.get("kind")
             if kind == "function":
-                fn = ns[entry["name"]]
+                # Prompt specifies a behavior, not a name: accept the requested
+                # name, else resolve the sole/only-arity-matching defined function.
+                fn = ns.get(entry["name"])
+                if not callable(fn):
+                    fn = _resolve_function(ns, code, len(args))
+                if not callable(fn):
+                    return None, "runtime_error"
             elif kind == "method":
-                cls = ns[entry["class_name"]]
+                cls = ns.get(entry["class_name"])
+                if not isinstance(cls, type):
+                    cls = _resolve_class(ns, _user_defined_names(code))
+                if cls is None:
+                    return None, "runtime_error"
                 fn = getattr(cls(), entry["method"])
             else:
                 return None, "bad_entry"
