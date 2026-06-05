@@ -110,6 +110,101 @@ def test_runtime_exception_is_not_successful_none():
     assert output is None
 
 
+def test_call_function_resolves_when_name_differs_single_def():
+    """Prompt asks for a behavior, not a name: a correct sole function under a
+    different name must still be graded."""
+    from reliquary.environment.grader.worker import evaluate_call
+
+    output, status = evaluate_call(
+        "def my_add(a, b): return a + b",
+        {"kind": "function", "name": "add"},
+        [2, 3],
+        {},
+        timeout_s=5.0,
+    )
+    assert status == "ok"
+    assert output == 5
+
+
+def test_call_method_resolves_when_class_name_differs():
+    from reliquary.environment.grader.worker import evaluate_call
+
+    code = "class Impl:\n    def run(self, x): return x * 2"
+    output, status = evaluate_call(
+        code,
+        {"kind": "method", "class_name": "Solution", "method": "run"},
+        [4],
+        {},
+        timeout_s=5.0,
+    )
+    assert status == "ok"
+    assert output == 8
+
+
+def test_call_disambiguates_multiple_functions_by_arity():
+    """With a helper of different arity, the matching entry is still found."""
+    from reliquary.environment.grader.worker import evaluate_call
+
+    code = "def helper(x): return x + 1\ndef solve(a, b): return a * b"
+    output, status = evaluate_call(
+        code,
+        {"kind": "function", "name": "main"},
+        [3, 4],
+        {},
+        timeout_s=5.0,
+    )
+    assert status == "ok"
+    assert output == 12
+
+
+def test_call_picks_call_graph_root_when_arity_ties():
+    """Helper + entry of the same arity: the one not called by the other wins."""
+    from reliquary.environment.grader.worker import evaluate_call
+
+    code = "def _twice(n): return n * 2\ndef compute(n): return _twice(n) + 1"
+    output, status = evaluate_call(
+        code,
+        {"kind": "function", "name": "missing"},
+        [5],
+        {},
+        timeout_s=5.0,
+    )
+    assert status == "ok"
+    assert output == 11  # compute(5), not _twice(5)
+
+
+def test_call_picks_last_defined_when_independent():
+    """Truly independent same-arity functions: take the last (deterministic)."""
+    from reliquary.environment.grader.worker import evaluate_call
+
+    code = "def f(a, b): return a + b\ndef g(a, b): return a * b"
+    output, status = evaluate_call(
+        code,
+        {"kind": "function", "name": "missing"},
+        [2, 3],
+        {},
+        timeout_s=5.0,
+    )
+    assert status == "ok"
+    assert output == 6  # g, the last-defined
+
+
+def test_call_fails_when_no_function_matches_arity():
+    """No defined function can accept the call: genuinely uncallable -> fail."""
+    from reliquary.environment.grader.worker import evaluate_call
+
+    code = "def f(a, b, c): return a + b + c"
+    output, status = evaluate_call(
+        code,
+        {"kind": "function", "name": "missing"},
+        [1, 2],
+        {},
+        timeout_s=5.0,
+    )
+    assert status != "ok"
+    assert output is None
+
+
 def test_compile_tamper_fails_without_passing():
     from reliquary.environment.grader.worker import evaluate_call
 

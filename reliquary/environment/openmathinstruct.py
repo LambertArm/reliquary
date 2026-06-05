@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+from fractions import Fraction
 from typing import ClassVar, Optional
 
 
@@ -96,11 +97,42 @@ def _normalize_answer(s: str) -> str:
 # Reward
 # ---------------------------------------------------------------------------
 
+_NUMERIC_RE = re.compile(r"[+-]?\d+(?:\.\d+)?(?:/\d+)?")
+
+
+def _as_number(s: str) -> Optional[Fraction]:
+    """Parse a plain integer / decimal / simple fraction as an exact Fraction.
+
+    Returns None for anything else (LaTeX expressions, words, empty), so the
+    caller can fall back to string comparison. Exact rationals avoid float
+    rounding, so "82.50" == "82.5" and "1/2" == "0.5".
+    """
+    if not _NUMERIC_RE.fullmatch(s):
+        return None
+    try:
+        return Fraction(s)
+    except (ValueError, ZeroDivisionError):
+        return None
+
+
+def _answers_equal(candidate: str, gt: str) -> bool:
+    """Compare by value when both sides are numbers, else by normalized string.
+
+    The prompt asks for a value, so any surface form of that value is correct
+    (trailing zeros, fraction vs decimal). Non-numeric answers (LaTeX) keep the
+    existing exact normalized-string match.
+    """
+    c, g = _as_number(candidate), _as_number(gt)
+    if c is not None and g is not None:
+        return c == g
+    return candidate == gt
+
+
 def _compute_omi_reward(problem: dict, completion: str) -> float:
     """Score an OMI completion.
 
-    1.0 if the last \\boxed{...} normalized matches expected_answer normalized.
-    0.0 otherwise. Never raises.
+    1.0 if the last \\boxed{...} matches expected_answer by value (numbers) or
+    by normalized string (expressions). 0.0 otherwise. Never raises.
     """
     try:
         boxed = _last_boxed_only_string(completion)
@@ -118,7 +150,7 @@ def _compute_omi_reward(problem: dict, completion: str) -> float:
         gt = _normalize_answer(problem.get("ground_truth", ""))
         if gt == "":
             return 0.0
-        return 1.0 if candidate == gt else 0.0
+        return 1.0 if _answers_equal(candidate, gt) else 0.0
     except Exception:
         return 0.0
 
