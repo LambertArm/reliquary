@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -185,12 +186,21 @@ async def submit_batch_v2(
 async def get_window_state_v2(
     url: str,
     *,
+    env: str | None = None,
     client: httpx.AsyncClient | None = None,
     timeout: float = _DEFAULT_TIMEOUT,
 ) -> GrpoBatchState:
-    """GET the validator's current v2 GrpoBatchState."""
+    """GET the validator's current v2 GrpoBatchState.
+
+    ``cooldown_prompts`` is per-env; pass ``env`` to read a specific env's
+    cooldown set. Omitting it returns the validator's first active env
+    (legacy single-env behavior).
+    """
+    state_url = f"{url}/state"
+    if env is not None:
+        state_url = f"{state_url}?env={quote(env, safe='')}"
     return await _get_with_retry(
-        f"{url}/state", GrpoBatchState,
+        state_url, GrpoBatchState,
         client=client, timeout=timeout,
     )
 

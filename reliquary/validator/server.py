@@ -1107,17 +1107,32 @@ class ValidatorServer:
             )
 
         @app.get("/state", response_model=GrpoBatchState)
-        async def state() -> GrpoBatchState:
+        async def state(env: str | None = None) -> GrpoBatchState:
             """Current window + checkpoint state. Lock-free: reads only the
             batcher's snapshot fields (set at construction) and the atomic
             ``valid_count`` counter. The submit worker holds ``batcher._lock``
             for up to ~25s per GRAIL verify, so this handler MUST NOT touch
             it — otherwise miners polling /state starve the event loop and
             timeout cascades hit every endpoint (see 2026-05-12 outage).
+
+            ``cooldown_prompts`` is PER-ENV (``prompt_idx`` indexes one env's
+            problem set), so a multi-env window has a distinct cooldown set
+            per env. The optional ``env`` query param selects which env's
+            batcher to report; without it we report the first active batcher
+            (legacy single-env behavior). Miners must poll once per env to
+            learn each env's real cooldown — the flat field can only carry
+            one. window_n/randomness/checkpoint are identical across envs.
             """
-            batcher = self.active_batcher
-            if batcher is None:
-                raise HTTPException(status_code=503, detail="no_active_window")
+            if env is not None:
+                batcher = self._active_batchers.get(env)
+                if batcher is None:
+                    if not self._active_batchers:
+                        raise HTTPException(status_code=503, detail="no_active_window")
+                    raise HTTPException(status_code=404, detail="unknown_env")
+            else:
+                batcher = self.active_batcher
+                if batcher is None:
+                    raise HTTPException(status_code=503, detail="no_active_window")
             cp = self._current_checkpoint
             return GrpoBatchState(
                 state=self._current_state,

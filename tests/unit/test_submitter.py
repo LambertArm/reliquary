@@ -168,6 +168,30 @@ async def test_get_window_state_v2(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_get_window_state_v2_passes_env_query_param(monkeypatch):
+    """Per-env cooldown: the miner must select which env's cooldown it reads
+    by passing ``env=`` to ``/state`` (the flat field reflects only one env)."""
+    state = GrpoBatchState(
+        state=WindowState.OPEN, window_n=100, anchor_block=1000,
+        cooldown_prompts=[5], valid_submissions=0, checkpoint_n=0,
+    )
+    seen = {}
+
+    async def _get(self, url, timeout=None):
+        seen["url"] = url
+        return httpx.Response(200, json=state.model_dump(mode="json"))
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", _get)
+    client = httpx.AsyncClient()
+    await get_window_state_v2("http://fake", env="opencode", client=client)
+    assert "env=opencode" in seen["url"]
+    # No env → no query param (backward compatible).
+    await get_window_state_v2("http://fake", client=client)
+    assert "?" not in seen["url"]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_submit_batch_v2_503_maps_to_window_not_active(monkeypatch):
     """HTTP 503 from /submit short-circuits to WINDOW_NOT_ACTIVE (no retry)."""
     call_count = {"n": 0}
