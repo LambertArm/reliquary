@@ -2268,6 +2268,21 @@ def test_set_prompt_range_armed(monkeypatch):
     assert 0 <= lo and hi <= 1000  # FakeEnv len is 1000
 
 
+def test_set_prompt_range_matches_shared_function(monkeypatch):
+    # Cross-side agreement: the validator must seed the slice with the SAME
+    # inputs (env.name, len(env), size) the miner feeds window_prompt_range,
+    # or an honest miner gets wrongly rejected. Pin it against future drift.
+    from reliquary.shared.prompt_range import window_prompt_range
+    monkeypatch.setattr(batcher_mod, "PROMPT_RANGE_ENFORCE_FROM_WINDOW", 0)
+    monkeypatch.setattr(batcher_mod, "PROMPT_RANGE_SIZE", 100)
+    b = _make_batcher(window_start=500)
+    b.randomness = "deadbeef"
+    b.set_prompt_range()
+    assert b.prompt_range == window_prompt_range(
+        b.randomness, b.env.name, len(b.env), 100,
+    )
+
+
 def test_accept_rejects_out_of_range(monkeypatch):
     monkeypatch.setattr(batcher_mod, "PROMPT_RANGE_ENFORCE_FROM_WINDOW", 0)
     monkeypatch.setattr(batcher_mod, "PROMPT_RANGE_SIZE", 100)
