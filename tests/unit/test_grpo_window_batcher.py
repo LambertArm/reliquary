@@ -2236,3 +2236,60 @@ def test_accept_genuine_wrong_wellformed_answer():
     req = _request_with_prompt_unique_tokens(rewards=[1.0] * 4 + [0.0] * 4)
     resp = b.accept_submission(req)
     assert resp.accepted is True
+
+
+from reliquary.validator import batcher as batcher_mod
+
+
+def test_set_prompt_range_none_before_cutover(monkeypatch):
+    monkeypatch.setattr(batcher_mod, "PROMPT_RANGE_ENFORCE_FROM_WINDOW", 10_000)
+    b = _make_batcher(window_start=500)
+    b.randomness = "deadbeef"
+    b.set_prompt_range()
+    assert b.prompt_range is None  # window 500 < cutover 10000 -> not armed
+
+
+def test_set_prompt_range_none_without_randomness(monkeypatch):
+    monkeypatch.setattr(batcher_mod, "PROMPT_RANGE_ENFORCE_FROM_WINDOW", 0)
+    b = _make_batcher(window_start=500)
+    b.randomness = ""
+    b.set_prompt_range()
+    assert b.prompt_range is None  # no randomness yet -> no restriction
+
+
+def test_set_prompt_range_armed(monkeypatch):
+    monkeypatch.setattr(batcher_mod, "PROMPT_RANGE_ENFORCE_FROM_WINDOW", 0)
+    monkeypatch.setattr(batcher_mod, "PROMPT_RANGE_SIZE", 100)
+    b = _make_batcher(window_start=500)
+    b.randomness = "deadbeef"
+    b.set_prompt_range()
+    lo, hi = b.prompt_range
+    assert hi - lo == 100
+    assert 0 <= lo and hi <= 1000  # FakeEnv len is 1000
+
+
+def test_accept_rejects_out_of_range(monkeypatch):
+    monkeypatch.setattr(batcher_mod, "PROMPT_RANGE_ENFORCE_FROM_WINDOW", 0)
+    monkeypatch.setattr(batcher_mod, "PROMPT_RANGE_SIZE", 100)
+    b = _make_batcher(window_start=500)
+    b.randomness = "deadbeef"
+    b.set_prompt_range()
+    lo, hi = b.prompt_range
+    out = (hi + 1) % 1000
+    if lo <= out < hi:
+        out = (lo - 1) % 1000
+    resp = b.accept_submission(_request(prompt_idx=out, window_start=500))
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.PROMPT_OUT_OF_RANGE
+
+
+def test_accept_in_range_passes_range_gate(monkeypatch):
+    monkeypatch.setattr(batcher_mod, "PROMPT_RANGE_ENFORCE_FROM_WINDOW", 0)
+    monkeypatch.setattr(batcher_mod, "PROMPT_RANGE_SIZE", 100)
+    b = _make_batcher(window_start=500)
+    b.randomness = "deadbeef"
+    b.set_prompt_range()
+    lo, hi = b.prompt_range
+    resp = b.accept_submission(_request(prompt_idx=lo, window_start=500))
+    # Passes the range gate; may still hit a later gate, but never this one.
+    assert resp.reason != RejectReason.PROMPT_OUT_OF_RANGE

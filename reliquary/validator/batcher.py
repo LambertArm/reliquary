@@ -27,10 +27,13 @@ from reliquary.constants import (
     MAX_SEAL_QUEUE_DRAIN_SECONDS,
     MAX_SUBMISSIONS_PER_PROMPT,
     MAX_TRUNCATED_PER_SUBMISSION,
+    PROMPT_RANGE_SIZE,
+    PROMPT_RANGE_ENFORCE_FROM_WINDOW,
     REJECTED_LIST_CAP_PER_HOTKEY,
     TOKEN_AUTH_ENFORCE,
 )
 from reliquary.environment.base import Environment
+from reliquary.shared.prompt_range import window_prompt_range
 from reliquary.protocol.submission import (
     BatchSubmissionRequest,
     BatchSubmissionResponse,
@@ -282,6 +285,10 @@ class GrpoWindowBatcher:
         # grouping but accept-time logic only needs the count.
         self._submissions_per_prompt: dict[int, list[ValidSubmission]] = {}
         self.randomness: str = ""
+        # Per-window eligible prompt slice [lo, hi). None = no restriction
+        # (randomness not yet known, or window is before the enforcement
+        # cutover). Set by set_prompt_range() once randomness is assigned.
+        self.prompt_range: tuple[int, int] | None = None
         # v2.3: post-seal emission distribution. Populated by seal_batch and
         # consumed by _archive_window so the EMA / weight-setter can credit
         # all GRAIL-validated submissions whose prompt landed in the
@@ -355,6 +362,26 @@ class GrpoWindowBatcher:
         # v2.1: checkpoint hash miners must match. Empty string disables
         # the gate (test convenience / pre-first-publish).
         self.current_checkpoint_hash: str = ""
+
+    def set_prompt_range(self) -> None:
+        """Compute and cache this window's eligible prompt slice.
+
+        Leaves ``prompt_range`` None (accept any prompt_idx, current behavior)
+        until randomness is known AND ``window_start`` has reached
+        ``PROMPT_RANGE_ENFORCE_FROM_WINDOW``. Call after assigning randomness.
+        """
+        if (
+            not self.randomness
+            or self.window_start < PROMPT_RANGE_ENFORCE_FROM_WINDOW
+        ):
+            self.prompt_range = None
+            return
+        self.prompt_range = window_prompt_range(
+            self.randomness,
+            getattr(self.env, "name", ""),
+            len(self.env),
+            PROMPT_RANGE_SIZE,
+        )
 
     @property
     def seal_event(self) -> asyncio.Event:
@@ -704,6 +731,10 @@ class GrpoWindowBatcher:
         # arrival path.
         if request.prompt_idx >= len(self.env):
             return reject(RejectReason.BAD_PROMPT_IDX, "prompt")
+        if self.prompt_range is not None:
+            lo, hi = self.prompt_range
+            if not (lo <= request.prompt_idx < hi):
+                return reject(RejectReason.PROMPT_OUT_OF_RANGE, "prompt_range")
         if self._cooldown.is_in_cooldown(request.prompt_idx, self.window_start):
             return reject(RejectReason.PROMPT_IN_COOLDOWN, "cooldown")
         # v2.3: cap submissions per prompt before the heavy verify. Once a
