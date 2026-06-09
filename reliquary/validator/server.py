@@ -986,6 +986,14 @@ class ValidatorServer:
                 )
             if request.prompt_idx >= len(batcher.env):
                 return _cheap_reject(RejectReason.BAD_PROMPT_IDX, reject_stage="prompt")
+            prompt_range = getattr(batcher, "prompt_range", None)
+            if prompt_range is not None:
+                lo, hi = prompt_range
+                if not (lo <= request.prompt_idx < hi):
+                    return _cheap_reject(
+                        RejectReason.PROMPT_OUT_OF_RANGE,
+                        reject_stage="prompt_range",
+                    )
             if request.prompt_idx in batcher.cooldown_prompts_snapshot:
                 return _cheap_reject(
                     RejectReason.PROMPT_IN_COOLDOWN,

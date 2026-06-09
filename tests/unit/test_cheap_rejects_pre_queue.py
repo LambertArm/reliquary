@@ -88,7 +88,8 @@ def _setup(*,
            env_len: int = 1000,
            drand_round_check_enabled: bool = False,
            validate_round_returns: RejectReason | None = None,
-           prompt_count: int = 0) -> tuple[ValidatorServer, MagicMock]:
+           prompt_count: int = 0,
+           prompt_range: tuple[int, int] | None = None) -> tuple[ValidatorServer, MagicMock]:
     """Build a server + mocked batcher in OPEN state with the given knobs."""
     s = ValidatorServer()
     s.set_current_state(WindowState.OPEN)
@@ -104,6 +105,9 @@ def _setup(*,
     # gate at the cheap-reject layer doesn't fire for tests that don't
     # exercise the seal extension.
     batcher._seal_trigger_round = None
+    # MagicMock would auto-create a truthy prompt_range; pin it so the range
+    # gate only fires when a test sets it explicitly.
+    batcher.prompt_range = prompt_range
     batcher.drand_round_check_enabled = drand_round_check_enabled
     batcher.validate_drand_round.return_value = validate_round_returns
     batcher.prompt_submission_count.return_value = prompt_count
@@ -742,3 +746,25 @@ def test_cheap_reject_does_not_burn_rate_limit_budget():
         # The (N+1)th post hits RATE_LIMITED before the checkpoint check.
         r = client.post("/submit", json=payload)
     assert r.json()["reason"] == RejectReason.RATE_LIMITED.value
+
+
+def test_out_of_range_rejected_pre_queue():
+    s, _ = _setup(prompt_range=(100, 200))
+    payload = _submission(prompt_idx=42)  # 42 not in [100, 200)
+    _assert_pre_queue_reject(s, payload, RejectReason.PROMPT_OUT_OF_RANGE)
+
+
+def test_in_range_passes_pre_queue():
+    s, _ = _setup(prompt_range=(0, 100))
+    payload = _submission(prompt_idx=42)  # in [0, 100)
+    with TestClient(s.app) as client:
+        r = client.post("/submit", json=payload)
+    assert r.json()["reason"] == RejectReason.ACCEPTED.value
+
+
+def test_no_range_skips_gate_pre_queue():
+    s, _ = _setup(prompt_range=None)  # enforcement off (pre-cutover)
+    payload = _submission(prompt_idx=42)
+    with TestClient(s.app) as client:
+        r = client.post("/submit", json=payload)
+    assert r.json()["reason"] == RejectReason.ACCEPTED.value

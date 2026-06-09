@@ -720,6 +720,7 @@ class ValidationService:
                 )
                 for batcher in self._active_batchers.values():
                     batcher.randomness = randomness
+                    batcher.set_prompt_range()
                 self._last_beacon = beacon
                 if beacon is not None and beacon.get("round") is not None:
                     self._active_batcher.window_open_drand_round = int(
