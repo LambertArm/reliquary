@@ -145,3 +145,54 @@ def test_generate_rollouts_passes_full_eos_set_and_trims_first_eos():
     assert eng.vllm_model.kwargs["eos_token_id"] == [248044, 248046]
     assert len(rollouts) == M_ROLLOUTS
     assert all(r["tokens"] == [10, 11, 1, 248046] for r in rollouts)
+
+
+def test_pick_prompt_respects_explicit_range():
+    env = FakeEnv()  # len 100
+    rng = random.Random(1)
+    for _ in range(50):
+        idx = pick_prompt_idx(
+            env, cooldown_prompts=set(), rng=rng, prompt_range=(20, 40),
+        )
+        assert 20 <= idx < 40
+
+
+def test_pick_prompt_range_skips_cooldown():
+    env = FakeEnv()
+    rng = random.Random(1)
+    cooldown = set(range(20, 38))  # leaves only 38, 39 free in [20, 40)
+    for _ in range(20):
+        idx = pick_prompt_idx(
+            env, cooldown_prompts=cooldown, rng=rng, prompt_range=(20, 40),
+        )
+        assert idx in (38, 39)
+
+
+def test_pick_prompt_full_range_unchanged():
+    env = FakeEnv()
+    rng = random.Random(42)
+    for _ in range(50):
+        idx = pick_prompt_idx(env, cooldown_prompts=set(), rng=rng)
+        assert 0 <= idx < 100
+
+
+def test_pick_env_and_prompt_confines_to_window():
+    from reliquary.miner.engine import pick_env_and_prompt
+    from reliquary.shared.prompt_range import window_prompt_range
+    from reliquary.constants import PROMPT_RANGE_SIZE
+
+    class BigEnv:
+        name = "openmathinstruct"
+        def __len__(self):
+            return 20_000
+
+    envs = {"openmathinstruct": BigEnv()}
+    mix = [("openmathinstruct", 8)]
+    cooldown = {"openmathinstruct": set()}
+    rng = random.Random(7)
+    rand = "deadbeefcafe"
+    lo, hi = window_prompt_range(rand, "openmathinstruct", 20_000, PROMPT_RANGE_SIZE)
+    for _ in range(50):
+        name, idx = pick_env_and_prompt(envs, mix, cooldown, rng=rng, randomness=rand)
+        assert name == "openmathinstruct"
+        assert lo <= idx < hi

@@ -18,12 +18,14 @@ from reliquary.constants import (
     LAYER_INDEX,
     MAX_NEW_TOKENS_PROTOCOL_CAP,
     M_ROLLOUTS,
+    PROMPT_RANGE_SIZE,
     T_PROTO,
     TOP_K_PROTO,
     TOP_P_PROTO,
     UPLOAD_BUFFER,
     WINDOW_LENGTH,
 )
+from reliquary.shared.prompt_range import window_prompt_range
 from reliquary.infrastructure import chain
 from reliquary.protocol.signatures import sign_envelope
 from reliquary.protocol.submission import (
@@ -84,27 +86,35 @@ def pick_prompt_idx(
     *,
     rng: _random.Random | None = None,
     max_attempts: int = 1000,
+    prompt_range: tuple[int, int] | None = None,
 ) -> int:
     """Pick a random prompt index that isn't currently in cooldown.
 
-    The reference miner uses uniform-random selection with rejection
-    sampling against the cooldown set. More sophisticated strategies
-    (pre-screening zone probability, etc.) are left to miner operators.
+    When ``prompt_range`` is given, sampling is confined to ``[lo, hi)`` —
+    the per-window slice the validator enforces. The reference miner uses
+    uniform-random selection with rejection sampling against the cooldown
+    set; more sophisticated strategies are left to miner operators.
 
-    Raises ``RuntimeError`` if no eligible prompt can be found — typically
-    because the env is fully in cooldown.
+    Raises ``RuntimeError`` if no eligible prompt can be found.
     """
     rng = rng or _random
     n = len(env)
-    if len(cooldown_prompts) < n / 2:
+    lo, hi = (0, n) if prompt_range is None else prompt_range
+    lo = max(0, lo)
+    hi = min(n, hi)
+    span = hi - lo
+    if span <= 0:
+        raise RuntimeError("no eligible prompt — empty range")
+    cd_in_span = sum(1 for c in cooldown_prompts if lo <= c < hi)
+    if cd_in_span < span / 2:
         for _ in range(max_attempts):
-            idx = rng.randrange(n)
+            idx = lo + rng.randrange(span)
             if idx not in cooldown_prompts:
                 return idx
         raise RuntimeError("no eligible prompt found after max attempts")
-    eligible = [i for i in range(n) if i not in cooldown_prompts]
+    eligible = [i for i in range(lo, hi) if i not in cooldown_prompts]
     if not eligible:
-        raise RuntimeError("no eligible prompt — env fully in cooldown")
+        raise RuntimeError("no eligible prompt — range fully in cooldown")
     return rng.choice(eligible)
 
 
@@ -115,11 +125,14 @@ def pick_env_and_prompt(
     *,
     rng: _random.Random | None = None,
     max_attempts: int = 1000,
+    randomness: str | None = None,
 ) -> tuple[str, int]:
     """Sample env per `mix` weights, then a prompt within that env.
 
-    Falls through to the next env (by re-sampling with that env masked)
-    if the chosen env is fully in cooldown.
+    When ``randomness`` is given, each env's prompt is drawn only from that
+    window's slice (``window_prompt_range``), matching the validator. Falls
+    through to the next env (re-sampling with the chosen env masked) if the
+    chosen env's slice is fully in cooldown.
     """
     rng = rng or _random
     names = [n for n, _ in mix]
@@ -132,10 +145,16 @@ def pick_env_and_prompt(
         avail_weights = [weights[names.index(n)] for n in available]
         env_name = rng.choices(available, weights=avail_weights)[0]
         env = envs[env_name]
+        prompt_range = None
+        if randomness:
+            env_label = getattr(env, "name", env_name)
+            prompt_range = window_prompt_range(
+                randomness, env_label, len(env), PROMPT_RANGE_SIZE,
+            )
         try:
             idx = pick_prompt_idx(
                 env, cooldown_per_env.get(env_name, set()),
-                rng=rng, max_attempts=max_attempts,
+                rng=rng, max_attempts=max_attempts, prompt_range=prompt_range,
             )
             return env_name, idx
         except RuntimeError:
@@ -334,6 +353,7 @@ class MiningEngine:
                 try:
                     env_name, prompt_idx = pick_env_and_prompt(
                         self.envs, self.mix, self._cooldown_per_env, rng=rng,
+                        randomness=randomness,
                     )
                 except RuntimeError:
                     logger.info("all envs fully in cooldown; sleeping")
