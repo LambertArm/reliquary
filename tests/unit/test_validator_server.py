@@ -207,6 +207,60 @@ def test_state_endpoint_503_when_no_active_batcher():
     assert resp.json()["detail"] == "no_active_window"
 
 
+def test_state_endpoint_per_env_cooldown_via_query_param():
+    """Multi-env: ``/state?env=<name>`` returns THAT env's cooldown set.
+
+    Regression for miners only ever seeing the first active batcher's
+    cooldown (math) and applying it to every env, so the code env's real
+    cooldown was never communicated.
+    """
+    from reliquary.protocol.submission import WindowState
+
+    class _Env:
+        def __init__(self, name): self.name = name
+        def __len__(self): return 1000
+        def get_problem(self, idx):
+            return {"prompt": f"p{idx}", "ground_truth": "", "id": f"p{idx}"}
+        def compute_reward(self, p, c): return 0.0
+
+    def _env_batcher(env, cd):
+        b = GrpoWindowBatcher(
+            window_start=500, env=env, model=_ModelStub(), cooldown_map=cd,
+            verify_commitment_proofs_fn=_always_true_proof,
+            verify_signature_fn=lambda c, h: True,
+            completion_text_fn=lambda r: "wrong",
+            drand_round_check_enabled=False,
+        )
+        b.randomness = "cd" * 16
+        return b
+
+    math_cd = CooldownMap(cooldown_windows=50); math_cd.record_batched(11, 490)
+    code_cd = CooldownMap(cooldown_windows=50); code_cd.record_batched(22, 490)
+    server = ValidatorServer()
+    # Dict order = math first, so the no-arg /state reflects math (the bug).
+    server.set_active_batchers({
+        "openmathinstruct": _env_batcher(_Env("openmathinstruct"), math_cd),
+        "opencode": _env_batcher(_Env("opencode"), code_cd),
+    })
+    server.set_current_state(WindowState.OPEN)
+    client = TestClient(server.app)
+
+    # No-arg: unchanged — first (math) env.
+    base = client.get("/state").json()
+    assert 11 in base["cooldown_prompts"] and 22 not in base["cooldown_prompts"]
+
+    # Per-env: each env's own cooldown.
+    code = client.get("/state", params={"env": "opencode"}).json()
+    assert 22 in code["cooldown_prompts"] and 11 not in code["cooldown_prompts"]
+    math = client.get("/state", params={"env": "openmathinstruct"}).json()
+    assert 11 in math["cooldown_prompts"] and 22 not in math["cooldown_prompts"]
+
+    # Unknown env while a window is active → 404.
+    unk = client.get("/state", params={"env": "nope"})
+    assert unk.status_code == 404
+    assert unk.json()["detail"] == "unknown_env"
+
+
 def test_state_endpoint_does_not_block_on_batcher_lock():
     """Regression for the 2026-05-12 miner-timeout outage.
 

@@ -315,10 +315,22 @@ class MiningEngine:
                     await asyncio.sleep(0.1)
                     continue
 
-                # Pick prompt, generate, submit.
-                cooldown_set = set(state.cooldown_prompts)
+                # Per-env cooldown: /state's flat ``cooldown_prompts`` covers
+                # only the validator's first env, but ``prompt_idx`` is per-env,
+                # so query each env for its own set. Fall back to the base set
+                # on a fetch error rather than stall the loop.
                 for env_name in self._cooldown_per_env:
-                    self._cooldown_per_env[env_name] = cooldown_set
+                    try:
+                        env_state = await get_window_state_v2(
+                            url, env=env_name, client=client,
+                        )
+                        self._cooldown_per_env[env_name] = set(
+                            env_state.cooldown_prompts
+                        )
+                    except Exception:
+                        self._cooldown_per_env[env_name] = set(
+                            state.cooldown_prompts
+                        )
                 try:
                     env_name, prompt_idx = pick_env_and_prompt(
                         self.envs, self.mix, self._cooldown_per_env, rng=rng,
