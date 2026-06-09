@@ -23,6 +23,9 @@ import pytest
 class _FakeBatcher:
     randomness: str = ""
 
+    def set_prompt_range(self) -> None:
+        pass
+
 
 class _FakeService:
     """Stub mirroring the retry loop in ``GrpoValidator._set_window_randomness``.
@@ -56,6 +59,7 @@ class _FakeService:
                     subtensor, self._window_n,
                 )
                 self._active_batcher.randomness = randomness
+                self._active_batcher.set_prompt_range()
                 self._last_beacon = beacon
                 return
             except asyncio.CancelledError:
