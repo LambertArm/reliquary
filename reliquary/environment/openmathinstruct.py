@@ -180,7 +180,7 @@ class OpenMathInstructEnvironment:
     name: str = "openmathinstruct"
 
     _dataset_cache: ClassVar[Optional[object]] = None
-    _DEFAULT_SHARDS: ClassVar[int] = 2
+    _DEFAULT_SHARDS: ClassVar[int] = 4
 
     def __init__(self) -> None:
         if OpenMathInstructEnvironment._dataset_cache is None:
