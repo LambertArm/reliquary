@@ -297,18 +297,25 @@ TOP_K_PROTO = 0
 # 14M-prompt env supplies enough fresh material without needing reuse.
 BATCH_PROMPT_COOLDOWN_WINDOWS = 1_000_000
 
-# Validator startup: cap the number of R2 archives scanned to rebuild
-# CooldownMap. Independent of BATCH_PROMPT_COOLDOWN_WINDOWS — that
-# constant can be astronomically large for one-shot semantics, but R2
-# rebuild must stay bounded in elapsed wall time. Defaulting to 300 keeps
-# prod restarts fast while still replaying recent windows; operators can
-# widen it via COOLDOWN_REBUILD_LOOKBACK for one-off backfills or recovery
-# runs. Older entries may be missing from the rebuilt in-memory cooldown
-# map, which is safe: prompt cooldown is curriculum rotation, and the
-# hash blacklist below still rejects re-submission of the same token
-# sequence within its own retention horizon.
+# Cooldown is restored at startup from a run-keyed snapshot persisted to R2
+# (see CooldownMap.export_state + service._restore_cooldown), so the FULL
+# cooldown survives a restart without replaying the whole
+# BATCH_PROMPT_COOLDOWN_WINDOWS history. COOLDOWN_REBUILD_LOOKBACK now only
+# bounds the *gap replay* — the windows recorded between the last snapshot and
+# the restart — so it just needs to comfortably exceed the snapshot cadence
+# (CHECKPOINT_PUBLISH_INTERVAL_WINDOWS). It is also the scan size for the
+# no-snapshot fallback. The old 300 default under-covered the 1M horizon and
+# let prompts beyond 300 windows back re-enter the batch (replay exploit).
 COOLDOWN_REBUILD_LOOKBACK = int(
-    _os.environ.get("COOLDOWN_REBUILD_LOOKBACK", "300")
+    _os.environ.get("COOLDOWN_REBUILD_LOOKBACK", "2000")
+)
+
+# Identity the cooldown snapshot is keyed by. Stable across restarts of the
+# SAME training run (successive checkpoints share it); change it when starting a
+# fresh training so the cooldown resets to zero — a fresh model must be allowed
+# to re-see every prompt.
+TRAINING_RUN_ID = (
+    _os.environ.get("RELIQUARY_TRAINING_RUN_ID", "default").strip() or "default"
 )
 
 # Per-window prompt range (anti pre-curation). Each window, miner and

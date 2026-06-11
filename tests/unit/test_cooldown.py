@@ -148,3 +148,39 @@ def test_rebuild_ignores_windows_older_than_cooldown():
     m.rebuild_from_history(archived, current_window=120)
     assert m.is_in_cooldown(42, 120) is False  # expired long ago
     assert m.is_in_cooldown(7, 120) is True
+
+
+def test_export_import_state_roundtrip():
+    """Snapshot persistence: export -> import restores cooldown exactly,
+    including across the JSON str-key coercion the snapshot does."""
+    m = CooldownMap(cooldown_windows=1000)
+    m.record_batched(7, 100)
+    m.record_batched(42, 250)
+    state = m.export_state()
+
+    restored = CooldownMap(cooldown_windows=1000)
+    # mimic a JSON round-trip: keys come back as strings
+    restored.import_state({str(k): v for k, v in state.items()})
+    assert restored.is_in_cooldown(7, 300) is True
+    assert restored.is_in_cooldown(42, 300) is True
+    assert restored.export_state() == {7: 100, 42: 250}
+
+
+def test_apply_history_merges_without_clearing():
+    """apply_history tops up existing state (gap-replay) instead of clearing,
+    keeping the most-recent window per prompt."""
+    m = CooldownMap(cooldown_windows=1000)
+    m.import_state({7: 100, 42: 100})  # restored snapshot
+    gap = [
+        {"window_start": 150, "batch": [{"prompt_idx": 7}]},   # newer for 7
+        {"window_start": 160, "batch": [{"prompt_idx": 99}]},  # new prompt
+    ]
+    m.apply_history(gap, current_window=170)
+    assert m.export_state() == {7: 150, 42: 100, 99: 160}
+
+
+def test_apply_history_keeps_older_when_snapshot_is_newer():
+    m = CooldownMap(cooldown_windows=1000)
+    m.import_state({7: 200})
+    m.apply_history([{"window_start": 150, "batch": [{"prompt_idx": 7}]}], current_window=210)
+    assert m.export_state() == {7: 200}  # snapshot's newer window wins

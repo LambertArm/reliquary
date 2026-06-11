@@ -10,6 +10,7 @@ from typing import Any
 from reliquary.constants import (
     BATCH_PROMPT_COOLDOWN_WINDOWS,
     COOLDOWN_REBUILD_LOOKBACK,
+    TRAINING_RUN_ID,
     B_BATCH,
     BOOTSTRAP_WINDOWS,
     BOOTSTRAP_SIGMA_MIN,
@@ -57,6 +58,11 @@ from reliquary.validator.server import ValidatorServer
 from reliquary.validator.training import train_step
 
 logger = logging.getLogger(__name__)
+
+
+def _cooldown_snapshot_key(run_id: str) -> str:
+    """R2 key for the run-keyed cooldown snapshot."""
+    return f"cooldown_snapshots/{run_id}.json"
 
 
 def _filter_archives_for_env(archives: list[dict], env_name: str) -> list[dict]:
@@ -1035,6 +1041,9 @@ class ValidationService:
                         "Published checkpoint %d to %s@%s and refreshed verify_model",
                         entry.checkpoint_n, entry.repo_id, entry.revision[:12],
                     )
+                    # Snapshot the cooldown at the publish cadence so a restart
+                    # restores the full state (run-keyed) instead of replaying.
+                    await self._snapshot_cooldown()
                 except Exception:
                     logger.exception("HF publish failed; staying on previous checkpoint")
             else:
@@ -1568,44 +1577,123 @@ class ValidationService:
             )
 
     async def _rebuild_cooldown_from_history(self) -> None:
-        """At startup, reconstruct per-env CooldownMaps from the last
-        COOLDOWN_REBUILD_LOOKBACK archived windows on R2.
-
-        R2 is the durable source of truth — each window's sealed batch is
-        uploaded by ``_archive_window``. Rebuilding from that history means:
-          * local disk state isn't needed (no JSON file to manage)
-          * multi-validator consistency: any validator rebuilding from the
-            same R2 prefix converges to the same cooldown map
-          * a fresh validator joining an active subnet picks up the
-            current cooldown state without coordination
-
-        Backward-compat: archives created before multi-env support have no
-        per-entry ``env_name``. Those archives carry a top-level ``environment``
-        (singular) field that we use to assign all batch entries to that env.
-        Newer archives have ``"env_name"`` on each batch entry.
+        """At startup, restore per-env cooldown from the run-keyed R2 snapshot,
+        then replay only the windows recorded since it was taken — so the FULL
+        cooldown survives a restart, not just the last COOLDOWN_REBUILD_LOOKBACK
+        windows (the old replay exploit). Falls back to a bounded archive scan
+        when no snapshot exists for the DEFAULT run (first start / pre-snapshot
+        transition); an explicit fresh RELIQUARY_TRAINING_RUN_ID with no snapshot
+        starts empty — a new model must be allowed to re-see every prompt.
         """
+        current_window = self._window_n
+        snapshot = None
         try:
-            current_window = self._window_n
-            archives = await storage.list_recent_datasets(
-                current_window=current_window + 1,
-                n=COOLDOWN_REBUILD_LOOKBACK,
+            snapshot = await storage.download_json(
+                _cooldown_snapshot_key(TRAINING_RUN_ID)
             )
-            # Build per-env filtered views of the archives for rebuild.
+        except Exception:
+            logger.exception("Failed to read cooldown snapshot")
+
+        if snapshot and snapshot.get("run_id") == TRAINING_RUN_ID:
+            envs = snapshot.get("envs", {}) or {}
             for env_name, cooldown_map in self._cooldown_per_env.items():
-                env_archives = _filter_archives_for_env(archives, env_name)
+                cooldown_map.import_state(envs.get(env_name, {}))
+            snapshot_window = int(snapshot.get("snapshot_window", current_window))
+            gap = max(0, current_window - snapshot_window)
+            if gap > 0:
+                await self._replay_cooldown_gap(current_window, gap)
+            logger.info(
+                "Restored cooldown from snapshot run=%s snapshot_window=%d "
+                "gap=%d (current=%d, sizes=%s)",
+                TRAINING_RUN_ID, snapshot_window, gap, current_window,
+                {n: len(m) for n, m in self._cooldown_per_env.items()},
+            )
+            return
+
+        if TRAINING_RUN_ID != "default":
+            logger.info(
+                "No cooldown snapshot for fresh run=%s — starting empty (reset).",
+                TRAINING_RUN_ID,
+            )
+            return
+
+        # Default run, no snapshot (first start / pre-snapshot transition):
+        # bounded archive rebuild — better than empty, and the first snapshot
+        # makes subsequent restarts complete.
+        await self._rebuild_cooldown_from_archives(
+            current_window, COOLDOWN_REBUILD_LOOKBACK,
+        )
+
+    async def _rebuild_cooldown_from_archives(self, current_window: int, n: int) -> None:
+        """Rebuild every env's cooldown from scratch from the last ``n`` R2
+        archives (used only when no snapshot is available)."""
+        try:
+            archives = await storage.list_recent_datasets(
+                current_window=current_window + 1, n=n,
+            )
+            for env_name, cooldown_map in self._cooldown_per_env.items():
                 cooldown_map.rebuild_from_history(
-                    env_archives, current_window=current_window,
+                    _filter_archives_for_env(archives, env_name),
+                    current_window=current_window,
                 )
             logger.info(
-                "Rebuilt cooldown from %d archive windows (current=%d, "
-                "map sizes=%s)",
+                "Rebuilt cooldown from %d archive windows (no snapshot; "
+                "current=%d, sizes=%s)",
                 len(archives), current_window,
-                {n: len(m) for n, m in self._cooldown_per_env.items()},
+                {n2: len(m) for n2, m in self._cooldown_per_env.items()},
             )
         except Exception:
             logger.exception(
-                "Failed to rebuild cooldown from history; starting with empty state"
+                "Failed to rebuild cooldown from history; starting empty"
             )
+
+    async def _replay_cooldown_gap(self, current_window: int, gap: int) -> None:
+        """Merge the windows recorded since the snapshot into the restored
+        cooldown. Bounded by COOLDOWN_REBUILD_LOOKBACK; in normal operation the
+        gap is ~the snapshot (publish) cadence."""
+        n = min(gap + 1, COOLDOWN_REBUILD_LOOKBACK)
+        try:
+            archives = await storage.list_recent_datasets(
+                current_window=current_window + 1, n=n,
+            )
+            for env_name, cooldown_map in self._cooldown_per_env.items():
+                cooldown_map.apply_history(
+                    _filter_archives_for_env(archives, env_name),
+                    current_window=current_window,
+                )
+            if gap + 1 > COOLDOWN_REBUILD_LOOKBACK:
+                logger.warning(
+                    "Cooldown gap %d exceeds replay cap %d; prompts in the "
+                    "uncovered span may be re-eligible. Widen "
+                    "COOLDOWN_REBUILD_LOOKBACK if this recurs.",
+                    gap, COOLDOWN_REBUILD_LOOKBACK,
+                )
+        except Exception:
+            logger.exception("Cooldown gap-replay failed; using snapshot only")
+
+    async def _snapshot_cooldown(self) -> None:
+        """Persist the per-env cooldown maps to R2, keyed by the training run id,
+        so a restart restores the full cooldown without replaying history. Best
+        effort — a snapshot failure must never break the publish path."""
+        try:
+            snapshot = {
+                "run_id": TRAINING_RUN_ID,
+                "snapshot_window": self._window_n,
+                "envs": {
+                    name: cd.export_state()
+                    for name, cd in self._cooldown_per_env.items()
+                },
+            }
+            if await storage.upload_json(
+                _cooldown_snapshot_key(TRAINING_RUN_ID), snapshot
+            ):
+                logger.info(
+                    "Snapshotted cooldown run=%s window=%d (sizes=%s)",
+                    TRAINING_RUN_ID, self._window_n,
+                    {n: len(m) for n, m in self._cooldown_per_env.items()},
+                )
+        except Exception:
+            logger.exception("Cooldown snapshot failed (non-fatal)")
 
     async def _rebuild_hashes_from_history(self) -> None:
         """Rebuild ``self._hash_set`` from the last HASH_DEDUP_RETENTION_WINDOWS
