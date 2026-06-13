@@ -92,17 +92,12 @@ def test_train_step_forwards_metrics_to_telemetry(monkeypatch):
     group.rollouts = [_mk_rollout(1.0), _mk_rollout(0.0)]
     group.prompt_idx = 0
 
-    # The test doesn't care whether the _rollout_loss forward pass
-    # actually runs; monkeypatch it to return loss tensors connected to
-    # model parameters (so loss.backward() works) but numerically zero.
-    # Must return fresh tensors each call — the graph is freed after each
-    # backward pass.
-    def fake_loss(model, ref_model, rollout, advantage, device):
-        p = next(model.parameters())
-        zero_loss = (p.sum() * 0.0)
-        return zero_loss, zero_loss.detach(), 1  # (ppo, kl, n_completion_tokens)
-
-    monkeypatch.setattr(_t, "_rollout_loss", fake_loss)
+    # The micro-batch train_step gathers grads via _accumulate_grouped_grads,
+    # not the legacy per-rollout _rollout_loss. Stub it to report a successful
+    # step (n_processed > 0) without a real forward, so we exercise only the
+    # telemetry-forwarding branch. No grads are produced → the optimizer step is
+    # a harmless no-op on the tiny Linear model.
+    monkeypatch.setattr(_t, "_accumulate_grouped_grads", lambda *a, **k: (0.0, 0.0, 2))
 
     import copy
     ref = copy.deepcopy(model)

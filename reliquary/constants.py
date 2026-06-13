@@ -279,6 +279,14 @@ DEFAULT_ENVIRONMENTS: str = "openmathinstruct"
 # to keep semantics simple.
 GRAD_ACCUM_STEPS: int = len(ENVIRONMENT_MIX)
 
+# Per-env weight in the GRPO loss. The step normalizes token-level *within*
+# each env (each batch is one env), then recombines as Σ_e w_e·L_e. Empty =
+# equal weights (renormalized over the envs present in a window) — so a
+# long-completion env (code) cannot dominate a short-completion env (math) via
+# raw token mass. Override to bias the mix, e.g. {"openmathinstruct": 2.0,
+# "opencodeinstruct": 1.0}; unlisted envs default to 1.0.
+ENV_LOSS_WEIGHTS: dict[str, float] = {}
+
 # Sampling temperature fixed at protocol level. Miners who use a different
 # T would produce samples from a different distribution → biased GRPO
 # gradient. Value chosen in the GRPO-friendly range (non-zero).
