@@ -134,6 +134,79 @@ def _compute_advantages(rewards: list[float]) -> list[float]:
     return [(r - mean) / std for r in rewards]
 
 
+def _batch_loss_weights(
+    token_counts: list[float],
+    raw_weights: Optional[list[float]] = None,
+) -> list[float]:
+    """Per-token loss scale ``s_b = w_b / N_b`` for token-level-per-env loss.
+
+    ``token_counts[b]`` is batch b's surviving completion-token count (N_b). A
+    batch with N_b == 0 is dropped (scale 0). ``raw_weights`` are the relative
+    env weights w_e (default equal); they are renormalized over the *present*
+    batches so ``Σ_b s_b·N_b == 1``, hence each env contributes exactly its
+    weight regardless of token mass. A single present batch gives ``s = 1/N`` —
+    the plain global token-level (DAPO) normalization the loss used before.
+    """
+    n = len(token_counts)
+    if raw_weights is None:
+        raw_weights = [1.0] * n
+    present = [b for b in range(n) if token_counts[b] > 0]
+    total_w = sum(raw_weights[b] for b in present)
+    scales = [0.0] * n
+    if total_w <= 0:
+        return scales
+    for b in present:
+        scales[b] = (raw_weights[b] / total_w) / token_counts[b]
+    return scales
+
+
+def _env_weight_for_batch(batch, env_weights: dict) -> float:
+    """Relative loss weight for a batch, read from the ``env_name`` on its first
+    rollout (every rollout in a batch shares one env). Unknown/absent → 1.0."""
+    for group in batch:
+        for rollout in group.rollouts:
+            name = getattr(rollout, "env_name", "") or ""
+            return float(env_weights.get(name, 1.0))
+    return 1.0
+
+
+def _plan_from_batches(batches, env_weights: Optional[dict] = None):
+    """Pass 1 (metadata only, no forward): group-relative advantages + per-batch
+    token-level loss weights. ``batches`` is one batch per env (env_mix order,
+    see service.py). Returns ``(plan, n_skipped)`` where each plan entry is
+    ``(group, advantages, scale)`` and ``scale`` is the per-token weight w_b/N_b
+    for the group's env. Degenerate groups (std==0 → zero advantage → no signal)
+    are dropped and counted in ``n_skipped``.
+    """
+    from reliquary.constants import ENV_LOSS_WEIGHTS
+
+    if env_weights is None:
+        env_weights = ENV_LOSS_WEIGHTS
+    n_batches = len(batches)
+    surviving: list[tuple[Any, list[float], int]] = []
+    batch_tokens = [0.0] * n_batches
+    n_skipped = 0
+    for b_idx, batch in enumerate(batches):
+        for group in batch:
+            advantages = _compute_advantages([r.reward for r in group.rollouts])
+            if all(a == 0.0 for a in advantages):
+                n_skipped += 1
+                logger.debug("skipping degenerate group on prompt_idx=%s",
+                             getattr(group, "prompt_idx", "?"))
+                continue
+            surviving.append((group, advantages, b_idx))
+            for rollout in group.rollouts:
+                meta = (rollout.commit or {}).get("rollout", {}) or {}
+                batch_tokens[b_idx] += len(meta.get("token_logprobs", []) or [])
+
+    raw_weights = None
+    if env_weights:
+        raw_weights = [_env_weight_for_batch(b, env_weights) for b in batches]
+    scales = _batch_loss_weights(batch_tokens, raw_weights)
+    plan = [(g, a, scales[b]) for g, a, b in surviving]
+    return plan, n_skipped
+
+
 # ---------------------------------------------------------------------------
 # Per-rollout loss (forward-pass heavy — uses the model)
 # ---------------------------------------------------------------------------
@@ -393,9 +466,10 @@ def _batched_completion_logprobs(model, input_ids, attention_mask, prompt_length
     return _selected_logprobs(logits[b_idx, p_idx], targets), seg
 
 
-def _microbatch_grad(model, ref_model, batch, n_total_tokens, device, *, atomic):
+def _microbatch_grad(model, ref_model, batch, device, *, atomic):
     """Forward + backward one micro-batch. ``batch`` is a list of
-    ``(tokens, prompt_length, old_logprobs, advantage)``. Returns
+    ``(tokens, prompt_length, old_logprobs, advantage, scale)`` where ``scale``
+    is the per-token loss weight ``w_e/N_e`` of the rollout's env. Returns
     ``(sum_ppo_mean, sum_kl_mean, n)`` for logging (per-rollout means summed,
     matching the legacy metric).
 
@@ -408,8 +482,8 @@ def _microbatch_grad(model, ref_model, batch, n_total_tokens, device, *, atomic)
     T = max(len(it[0]) for it in batch)
     input_ids = torch.zeros(B, T, dtype=torch.long, device=device)
     attn = torch.zeros(B, T, dtype=torch.long, device=device)
-    plens, lens, olds, advs = [], [], [], []
-    for j, (tokens, p, old, adv) in enumerate(batch):
+    plens, lens, olds, advs, scales = [], [], [], [], []
+    for j, (tokens, p, old, adv, scale) in enumerate(batch):
         L = len(tokens)
         input_ids[j, :L] = torch.tensor(tokens, device=device)
         attn[j, :L] = 1
@@ -417,6 +491,7 @@ def _microbatch_grad(model, ref_model, batch, n_total_tokens, device, *, atomic)
         lens.append(L)
         olds.append(old)
         advs.append(adv)
+        scales.append(scale)
 
     with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
                         enabled=device.type in ("cuda", "cpu")):
@@ -427,14 +502,18 @@ def _microbatch_grad(model, ref_model, batch, n_total_tokens, device, *, atomic)
     old_cat = torch.tensor([x for old in olds for x in old], device=device, dtype=new_lp.dtype)
     adv_cat = torch.tensor([advs[k] for k in range(B) for _ in range(seg[k])],
                            device=device, dtype=new_lp.dtype)
+    scale_cat = torch.tensor([scales[k] for k in range(B) for _ in range(seg[k])],
+                             device=device, dtype=new_lp.dtype)
     ratio = torch.exp(new_lp - old_cat)
     surr = torch.min(ratio * adv_cat,
                      torch.clamp(ratio, 1 - PPO_CLIP_EPSILON, 1 + PPO_CLIP_EPSILON) * adv_cat)
     ppo_tok = -surr
     kl_log = ref_lp - new_lp
     kl_tok = torch.exp(kl_log) - 1 - kl_log
-    # Token-level (DAPO) normalisation: every completion token weighed equally.
-    loss = (ppo_tok.sum() + KL_BETA * kl_tok.sum()) / n_total_tokens
+    # Token-level (DAPO) normalisation, weighted per-env: scale_cat carries each
+    # token's w_e/N_e, so the loss is Σ_e w_e·(token-mean over env e) — no env's
+    # raw token mass dominates the shared step.
+    loss = (scale_cat * (ppo_tok + KL_BETA * kl_tok)).sum()
 
     if atomic:
         params = [p for p in model.parameters() if p.requires_grad]
@@ -458,14 +537,14 @@ def _microbatch_grad(model, ref_model, batch, n_total_tokens, device, *, atomic)
     return sum_ppo, sum_kl, B
 
 
-def _process_microbatch(model, ref_model, batch, n_total_tokens, device, *, atomic):
+def _process_microbatch(model, ref_model, batch, device, *, atomic):
     """One micro-batch; when atomic, on OOM halve and retry down to a single
     sequence (which, if it still OOMs, is a genuine unrecoverable OOM)."""
     if not atomic:
-        return _microbatch_grad(model, ref_model, batch, n_total_tokens, device, atomic=False)
+        return _microbatch_grad(model, ref_model, batch, device, atomic=False)
     oom = False
     try:
-        return _microbatch_grad(model, ref_model, batch, n_total_tokens, device, atomic=True)
+        return _microbatch_grad(model, ref_model, batch, device, atomic=True)
     except torch.cuda.OutOfMemoryError:
         if len(batch) == 1:
             raise
@@ -476,17 +555,18 @@ def _process_microbatch(model, ref_model, batch, n_total_tokens, device, *, atom
         gc.collect()
         torch.cuda.empty_cache()
         mid = len(batch) // 2
-        a = _process_microbatch(model, ref_model, batch[:mid], n_total_tokens, device, atomic=True)
-        b = _process_microbatch(model, ref_model, batch[mid:], n_total_tokens, device, atomic=True)
+        a = _process_microbatch(model, ref_model, batch[:mid], device, atomic=True)
+        b = _process_microbatch(model, ref_model, batch[mid:], device, atomic=True)
         return a[0] + b[0], a[1] + b[1], a[2] + b[2]
 
 
 def _build_microbatch_items(plan):
-    """Flatten plan -> list of (tokens, prompt_length, old_logprobs, advantage),
-    dropping rollouts the per-rollout path would have skipped (missing
-    prompt_length/token_logprobs, or a miner/model completion-length mismatch)."""
+    """Flatten plan -> list of (tokens, prompt_length, old_logprobs, advantage,
+    scale), dropping rollouts the per-rollout path would have skipped (missing
+    prompt_length/token_logprobs, or a miner/model completion-length mismatch).
+    ``scale`` is the per-token loss weight w_e/N_e carried from the plan entry."""
     items = []
-    for group, advantages in plan:
+    for group, advantages, scale in plan:
         for rollout, adv in zip(group.rollouts, advantages):
             commit = rollout.commit or {}
             tokens = commit.get("tokens")
@@ -500,11 +580,11 @@ def _build_microbatch_items(plan):
             if n_completion <= 0 or n_completion != len(old):
                 logger.warning("rollout skipped: log-prob length mismatch")
                 continue
-            items.append((tokens, p, old, adv))
+            items.append((tokens, p, old, adv, scale))
     return items
 
 
-def _accumulate_grouped_grads(model, ref_model, plan, n_total_tokens, device, *, budget, atomic):
+def _accumulate_grouped_grads(model, ref_model, plan, device, *, budget, atomic):
     """Pack the plan's rollouts into token-budget micro-batches and accumulate
     gradients. Returns ``(total_ppo, total_kl, n_processed)``."""
     items = _build_microbatch_items(plan)
@@ -515,7 +595,7 @@ def _accumulate_grouped_grads(model, ref_model, plan, n_total_tokens, device, *,
     n_processed = 0
     for idxs in _pack_by_token_budget(lengths, budget):
         sp, sk, n = _process_microbatch(
-            model, ref_model, [items[i] for i in idxs], n_total_tokens, device, atomic=atomic,
+            model, ref_model, [items[i] for i in idxs], device, atomic=atomic,
         )
         total_ppo += sp
         total_kl += sk
@@ -564,30 +644,19 @@ def train_step(
     _optimizer.zero_grad()
 
     n_total_rollouts = sum(len(g.rollouts) for batch in batches for g in batch)
-    n_skipped = 0
 
-    # Pass 1 (metadata only, no forward): group advantages + total completion-
-    # token budget. DAPO token-level normalisation weighs every completion
-    # token equally, vs the old sample-level mean which averaged per rollout
-    # and so under-weighted (and under-penalised) tokens in long responses.
-    # Completion length is known from the miner-committed token_logprobs, so
-    # this pre-pass costs no extra forward.
-    plan: list[tuple[Any, list[float]]] = []
-    n_total_tokens = 0
-    for batch in batches:
-        for group in batch:
-            advantages = _compute_advantages([r.reward for r in group.rollouts])
-            if all(a == 0.0 for a in advantages):
-                n_skipped += 1
-                logger.debug("skipping degenerate group on prompt_idx=%d", group.prompt_idx)
-                continue
-            plan.append((group, advantages))
-            for rollout in group.rollouts:
-                meta = (rollout.commit or {}).get("rollout", {}) or {}
-                n_total_tokens += len(meta.get("token_logprobs", []) or [])
+    # Pass 1 (metadata only, no forward): group-relative advantages + per-batch
+    # token-level loss weights. Each batch is one env (env_mix order, see
+    # service.py), so the loss normalizes token-level *within* a batch and
+    # recombines as Σ_e w_e·L_e — a long-completion env (code) cannot dominate a
+    # short-completion env (math) through raw token mass. DAPO token-level
+    # weighting is preserved inside each env. Degenerate groups (std==0 → zero
+    # advantage) carry no signal and are dropped. Completion length comes from
+    # the miner-committed token_logprobs, so this costs no extra forward.
+    plan, n_skipped = _plan_from_batches(batches)
 
-    if n_total_tokens == 0:
-        logger.info("train_step: no trainable completion tokens")
+    if not plan:
+        logger.info("train_step: no trainable groups")
         return model
 
     # Pass 2: micro-batched forward/backward (token-budget packing). The fast
@@ -596,7 +665,7 @@ def train_step(
     # a halved budget (atomic = an OOM mid-backward commits no gradient).
     try:
         total_ppo, total_kl, n_processed = _accumulate_grouped_grads(
-            model, ref_model, plan, n_total_tokens, device,
+            model, ref_model, plan, device,
             budget=MICROBATCH_MAX_PADDED_TOKENS, atomic=False,
         )
     except torch.cuda.OutOfMemoryError:
@@ -604,7 +673,7 @@ def train_step(
         _optimizer.zero_grad()
         torch.cuda.empty_cache()
         total_ppo, total_kl, n_processed = _accumulate_grouped_grads(
-            model, ref_model, plan, n_total_tokens, device,
+            model, ref_model, plan, device,
             budget=max(1, MICROBATCH_MAX_PADDED_TOKENS // 2), atomic=True,
         )
 

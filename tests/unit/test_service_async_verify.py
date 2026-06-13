@@ -114,6 +114,8 @@ def _make_test_batcher():
     class _B:
         randomness = None
         beacon_invalid = False
+        def set_prompt_range(self):
+            pass
         def seal_batch(self):
             raise AssertionError("seal_batch must not be called for invalid windows")
     return _B()

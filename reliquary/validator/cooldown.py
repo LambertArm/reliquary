@@ -92,24 +92,30 @@ class CooldownMap:
         # JSON object keys are strings — coerce back to int.
         self._last_batched = {int(k): int(v) for k, v in data["last_batched"].items()}
 
+    # ---------- snapshot state (run-keyed, persisted to R2) ----------
+
+    def export_state(self) -> dict[int, int]:
+        """Snapshot of ``prompt_idx -> last_batched_window`` for persistence."""
+        return dict(self._last_batched)
+
+    def import_state(self, last_batched: dict) -> None:
+        """Replace state from an ``export_state`` snapshot (keys may be str)."""
+        self._last_batched = {int(k): int(v) for k, v in last_batched.items()}
+
     # ---------- rebuild from archived window data ----------
 
-    def rebuild_from_history(
+    def apply_history(
         self,
         archived_windows: list[dict],
         current_window: int,
     ) -> None:
-        """Rebuild state from the last N archived windows' rewarded prompts.
-
-        *archived_windows* is a list of dicts, each with ``window_start``
-        (int), ``batch`` (selected training prompts), and optionally
-        ``runners_up`` entries carrying ``rewarded=True``. Typically fetched
-        from the R2 dataset archive at validator startup.
+        """Merge rewarded prompts from *archived_windows*, keeping the most
+        recent window per prompt. Does NOT clear existing state — use to top up
+        a restored snapshot with the windows recorded since it was taken.
 
         Only windows within ``cooldown_windows`` of *current_window* matter —
         older entries have already expired and are skipped.
         """
-        self._last_batched.clear()
         horizon = current_window - self._cooldown_windows
         for record in archived_windows:
             w = int(record["window_start"])
@@ -125,3 +131,18 @@ class CooldownMap:
                 # Keep the most recent window for each prompt.
                 if self._last_batched.get(idx, -1) < w:
                     self._last_batched[idx] = w
+
+    def rebuild_from_history(
+        self,
+        archived_windows: list[dict],
+        current_window: int,
+    ) -> None:
+        """Rebuild state from scratch from archived windows' rewarded prompts.
+
+        *archived_windows* is a list of dicts, each with ``window_start``
+        (int), ``batch`` (selected training prompts), and optionally
+        ``runners_up`` entries carrying ``rewarded=True``. Typically fetched
+        from the R2 dataset archive at validator startup.
+        """
+        self._last_batched.clear()
+        self.apply_history(archived_windows, current_window)

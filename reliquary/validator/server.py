@@ -986,6 +986,14 @@ class ValidatorServer:
                 )
             if request.prompt_idx >= len(batcher.env):
                 return _cheap_reject(RejectReason.BAD_PROMPT_IDX, reject_stage="prompt")
+            prompt_range = getattr(batcher, "prompt_range", None)
+            if prompt_range is not None:
+                lo, hi = prompt_range
+                if not (lo <= request.prompt_idx < hi):
+                    return _cheap_reject(
+                        RejectReason.PROMPT_OUT_OF_RANGE,
+                        reject_stage="prompt_range",
+                    )
             if request.prompt_idx in batcher.cooldown_prompts_snapshot:
                 return _cheap_reject(
                     RejectReason.PROMPT_IN_COOLDOWN,
@@ -1003,8 +1011,11 @@ class ValidatorServer:
                 type(batcher), "try_reserve_proof_admission", None
             )
             if reserve_proof is not None:
-                preflight_reason, preflight_stage = _proof_free_submission_reject(
-                    request, batcher
+                # Runs in a thread: the canonical-prompt check calls
+                # env.get_problem, which for the lazy parquet dataset may do a
+                # blocking row-group fetch — must not stall the event loop.
+                preflight_reason, preflight_stage = await asyncio.to_thread(
+                    _proof_free_submission_reject, request, batcher
                 )
                 if preflight_reason is not None:
                     return _cheap_reject(

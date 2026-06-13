@@ -42,7 +42,11 @@ async def test_rebuild_uses_state_window_n_not_block_derived():
         captured["current_window"] = current_window
         return []
 
+    # No snapshot for the default run -> falls back to the bounded archive scan.
     with patch(
+        "reliquary.infrastructure.storage.download_json",
+        new=AsyncMock(return_value=None),
+    ), patch(
         "reliquary.infrastructure.storage.list_recent_datasets",
         new=fake_list,
     ):

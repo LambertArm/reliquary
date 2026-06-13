@@ -20,9 +20,9 @@ def test_v2_group_sizes():
     assert C.MAX_PROOF_CANDIDATES_PER_WINDOW == 32
     assert C.MAX_POST_TRIGGER_PROOF_CANDIDATES == 8
     assert C.MAX_SEAL_QUEUE_DRAIN_SECONDS == 60.0
-    assert C.SPARSE_VALID_IDLE_SEAL_SECONDS == 180.0
+    assert C.SPARSE_VALID_IDLE_SEAL_SECONDS == 300.0
     assert C.SPARSE_VALID_IDLE_MIN_DISTINCT_PROMPTS == 4
-    assert C.SPARSE_VALID_MAX_WINDOW_SECONDS == 600.0
+    assert C.SPARSE_VALID_MAX_WINDOW_SECONDS == 900.0
 
 
 def test_v2_temperature_fixed_nonzero():
@@ -51,10 +51,11 @@ def test_hash_dedup_retention_decoupled_from_cooldown():
 
 
 def test_cooldown_rebuild_lookback_bounded():
-    """The R2 rebuild cap must stay small enough for a startup scan to
-    complete in seconds even when BATCH_PROMPT_COOLDOWN_WINDOWS is set to
-    an astronomical value for one-shot semantics."""
-    assert C.COOLDOWN_REBUILD_LOOKBACK == 300
+    """The gap-replay / no-snapshot fallback scan must stay small enough for a
+    fast startup, comfortably exceed the snapshot cadence (so a normal gap is
+    always covered), and stay below the cooldown horizon."""
+    assert C.COOLDOWN_REBUILD_LOOKBACK == 2000
+    assert C.COOLDOWN_REBUILD_LOOKBACK > C.COOLDOWN_SNAPSHOT_INTERVAL_WINDOWS
     assert C.COOLDOWN_REBUILD_LOOKBACK < C.BATCH_PROMPT_COOLDOWN_WINDOWS
 
 

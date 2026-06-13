@@ -177,10 +177,12 @@ PROOF_ADMISSION_STALL_POLL_SECONDS = 0.5
 # stale/misconfigured miners can leave a window with some valid submissions but
 # fewer than B distinct trainable prompts. Keep the normal 8-distinct seal as
 # the happy path, but do not let sparse valid traffic hold checkpoint progress
-# for the long safety-net timeout.
-SPARSE_VALID_IDLE_SEAL_SECONDS = 180.0
+# for the long safety-net timeout. Idle/age caps are sized to give slower
+# fresh-model submissions (longer generations, bursty arrivals) time to reach
+# 8 distinct before a sparse window is force-sealed.
+SPARSE_VALID_IDLE_SEAL_SECONDS = 300.0
 SPARSE_VALID_IDLE_MIN_DISTINCT_PROMPTS = 4
-SPARSE_VALID_MAX_WINDOW_SECONDS = 600.0
+SPARSE_VALID_MAX_WINDOW_SECONDS = 900.0
 
 # UID that receives unused slot emission budget (the burn address).
 UID_BURN = 0
@@ -279,6 +281,14 @@ DEFAULT_ENVIRONMENTS: str = "openmathinstruct"
 # to keep semantics simple.
 GRAD_ACCUM_STEPS: int = len(ENVIRONMENT_MIX)
 
+# Per-env weight in the GRPO loss. The step normalizes token-level *within*
+# each env (each batch is one env), then recombines as Σ_e w_e·L_e. Empty =
+# equal weights (renormalized over the envs present in a window) — so a
+# long-completion env (code) cannot dominate a short-completion env (math) via
+# raw token mass. Override to bias the mix, e.g. {"openmathinstruct": 2.0,
+# "opencodeinstruct": 1.0}; unlisted envs default to 1.0.
+ENV_LOSS_WEIGHTS: dict[str, float] = {}
+
 # Sampling temperature fixed at protocol level. Miners who use a different
 # T would produce samples from a different distribution → biased GRPO
 # gradient. Value chosen in the GRPO-friendly range (non-zero).
@@ -297,18 +307,53 @@ TOP_K_PROTO = 0
 # 14M-prompt env supplies enough fresh material without needing reuse.
 BATCH_PROMPT_COOLDOWN_WINDOWS = 1_000_000
 
-# Validator startup: cap the number of R2 archives scanned to rebuild
-# CooldownMap. Independent of BATCH_PROMPT_COOLDOWN_WINDOWS — that
-# constant can be astronomically large for one-shot semantics, but R2
-# rebuild must stay bounded in elapsed wall time. Defaulting to 300 keeps
-# prod restarts fast while still replaying recent windows; operators can
-# widen it via COOLDOWN_REBUILD_LOOKBACK for one-off backfills or recovery
-# runs. Older entries may be missing from the rebuilt in-memory cooldown
-# map, which is safe: prompt cooldown is curriculum rotation, and the
-# hash blacklist below still rejects re-submission of the same token
-# sequence within its own retention horizon.
+# Cooldown is restored at startup from a run-keyed snapshot persisted to R2
+# (see CooldownMap.export_state + service._restore_cooldown), so the FULL
+# cooldown survives a restart without replaying the whole
+# BATCH_PROMPT_COOLDOWN_WINDOWS history. COOLDOWN_REBUILD_LOOKBACK now only
+# bounds the *gap replay* — the windows recorded between the last snapshot and
+# the restart — so it just needs to comfortably exceed the snapshot cadence
+# (CHECKPOINT_PUBLISH_INTERVAL_WINDOWS). It is also the scan size for the
+# no-snapshot fallback. The old 300 default under-covered the 1M horizon and
+# let prompts beyond 300 windows back re-enter the batch (replay exploit).
 COOLDOWN_REBUILD_LOOKBACK = int(
-    _os.environ.get("COOLDOWN_REBUILD_LOOKBACK", "300")
+    _os.environ.get("COOLDOWN_REBUILD_LOOKBACK", "2000")
+)
+
+# Identity the cooldown snapshot is keyed by. Stable across restarts of the
+# SAME training run (successive checkpoints share it); change it when starting a
+# fresh training so the cooldown resets to zero — a fresh model must be allowed
+# to re-see every prompt.
+TRAINING_RUN_ID = (
+    _os.environ.get("RELIQUARY_TRAINING_RUN_ID", "default").strip() or "default"
+)
+
+# How often (in windows) to persist the cooldown snapshot, INDEPENDENT of the
+# checkpoint-publish cadence. Publishing can stall (training starvation, HF
+# publish failures) while windows keep advancing, which would let the snapshot
+# fall arbitrarily far behind current_window — beyond what the gap replay
+# (COOLDOWN_REBUILD_LOOKBACK) can recover, re-opening the replay exploit. A small
+# fixed cadence keeps snapshot_window within this many windows of current.
+COOLDOWN_SNAPSHOT_INTERVAL_WINDOWS = max(
+    1, int(_os.environ.get("COOLDOWN_SNAPSHOT_INTERVAL_WINDOWS", "10"))
+)
+
+# Per-window prompt range (anti pre-curation). Each window, miner and
+# validator derive the same contiguous slice of the prompt index space from
+# the shared per-window randomness; once enforcement is armed only
+# submissions whose prompt_idx falls in the slice are accepted. A static or
+# shared bank of pre-curated prompts then lands in-range only
+# ~PROMPT_RANGE_SIZE/len(env) of windows. See reliquary/shared/prompt_range.py.
+PROMPT_RANGE_SIZE = int(_os.environ.get("PROMPT_RANGE_SIZE", "5000"))
+
+# Window number from which the validator hard-enforces the prompt range.
+# Below this window the slice is NOT enforced (current behavior, no rejects),
+# so the upgraded miner client can ship ahead of the cutover. The default is
+# a "never enforce" sentinel: set PROMPT_RANGE_ENFORCE_FROM_WINDOW=N* to the
+# agreed cutover window AFTER the gated client is released and announced,
+# otherwise un-upgraded miners are rejected ~every window.
+PROMPT_RANGE_ENFORCE_FROM_WINDOW = int(
+    _os.environ.get("PROMPT_RANGE_ENFORCE_FROM_WINDOW", str(2 ** 63 - 1))
 )
 
 # Per-rollout content dedup horizon. Independent of and strictly longer

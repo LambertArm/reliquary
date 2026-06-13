@@ -72,21 +72,25 @@ class _QwenLike(torch.nn.Module):
 
 
 def _make_plan(groups):
-    plan, n_total = [], 0
+    """Single-env plan: scale = 1/n_total per group, i.e. the global token-level
+    normalization (one present batch reduces to the pre-fix DAPO denominator)."""
+    surviving, n_total = [], 0
     for grp in groups:
         advs = _compute_advantages([r.reward for r in grp.rollouts])
         if all(a == 0.0 for a in advs):
             continue
-        plan.append((grp, advs))
+        surviving.append((grp, advs))
         for r in grp.rollouts:
             n_total += len(r.commit["rollout"]["token_logprobs"])
+    scale = 1.0 / n_total if n_total else 0.0
+    plan = [(grp, advs, scale) for grp, advs in surviving]
     return plan, n_total
 
 
 def _reference_grads(model, ref, plan, n_total, device):
     for p in model.parameters():
         p.grad = None
-    for grp, advs in plan:
+    for grp, advs, _scale in plan:
         for r, adv in zip(grp.rollouts, advs):
             ppo, kl, n = _rollout_loss(model, ref, r, adv, device=device)
             ((ppo + KL_BETA * kl) * n / n_total).backward()
@@ -164,7 +168,7 @@ def test_batched_grads_match_per_rollout_qwenlike():
     ref_grads = _reference_grads(m_ref, _frozen(m_ref), plan, n_total, device)
     m_bat = copy.deepcopy(model)
     bat_grads = _grads_after(m_bat, lambda: _accumulate_grouped_grads(
-        m_bat, _frozen(m_bat), plan, n_total, device, budget=64, atomic=False))
+        m_bat, _frozen(m_bat), plan, device, budget=64, atomic=False))
     assert _rel_l2(bat_grads, ref_grads) < 5e-2
 
 
@@ -177,10 +181,10 @@ def test_atomic_matches_nonatomic_qwenlike():
 
     m1 = copy.deepcopy(base)
     g_plain = _grads_after(m1, lambda: _accumulate_grouped_grads(
-        m1, _frozen(m1), plan, n_total, device, budget=32, atomic=False))
+        m1, _frozen(m1), plan, device, budget=32, atomic=False))
     m2 = copy.deepcopy(base)
     g_atomic = _grads_after(m2, lambda: _accumulate_grouped_grads(
-        m2, _frozen(m2), plan, n_total, device, budget=32, atomic=True))
+        m2, _frozen(m2), plan, device, budget=32, atomic=True))
     assert _rel_l2(g_atomic, g_plain) < 1e-5
 
 
